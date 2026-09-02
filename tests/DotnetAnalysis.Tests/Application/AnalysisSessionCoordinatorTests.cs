@@ -211,6 +211,69 @@ public sealed class AnalysisSessionCoordinatorTests
     }
 
     [TestMethod]
+    public async Task CancelAsync_WhenActiveTokenCallbackThrows_StillConvergesAndClearsCancellationOperation()
+    {
+        var callbackFailure = new InvalidOperationException("Cancellation callback failed.");
+        var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cancelGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var backend = new ControlledCaptureBackend
+        {
+            StartGate = startGate,
+            CancelGate = cancelGate,
+            CancellationCallbackException = callbackFailure,
+            OnCancel = () => startGate.TrySetResult()
+        };
+        await using var bus = new RecordingEventBus();
+        var logger = new RecordingLogger<AnalysisSessionCoordinator>();
+        var coordinator = CreateCoordinator(backend, new ControlledAnalysisService(), bus, logger);
+
+        var start = coordinator.StartAsync(CancellationToken.None);
+        await backend.StartEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        var session = backend.LastSession!;
+        Task? cancellation = null;
+
+        try
+        {
+            cancellation = coordinator.CancelAsync(session.Id, CancellationToken.None);
+            await backend.CancelEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+            var repeatedCancellation = coordinator.CancelAsync(session.Id, CancellationToken.None);
+
+            Assert.AreSame(cancellation, repeatedCancellation);
+            Assert.AreEqual(1, backend.Calls.Count(call => call == "cancel"));
+            Assert.AreEqual(AnalysisSessionState.Canceling, session.State);
+            Assert.IsEmpty(bus.Events.OfType<CaptureStarted>());
+
+            cancelGate.TrySetResult();
+            await Task.WhenAll(start, cancellation, repeatedCancellation).WaitAsync(TimeSpan.FromSeconds(1));
+        }
+        finally
+        {
+            startGate.TrySetResult();
+            cancelGate.TrySetResult();
+            await start.WaitAsync(TimeSpan.FromSeconds(1));
+            if (cancellation is not null)
+            {
+                await cancellation.WaitAsync(TimeSpan.FromSeconds(1));
+            }
+        }
+
+        Assert.AreEqual(AnalysisSessionState.Failed, session.State);
+        Assert.AreEqual(1, backend.Calls.Count(call => call == "cancel"));
+        Assert.HasCount(1, bus.Events.OfType<AnalysisFailed>());
+        Assert.IsEmpty(bus.Events.OfType<CaptureStarted>());
+
+        var signalFailure = logger.Entries.Single(log => log.EventId.Name == "SessionStageFailed");
+        Assert.AreEqual(LogLevel.Error, signalFailure.LogLevel);
+        Assert.AreEqual(session.Id, signalFailure.Properties["SessionId"]);
+        Assert.AreEqual("SignalCancellation", signalFailure.Properties["Stage"]);
+        var aggregateFailure = signalFailure.Exception as AggregateException;
+        Assert.IsNotNull(aggregateFailure);
+        Assert.AreSame(callbackFailure, aggregateFailure.InnerExceptions.Single());
+
+        Assert.Throws<InvalidOperationException>(() => coordinator.CancelAsync(session.Id, CancellationToken.None));
+    }
+
+    [TestMethod]
     public async Task CancelAsync_ImmediatelyBeforeSnapshotAdmission_SkipsSnapshotAndAnalysis()
     {
         var stopGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -620,6 +683,7 @@ public sealed class AnalysisSessionCoordinatorTests
         public Exception? StopException { get; init; }
         public Exception? SnapshotException { get; init; }
         public Exception? CancelException { get; init; }
+        public Exception? CancellationCallbackException { get; init; }
         public Action? OnCancel { get; init; }
         public AnalysisSession? LastSession { get; private set; }
 
@@ -627,6 +691,10 @@ public sealed class AnalysisSessionCoordinatorTests
         {
             LastSession = session;
             Record("start", session, cancellationToken);
+            var callbackException = CancellationCallbackException;
+            using var registration = callbackException is null
+                ? default
+                : cancellationToken.Register(() => throw callbackException);
             StartEntered.TrySetResult();
             await WaitForGateAsync(StartGate).ConfigureAwait(false);
             if (StartException is not null) throw StartException;

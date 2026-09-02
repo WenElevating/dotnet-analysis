@@ -17,6 +17,7 @@ public sealed class AnalysisSessionCoordinator
     private const string StopAllocationTraceStage = "StopAllocationTrace";
     private const string CaptureHeapSnapshotStage = "CaptureHeapSnapshot";
     private const string AnalyzeStage = "Analyze";
+    private const string SignalCancellationStage = "SignalCancellation";
     private const string CancelStage = "Cancel";
 
     private static readonly Action<ILogger, SessionId, string, Exception?> s_sessionStageFailed =
@@ -427,15 +428,27 @@ public sealed class AnalysisSessionCoordinator
         return completion.Task;
     }
 
-    private static Task StartCancellationOperationLocked(
+    private Task StartCancellationOperationLocked(
         SessionEntry entry,
         Func<Task> operation,
         CancellationTokenSource? activeOperationCancellation = null)
     {
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         entry.CancellationOperation = completion.Task;
-        activeOperationCancellation?.Cancel();
-        _ = ExecuteCancellationOperationAsync(entry, completion, operation);
+        try
+        {
+            activeOperationCancellation?.Cancel();
+        }
+        catch (Exception exception)
+        {
+            entry.FailureDetected = true;
+            LogStageFailure(entry, SignalCancellationStage, exception);
+        }
+        finally
+        {
+            _ = ExecuteCancellationOperationAsync(entry, completion, operation);
+        }
+
         return completion.Task;
     }
 
