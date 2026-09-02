@@ -3,6 +3,7 @@
   <ItemGroup>
     <ProjectReference Include="..\DotnetAnalysis.Core\DotnetAnalysis.Core.csproj" />
     <ProjectReference Include="..\DotnetAnalysis.Application\DotnetAnalysis.Application.csproj" />
+    <ProjectReference Include="..\DotnetAnalysis.Diagnostics\DotnetAnalysis.Diagnostics.csproj" />
   </ItemGroup>
 
   <ItemGroup>

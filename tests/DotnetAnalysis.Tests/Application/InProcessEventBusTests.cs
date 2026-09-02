@@ -1,7 +1,8 @@
 using System.Diagnostics.CodeAnalysis;
 using System.Diagnostics;
 using DotnetAnalysis.Application.Events;
-using DotnetAnalysis.Core.Sessions;
+using DotnetAnalysis.Core.Diagnostics;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace DotnetAnalysis.Tests.Application;
@@ -17,14 +18,14 @@ public sealed class InProcessEventBusTests
     public async Task PublishAsync_DeliversLifecycleEventToMatchingSubscriber()
     {
         await using var bus = new InProcessEventBus(NullLogger<InProcessEventBus>.Instance);
-        var received = new TaskCompletionSource<CaptureStarted>(TaskCreationOptions.RunContinuationsAsynchronously);
-        using var subscription = bus.Subscribe<CaptureStarted>((@event, _) =>
+        var received = new TaskCompletionSource<MemorySnapshotCaptureStarted>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var subscription = bus.Subscribe<MemorySnapshotCaptureStarted>((@event, _) =>
         {
             received.TrySetResult(@event);
             return ValueTask.CompletedTask;
         });
 
-        var expected = new CaptureStarted(SessionId.New(), DateTimeOffset.UtcNow, "Coordinator");
+        var expected = new MemorySnapshotCaptureStarted(ProcessDiagnosticsSessionId.New(), DateTimeOffset.UtcNow, "Coordinator");
         await bus.PublishAsync(expected, CancellationToken.None);
 
         Assert.AreEqual(expected, await received.Task.WaitAsync(TimeSpan.FromSeconds(1)));
@@ -36,12 +37,12 @@ public sealed class InProcessEventBusTests
         await using var bus = new InProcessEventBus(NullLogger<InProcessEventBus>.Instance);
         var calls = 0;
         var healthyReceived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var subscription = bus.Subscribe<CaptureStarted>((_, _) =>
+        var subscription = bus.Subscribe<MemorySnapshotCaptureStarted>((_, _) =>
         {
             calls++;
             return ValueTask.CompletedTask;
         });
-        using var healthySubscription = bus.Subscribe<CaptureStarted>((_, _) =>
+        using var healthySubscription = bus.Subscribe<MemorySnapshotCaptureStarted>((_, _) =>
         {
             healthyReceived.TrySetResult();
             return ValueTask.CompletedTask;
@@ -49,7 +50,7 @@ public sealed class InProcessEventBusTests
 
         subscription.Dispose();
         await bus.PublishAsync(
-            new CaptureStarted(SessionId.New(), DateTimeOffset.UtcNow, "Coordinator"),
+            new MemorySnapshotCaptureStarted(ProcessDiagnosticsSessionId.New(), DateTimeOffset.UtcNow, "Coordinator"),
             CancellationToken.None);
         await healthyReceived.Task.WaitAsync(TimeSpan.FromSeconds(1));
         healthySubscription.Dispose();
@@ -64,13 +65,13 @@ public sealed class InProcessEventBusTests
         await using var bus = new InProcessEventBus(NullLogger<InProcessEventBus>.Instance);
         var slowHandlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var releaseSlowHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var healthyReceived = new TaskCompletionSource<CaptureStarted>(TaskCreationOptions.RunContinuationsAsynchronously);
-        using var slowSubscription = bus.Subscribe<CaptureStarted>(async (_, _) =>
+        var healthyReceived = new TaskCompletionSource<MemorySnapshotCaptureStarted>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var slowSubscription = bus.Subscribe<MemorySnapshotCaptureStarted>(async (_, _) =>
         {
             slowHandlerStarted.TrySetResult();
             await releaseSlowHandler.Task;
         }, new EventSubscriptionOptions(QueueCapacity: 1));
-        using var healthySubscription = bus.Subscribe<CaptureStarted>((@event, _) =>
+        using var healthySubscription = bus.Subscribe<MemorySnapshotCaptureStarted>((@event, _) =>
         {
             if (@event.Source == "third")
             {
@@ -82,15 +83,15 @@ public sealed class InProcessEventBusTests
 
         try
         {
-            await bus.PublishAsync(new CaptureStarted(SessionId.New(), DateTimeOffset.UtcNow, "first"), CancellationToken.None);
+            await bus.PublishAsync(new MemorySnapshotCaptureStarted(ProcessDiagnosticsSessionId.New(), DateTimeOffset.UtcNow, "first"), CancellationToken.None);
             await slowHandlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
-            await bus.PublishAsync(new CaptureStarted(SessionId.New(), DateTimeOffset.UtcNow, "second"), CancellationToken.None);
-            var expected = new CaptureStarted(SessionId.New(), DateTimeOffset.UtcNow, "third");
+            await bus.PublishAsync(new MemorySnapshotCaptureStarted(ProcessDiagnosticsSessionId.New(), DateTimeOffset.UtcNow, "second"), CancellationToken.None);
+            var expected = new MemorySnapshotCaptureStarted(ProcessDiagnosticsSessionId.New(), DateTimeOffset.UtcNow, "third");
 
             var exception = await Assert.ThrowsAsync<EventDeliveryException>(async () =>
                 await bus.PublishAsync(expected, CancellationToken.None).AsTask().WaitAsync(TimeSpan.FromMilliseconds(250)));
 
-            Assert.AreEqual(typeof(CaptureStarted), exception.EventType);
+            Assert.AreEqual(typeof(MemorySnapshotCaptureStarted), exception.EventType);
             Assert.IsFalse(string.IsNullOrWhiteSpace(exception.SubscriptionIdentity));
             Assert.AreEqual(expected, await healthyReceived.Task.WaitAsync(TimeSpan.FromSeconds(1)));
         }
@@ -108,7 +109,7 @@ public sealed class InProcessEventBusTests
         var releaseFirstHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var received = new List<string>();
-        using var subscription = bus.Subscribe<CaptureStarted>(async (@event, _) =>
+        using var subscription = bus.Subscribe<MemorySnapshotCaptureStarted>(async (@event, _) =>
         {
             received.Add(@event.Source);
             if (@event.Source == "first")
@@ -122,9 +123,9 @@ public sealed class InProcessEventBusTests
             }
         }, new EventSubscriptionOptions(QueueCapacity: 2));
 
-        await bus.PublishAsync(new CaptureStarted(SessionId.New(), DateTimeOffset.UtcNow, "first"), CancellationToken.None);
+        await bus.PublishAsync(new MemorySnapshotCaptureStarted(ProcessDiagnosticsSessionId.New(), DateTimeOffset.UtcNow, "first"), CancellationToken.None);
         await firstHandlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
-        await bus.PublishAsync(new CaptureStarted(SessionId.New(), DateTimeOffset.UtcNow, "second"), CancellationToken.None);
+        await bus.PublishAsync(new MemorySnapshotCaptureStarted(ProcessDiagnosticsSessionId.New(), DateTimeOffset.UtcNow, "second"), CancellationToken.None);
         subscription.Dispose();
 
         releaseFirstHandler.TrySetResult();
@@ -135,38 +136,39 @@ public sealed class InProcessEventBusTests
     }
 
     [TestMethod]
-    public async Task PublishAsync_CoalescesProgressToExactFirstAndLatestValuesForSlowSubscriber()
+    public async Task LatestOnly_SameKeyDeliversNewestPendingSample()
     {
         await using var bus = new InProcessEventBus(NullLogger<InProcessEventBus>.Instance);
         var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var received = new List<int>();
+        var received = new List<long>();
         var firstHandlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var latestReceived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        using var subscription = bus.Subscribe<CaptureProgressChanged>(async (@event, _) =>
+        using var subscription = bus.Subscribe<ProcessMemoryUsageUpdated>(async (@event, _) =>
         {
-            received.Add(@event.Percent);
-            if (@event.Percent == 1)
+            received.Add(@event.Sample.ProcessMemoryBytes!.Value);
+            if (@event.Sample.ProcessMemoryBytes == 1)
             {
                 firstHandlerStarted.TrySetResult();
                 await gate.Task;
             }
-            else if (@event.Percent == 100)
+            else if (@event.Sample.ProcessMemoryBytes == 100)
             {
                 latestReceived.TrySetResult();
             }
         });
 
-        var sessionId = SessionId.New();
-        await bus.PublishAsync(
-            new CaptureProgressChanged(sessionId, 1, DateTimeOffset.UtcNow, "Capture"),
-            CancellationToken.None);
+        var sessionId = ProcessDiagnosticsSessionId.New();
+        await bus.PublishAsync(ProcessMemoryUsageUpdated(sessionId, 1), CancellationToken.None);
         await firstHandlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
-        for (var percent = 2; percent <= 100; percent++)
+        var stopwatch = Stopwatch.StartNew();
+        for (var value = 2; value <= 100; value++)
         {
             await bus.PublishAsync(
-                new CaptureProgressChanged(sessionId, percent, DateTimeOffset.UtcNow, "Capture"),
+                ProcessMemoryUsageUpdated(sessionId, value),
                 CancellationToken.None);
         }
+        stopwatch.Stop();
+        Assert.IsTrue(stopwatch.Elapsed < TimeSpan.FromMilliseconds(250));
 
         gate.SetResult();
         await latestReceived.Task.WaitAsync(TimeSpan.FromSeconds(1));
@@ -176,19 +178,19 @@ public sealed class InProcessEventBusTests
     }
 
     [TestMethod]
-    public async Task PublishAsync_CoalescesProgressIndependentlyPerSession()
+    public async Task LatestOnly_DifferentKeysCoalesceIndependently()
     {
         await using var bus = new InProcessEventBus(NullLogger<InProcessEventBus>.Instance);
         var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var firstHandlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var allExpectedEventsReceived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var received = new List<(SessionId SessionId, int Percent)>();
-        var firstSessionId = SessionId.New();
-        var secondSessionId = SessionId.New();
-        using var subscription = bus.Subscribe<CaptureProgressChanged>(async (@event, _) =>
+        var firstSessionId = ProcessDiagnosticsSessionId.New();
+        var secondSessionId = ProcessDiagnosticsSessionId.New();
+        var received = new List<(ProcessDiagnosticsSessionId SessionId, long Bytes)>();
+        using var subscription = bus.Subscribe<ProcessMemoryUsageUpdated>(async (@event, _) =>
         {
-            received.Add((@event.SessionId!.Value, @event.Percent));
-            if (@event.SessionId == firstSessionId && @event.Percent == 1)
+            received.Add((@event.SessionId, @event.Sample.ProcessMemoryBytes!.Value));
+            if (@event.SessionId == firstSessionId && @event.Sample.ProcessMemoryBytes == 1)
             {
                 firstHandlerStarted.TrySetResult();
                 await gate.Task;
@@ -198,21 +200,13 @@ public sealed class InProcessEventBusTests
             {
                 allExpectedEventsReceived.TrySetResult();
             }
-        });
+        }, new EventSubscriptionOptions(QueueCapacity: 1));
 
-        await bus.PublishAsync(
-            new CaptureProgressChanged(firstSessionId, 1, DateTimeOffset.UtcNow, "Capture"),
-            CancellationToken.None);
+        await bus.PublishAsync(ProcessMemoryUsageUpdated(firstSessionId, 1), CancellationToken.None);
         await firstHandlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
-        await bus.PublishAsync(
-            new CaptureProgressChanged(firstSessionId, 2, DateTimeOffset.UtcNow, "Capture"),
-            CancellationToken.None);
-        await bus.PublishAsync(
-            new CaptureProgressChanged(secondSessionId, 10, DateTimeOffset.UtcNow, "Capture"),
-            CancellationToken.None);
-        await bus.PublishAsync(
-            new CaptureProgressChanged(secondSessionId, 20, DateTimeOffset.UtcNow, "Capture"),
-            CancellationToken.None);
+        await bus.PublishAsync(ProcessMemoryUsageUpdated(firstSessionId, 2), CancellationToken.None);
+        await bus.PublishAsync(ProcessMemoryUsageUpdated(secondSessionId, 10), CancellationToken.None);
+        await bus.PublishAsync(ProcessMemoryUsageUpdated(secondSessionId, 20), CancellationToken.None);
 
         gate.SetResult();
         await allExpectedEventsReceived.Task.WaitAsync(TimeSpan.FromSeconds(1));
@@ -223,33 +217,57 @@ public sealed class InProcessEventBusTests
     }
 
     [TestMethod]
+    public async Task Ordered_WhenQueueIsFull_ReportsDeliveryFailure()
+    {
+        await using var bus = new InProcessEventBus(NullLogger<InProcessEventBus>.Instance);
+        var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var subscription = bus.Subscribe<MemorySnapshotCaptureStarted>(async (_, _) =>
+        {
+            handlerStarted.TrySetResult();
+            await releaseHandler.Task;
+        }, new EventSubscriptionOptions(QueueCapacity: 1));
+
+        await bus.PublishAsync(new MemorySnapshotCaptureStarted(ProcessDiagnosticsSessionId.New(), DateTimeOffset.UtcNow, "first"), CancellationToken.None);
+        await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        await bus.PublishAsync(new MemorySnapshotCaptureStarted(ProcessDiagnosticsSessionId.New(), DateTimeOffset.UtcNow, "second"), CancellationToken.None);
+
+        var exception = await Assert.ThrowsAsync<EventDeliveryException>(async () =>
+            await bus.PublishAsync(new MemorySnapshotCaptureStarted(ProcessDiagnosticsSessionId.New(), DateTimeOffset.UtcNow, "third"), CancellationToken.None).AsTask());
+
+        Assert.AreEqual(typeof(MemorySnapshotCaptureStarted), exception.EventType);
+        Assert.IsFalse(string.IsNullOrWhiteSpace(exception.SubscriptionIdentity));
+        releaseHandler.TrySetResult();
+    }
+
+    [TestMethod]
     public async Task HandlerFailure_PublishesFaultWithoutInterruptingHealthySubscriber()
     {
         await using var bus = new InProcessEventBus(NullLogger<InProcessEventBus>.Instance);
-        var healthyReceived = new TaskCompletionSource<CaptureStarted>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var healthyReceived = new TaskCompletionSource<MemorySnapshotCaptureStarted>(TaskCreationOptions.RunContinuationsAsynchronously);
         var faultReceived = new TaskCompletionSource<ModuleFaulted>(TaskCreationOptions.RunContinuationsAsynchronously);
         using var faultSubscription = bus.Subscribe<ModuleFaulted>((@event, _) =>
         {
             faultReceived.TrySetResult(@event);
             return ValueTask.CompletedTask;
         });
-        using var throwingSubscription = bus.Subscribe<CaptureStarted>((_, _) =>
+        using var throwingSubscription = bus.Subscribe<MemorySnapshotCaptureStarted>((_, _) =>
         {
             throw new InvalidOperationException("Handler failure.");
         });
-        using var healthySubscription = bus.Subscribe<CaptureStarted>((@event, _) =>
+        using var healthySubscription = bus.Subscribe<MemorySnapshotCaptureStarted>((@event, _) =>
         {
             healthyReceived.TrySetResult(@event);
             return ValueTask.CompletedTask;
         });
 
-        var expected = new CaptureStarted(SessionId.New(), DateTimeOffset.UtcNow, "Coordinator");
+        var expected = new MemorySnapshotCaptureStarted(ProcessDiagnosticsSessionId.New(), DateTimeOffset.UtcNow, "Coordinator");
         await bus.PublishAsync(expected, CancellationToken.None);
 
         Assert.AreEqual(expected, await healthyReceived.Task.WaitAsync(TimeSpan.FromSeconds(1)));
         var fault = await faultReceived.Task.WaitAsync(TimeSpan.FromSeconds(1));
         Assert.AreEqual(expected.SessionId, fault.SessionId);
-        Assert.AreEqual(nameof(CaptureStarted), fault.Module);
+        Assert.AreEqual(nameof(MemorySnapshotCaptureStarted), fault.Module);
     }
 
     [TestMethod]
@@ -292,13 +310,13 @@ public sealed class InProcessEventBusTests
             faultReceived.TrySetResult();
             return ValueTask.CompletedTask;
         });
-        using var throwingSubscription = bus.Subscribe<CaptureStarted>((_, _) =>
+        using var throwingSubscription = bus.Subscribe<MemorySnapshotCaptureStarted>((_, _) =>
         {
             throw new InvalidOperationException("Capture handler failure.");
         });
 
         await bus.PublishAsync(
-            new CaptureStarted(SessionId.New(), DateTimeOffset.UtcNow, "Coordinator"),
+            new MemorySnapshotCaptureStarted(ProcessDiagnosticsSessionId.New(), DateTimeOffset.UtcNow, "Coordinator"),
             CancellationToken.None);
         await faultReceived.Task.WaitAsync(TimeSpan.FromSeconds(1));
         await bus.PublishAsync(
@@ -316,18 +334,17 @@ public sealed class InProcessEventBusTests
     [TestMethod]
     public async Task DisposeAsync_CompletesAfterBoundedWaitForNonCooperativeSubscriber()
     {
-        var bus = new InProcessEventBus(
-            NullLogger<InProcessEventBus>.Instance,
-            TimeSpan.FromMilliseconds(50));
+        var logger = new RecordingLogger<InProcessEventBus>();
+        var bus = new InProcessEventBus(logger, TimeSpan.FromMilliseconds(50));
         var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        using var subscription = bus.Subscribe<CaptureStarted>(async (_, _) =>
+        using var subscription = bus.Subscribe<MemorySnapshotCaptureStarted>(async (_, _) =>
         {
             handlerStarted.TrySetResult();
             await releaseHandler.Task;
         });
 
-        await bus.PublishAsync(new CaptureStarted(SessionId.New(), DateTimeOffset.UtcNow, "Coordinator"), CancellationToken.None);
+        await bus.PublishAsync(new MemorySnapshotCaptureStarted(ProcessDiagnosticsSessionId.New(), DateTimeOffset.UtcNow, "Coordinator"), CancellationToken.None);
         await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
 
         var stopwatch = Stopwatch.StartNew();
@@ -335,6 +352,9 @@ public sealed class InProcessEventBusTests
         await disposal.WaitAsync(TimeSpan.FromSeconds(1));
         stopwatch.Stop();
         Assert.IsTrue(stopwatch.Elapsed < TimeSpan.FromSeconds(1));
+        Assert.IsTrue(logger.Entries.Any(entry =>
+            entry.LogLevel == LogLevel.Warning
+            && entry.EventId.Name == "EventSubscriptionShutdownTimedOut"));
 
         releaseHandler.TrySetResult();
     }
@@ -347,13 +367,13 @@ public sealed class InProcessEventBusTests
             TimeSpan.FromSeconds(1));
         var handlerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var releaseHandler = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        using var subscription = bus.Subscribe<CaptureStarted>(async (_, _) =>
+        using var subscription = bus.Subscribe<MemorySnapshotCaptureStarted>(async (_, _) =>
         {
             handlerStarted.TrySetResult();
             await releaseHandler.Task;
         });
 
-        await bus.PublishAsync(new CaptureStarted(SessionId.New(), DateTimeOffset.UtcNow, "Coordinator"), CancellationToken.None);
+        await bus.PublishAsync(new MemorySnapshotCaptureStarted(ProcessDiagnosticsSessionId.New(), DateTimeOffset.UtcNow, "Coordinator"), CancellationToken.None);
         await handlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
         subscription.Dispose();
 
@@ -363,4 +383,45 @@ public sealed class InProcessEventBusTests
         releaseHandler.TrySetResult();
         await disposal.WaitAsync(TimeSpan.FromSeconds(1));
     }
+
+    private static ProcessMemoryUsageUpdated ProcessMemoryUsageUpdated(
+        ProcessDiagnosticsSessionId sessionId,
+        long processMemoryBytes) =>
+        new(
+            sessionId,
+            new MemoryUsageSample(
+                DateTimeOffset.UtcNow,
+                managedHeapBytes: processMemoryBytes,
+                processMemoryBytes: processMemoryBytes,
+            MemoryUsageSampleState.Measured),
+            DateTimeOffset.UtcNow,
+            "test");
+
+    private sealed class RecordingLogger<T> : ILogger<T>
+    {
+        private readonly List<LogEntry> _entries = [];
+
+        public IReadOnlyList<LogEntry> Entries => _entries;
+
+        public IDisposable? BeginScope<TState>(TState state)
+            where TState : notnull =>
+            null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            _entries.Add(new LogEntry(logLevel, eventId, exception));
+        }
+    }
+
+    private sealed record LogEntry(
+        LogLevel LogLevel,
+        EventId EventId,
+        Exception? Exception);
 }

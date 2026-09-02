@@ -1,4 +1,5 @@
 using System.Windows;
+using DotnetAnalysis.Diagnostics.DependencyInjection;
 using DotnetAnalysis.Desktop.Composition;
 using DotnetAnalysis.Desktop.ViewModels;
 using Microsoft.Extensions.DependencyInjection;
@@ -15,6 +16,7 @@ public partial class App : System.Windows.Application
 
         var services = new ServiceCollection();
         services.AddDesktopApplication();
+        services.AddWindowsProcessDiagnostics();
         _serviceProvider = services.BuildServiceProvider(validateScopes: true);
 
         var mainWindow = _serviceProvider.GetRequiredService<MainWindow>();

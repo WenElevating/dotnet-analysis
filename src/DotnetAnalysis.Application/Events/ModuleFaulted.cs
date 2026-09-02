@@ -1,10 +1,10 @@
 using DotnetAnalysis.Core.Events;
-using DotnetAnalysis.Core.Sessions;
+using DotnetAnalysis.Core.Diagnostics;
 
 namespace DotnetAnalysis.Application.Events;
 
 public sealed record ModuleFaulted(
-    SessionId? SessionId,
+    ProcessDiagnosticsSessionId? SessionId,
     string Module,
     string Message,
     DateTimeOffset OccurredAt,

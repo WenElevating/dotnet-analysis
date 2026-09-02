@@ -5,6 +5,8 @@
     <LangVersion>latest</LangVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <ApplicationOnly Condition="'$(ApplicationOnly)' == ''">false</ApplicationOnly>
+    <Task2Only Condition="'$(Task2Only)' == ''">false</Task2Only>
   </PropertyGroup>
 
   <ItemGroup>
@@ -22,14 +24,26 @@
     <Compile Remove="Desktop\**\*.cs" />
   </ItemGroup>
 
+  <ItemGroup Condition="'$(ApplicationOnly)' == 'true'">
+    <Compile Remove="Desktop\**\*.cs" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(Task2Only)' == 'true'">
+    <Compile Remove="Application\InProcessEventBusTests.cs" />
+    <Compile Remove="Desktop\**\*.cs" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\..\src\DotnetAnalysis.Core\DotnetAnalysis.Core.csproj" />
     <ProjectReference
       Include="..\..\src\DotnetAnalysis.Application\DotnetAnalysis.Application.csproj"
       Condition="'$(CoreDiagnosticsOnly)' != 'true'" />
     <ProjectReference
+      Include="..\..\src\DotnetAnalysis.Diagnostics\DotnetAnalysis.Diagnostics.csproj"
+      Condition="'$(CoreDiagnosticsOnly)' != 'true' and '$(ApplicationOnly)' != 'true' and '$(Task2Only)' != 'true'" />
+    <ProjectReference
       Include="..\..\src\DotnetAnalysis.Desktop\DotnetAnalysis.Desktop.csproj"
-      Condition="'$(CoreDiagnosticsOnly)' != 'true'" />
+      Condition="'$(CoreDiagnosticsOnly)' != 'true' and '$(ApplicationOnly)' != 'true' and '$(Task2Only)' != 'true'" />
   </ItemGroup>
 
 </Project>

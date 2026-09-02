@@ -169,9 +169,8 @@ public sealed class InProcessEventBus : IEventBus
         private readonly Action<IEventSubscription> _retire;
         private readonly Action<IEventSubscription> _release;
         private readonly Func<ModuleFaulted, ValueTask> _publishFault;
-        private readonly bool _coalesceProgressEvents;
-        private readonly Dictionary<ProgressSessionKey, CaptureProgressChanged> _pendingProgress = [];
-        private readonly HashSet<ProgressSessionKey> _progressMarkers = [];
+        private readonly Dictionary<string, TEvent> _pendingLatestOnly = [];
+        private readonly HashSet<string> _latestOnlyMarkers = [];
         private readonly Action<ILogger, string, Exception?> _handlerFailed;
         private readonly Action<ILogger, Exception?> _faultPublicationFailed;
         private readonly string _identity;
@@ -190,7 +189,6 @@ public sealed class InProcessEventBus : IEventBus
             _retire = retire;
             _release = release;
             _publishFault = publishFault;
-            _coalesceProgressEvents = options.CoalesceProgressEvents;
             _identity = $"{typeof(TEvent).FullName}/{Guid.NewGuid():N}";
             _handlerFailed = LoggerMessage.Define<string>(
                 LogLevel.Error,
@@ -225,15 +223,105 @@ public sealed class InProcessEventBus : IEventBus
                     return null;
                 }
 
-                if (_coalesceProgressEvents && applicationEvent is CaptureProgressChanged progress)
+                if (applicationEvent is IApplicationEventDeliveryPolicy
+                    {
+                        DeliveryMode: ApplicationEventDeliveryMode.LatestOnly
+                    } policy)
                 {
-                    TryEnqueueProgress(progress);
-                    return null;
+                    return TryEnqueueLatestOnly((TEvent)applicationEvent, policy.DeliveryKey);
                 }
 
-                return _queue.Writer.TryWrite(new EventWorkItem((TEvent)applicationEvent))
-                    ? null
-                    : new EventDeliveryException(applicationEvent.GetType(), Identity);
+                if (applicationEvent is IApplicationEventDeliveryPolicy
+                    {
+                        DeliveryMode: not ApplicationEventDeliveryMode.Ordered
+                    })
+                {
+                    throw new InvalidOperationException(
+                        $"Unsupported application event delivery mode for {applicationEvent.GetType().Name}.");
+                }
+
+                return TryEnqueueOrdered((TEvent)applicationEvent);
+            }
+        }
+
+        private EventDeliveryException? TryEnqueueOrdered(TEvent applicationEvent)
+        {
+            return _queue.Writer.TryWrite(new EventWorkItem(applicationEvent))
+                ? null
+                : new EventDeliveryException(applicationEvent.GetType(), Identity);
+        }
+
+        private EventDeliveryException? TryEnqueueLatestOnly(TEvent applicationEvent, string deliveryKey)
+        {
+            if (string.IsNullOrWhiteSpace(deliveryKey))
+            {
+                throw new InvalidOperationException(
+                    $"LatestOnly event {typeof(TEvent).Name} must provide a non-empty delivery key.");
+            }
+
+            if (_latestOnlyMarkers.Contains(deliveryKey))
+            {
+                _pendingLatestOnly[deliveryKey] = applicationEvent;
+                return null;
+            }
+
+            if (_queue.Writer.TryWrite(new LatestOnlyWorkItem(deliveryKey, applicationEvent)))
+            {
+                _latestOnlyMarkers.Add(deliveryKey);
+                return null;
+            }
+
+            _pendingLatestOnly[deliveryKey] = applicationEvent;
+            TrySchedulePendingLatestOnly();
+
+            return null;
+        }
+
+        private bool TryGetEvent(SubscriptionWorkItem workItem, out TEvent applicationEvent)
+        {
+            if (workItem is EventWorkItem eventWorkItem)
+            {
+                applicationEvent = eventWorkItem.Event;
+                lock (_admissionGate)
+                {
+                    TrySchedulePendingLatestOnly();
+                }
+
+                return true;
+            }
+
+            var latestOnlyWorkItem = (LatestOnlyWorkItem)workItem;
+            lock (_admissionGate)
+            {
+                _latestOnlyMarkers.Remove(latestOnlyWorkItem.DeliveryKey);
+                if (_pendingLatestOnly.Remove(latestOnlyWorkItem.DeliveryKey, out var latestEvent))
+                {
+                    applicationEvent = latestEvent;
+                    TrySchedulePendingLatestOnly();
+                    return true;
+                }
+
+                applicationEvent = latestOnlyWorkItem.InitialEvent;
+                TrySchedulePendingLatestOnly();
+                return true;
+            }
+        }
+
+        private void TrySchedulePendingLatestOnly()
+        {
+            foreach (var (deliveryKey, latestEvent) in _pendingLatestOnly)
+            {
+                if (_latestOnlyMarkers.Contains(deliveryKey))
+                {
+                    continue;
+                }
+
+                if (!_queue.Writer.TryWrite(new LatestOnlyWorkItem(deliveryKey, latestEvent)))
+                {
+                    return;
+                }
+
+                _latestOnlyMarkers.Add(deliveryKey);
             }
         }
 
@@ -299,44 +387,6 @@ public sealed class InProcessEventBus : IEventBus
             }
         }
 
-        private void TryEnqueueProgress(CaptureProgressChanged progress)
-        {
-            var sessionKey = new ProgressSessionKey(progress.SessionId?.Value);
-            if (_progressMarkers.Contains(sessionKey))
-            {
-                _pendingProgress[sessionKey] = progress;
-                return;
-            }
-
-            if (_queue.Writer.TryWrite(new ProgressWorkItem(sessionKey, progress)))
-            {
-                _progressMarkers.Add(sessionKey);
-            }
-        }
-
-        private bool TryGetEvent(SubscriptionWorkItem workItem, out TEvent applicationEvent)
-        {
-            if (workItem is EventWorkItem eventWorkItem)
-            {
-                applicationEvent = eventWorkItem.Event;
-                return true;
-            }
-
-            var progressWorkItem = (ProgressWorkItem)workItem;
-            lock (_admissionGate)
-            {
-                _progressMarkers.Remove(progressWorkItem.SessionKey);
-                if (_pendingProgress.Remove(progressWorkItem.SessionKey, out var progress))
-                {
-                    applicationEvent = (TEvent)(IApplicationEvent)progress;
-                    return true;
-                }
-
-                applicationEvent = (TEvent)(IApplicationEvent)progressWorkItem.InitialProgress;
-                return true;
-            }
-        }
-
         private async ValueTask PublishHandlerFaultAsync(TEvent applicationEvent, Exception exception)
         {
             try
@@ -361,10 +411,6 @@ public sealed class InProcessEventBus : IEventBus
 
         private sealed record EventWorkItem(TEvent Event) : SubscriptionWorkItem;
 
-        private sealed record ProgressWorkItem(
-            ProgressSessionKey SessionKey,
-            CaptureProgressChanged InitialProgress) : SubscriptionWorkItem;
-
-        private readonly record struct ProgressSessionKey(Guid? Value);
+        private sealed record LatestOnlyWorkItem(string DeliveryKey, TEvent InitialEvent) : SubscriptionWorkItem;
     }
 }

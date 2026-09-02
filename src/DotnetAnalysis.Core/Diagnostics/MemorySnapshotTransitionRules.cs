@@ -14,6 +14,8 @@ public static class MemorySnapshotTransitionRules
             MemorySnapshotState.Analyzing => to is MemorySnapshotState.Ready
                 or MemorySnapshotState.Canceled
                 or MemorySnapshotState.Failed,
+            MemorySnapshotState.Failed => to is MemorySnapshotState.Analyzing
+                or MemorySnapshotState.Canceled,
             _ => false
         };
 }
