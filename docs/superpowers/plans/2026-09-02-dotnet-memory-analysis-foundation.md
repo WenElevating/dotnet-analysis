@@ -162,7 +162,10 @@ Create Directory.Build.props:
 </Project>
 ~~~
 
-Set the Desktop target to net10.0-windows and set UseWPF to true. Delete generated Class1.cs files and the generated MSTest sample file.
+Set the Desktop target to net10.0-windows, set UseWPF to true, and enforce
+`PlatformTarget` as `x64` with `Prefer32Bit` set to `false`. Do not add a
+RuntimeIdentifier or self-contained publishing policy. Delete generated
+Class1.cs files and the generated MSTest sample file.
 
 - [ ] **Step 4: Add ignored diagnostic output and verify the build fails before restore**
 
