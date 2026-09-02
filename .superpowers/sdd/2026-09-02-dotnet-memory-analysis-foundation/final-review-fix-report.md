@@ -168,3 +168,51 @@ The final diff was reread against all seven review findings after automated vali
 Internal confidence scores after review: requirement coverage 10/10, correctness 9/10, robustness 9/10, security 9/10, performance 9/10, maintainability 9/10, test coverage 10/10, overall confidence 9/10.
 
 No actionable implementation-QA finding remains.
+
+## Round 2 repair evidence
+
+- Re-review source: `final-review-repair-rereview.md`
+- Repair commit: `e81ac496a0da8e09c44e17c7147b1d941badf6b9`
+- Remaining Important findings after repair: none
+- Remaining Minor findings after repair: none
+
+### Inline cancellation race red-green
+
+The regression backend used a default `TaskCompletionSource` with no `RunContinuationsAsynchronously`. Its `CancelAsync` callback completed the active start gate synchronously/inline.
+
+RED against `75054a2`:
+
+```text
+dotnet test tests\DotnetAnalysis.Tests\DotnetAnalysis.Tests.csproj --configuration Debug --no-restore --filter "FullyQualifiedName~CancelAsync_WhenBackendReleasesActiveStartInline_CancelsWithoutDisposedTokenRace"
+Failed: 1/1
+System.ObjectDisposedException: The CancellationTokenSource has been disposed.
+at AnalysisSessionCoordinator.CancelAsync(...) line 137
+```
+
+The test also requires exactly one backend `CancelAsync` call, no `CaptureStarted` publication, and a final `Canceled` state.
+
+GREEN after reserving the shared cancellation operation, signaling the active CTS, and only then launching backend cancellation/convergence:
+
+```text
+Focused race test: 1/1 passed.
+Repeated race validation: 25 consecutive runs, 25/25 passed.
+```
+
+### Round 2 Minor repairs
+
+- The executable plan's remaining coordinator constructor example now supplies `NullLogger<AnalysisSessionCoordinator>.Instance`.
+- Desktop composition documentation now includes `TimeProvider.System`.
+- The disposed-subscription test explicitly disposes the healthy subscriber and awaits `bus.DisposeAsync()` before its final assertion, so the tested retired consumer itself is deterministically drained.
+- The executable plan's corresponding disposed-subscription example now uses the same disposal barrier rather than a fixed delay.
+
+### Round 2 validation
+
+```text
+Focused coordinator/event-bus/composition tests: 36 passed, 0 failed, 0 skipped.
+dotnet format --verify-no-changes: exit 0; 0 of 55 files changed.
+Debug solution build: exit 0; 0 warnings, 0 errors.
+Full solution tests: 48 passed, 0 failed, 0 skipped.
+git diff --check: exit 0; no whitespace errors.
+```
+
+The round 2 diff was reread after validation. The reservation is visible before token signaling, prevents the inline active path from creating duplicate cancellation work, and the backend path does not begin until token signaling returns. No actionable implementation-QA finding remains.
