@@ -23,15 +23,16 @@ public sealed class AnalysisSessionCoordinatorTests
     [TestMethod]
     public async Task FinishAsync_StopsTraceBeforeSnapshotBeforeAnalysis()
     {
-        var backend = new ControlledCaptureBackend();
-        var analyzer = new ControlledAnalysisService();
+        var calls = new List<string>();
+        var backend = new ControlledCaptureBackend(calls);
+        var analyzer = new ControlledAnalysisService(calls);
         await using var bus = new RecordingEventBus();
         var coordinator = CreateCoordinator(backend, analyzer, bus);
 
         var session = await coordinator.StartAsync(CancellationToken.None);
         await coordinator.FinishAsync(session.Id, CancellationToken.None);
 
-        CollectionAssert.AreEqual(NormalCompletionCalls, backend.Calls.Concat(analyzer.Calls).ToArray());
+        CollectionAssert.AreEqual(NormalCompletionCalls, calls);
         Assert.AreEqual(AnalysisSessionState.Completed, session.State);
         AssertBoundary(backend, "start", AnalysisSessionState.CapturingAllocations);
         AssertBoundary(backend, "stop", AnalysisSessionState.FinishingTrace);
@@ -56,6 +57,37 @@ public sealed class AnalysisSessionCoordinatorTests
         Assert.AreEqual(AnalysisSessionState.Failed, session.State);
         AssertBoundary(backend, "cancel", AnalysisSessionState.Canceling);
         Assert.HasCount(1, bus.Events.OfType<AnalysisFailed>());
+    }
+
+    [TestMethod]
+    public async Task StartAsync_WhenCaptureStartedPublicationThrowsSynchronously_CancelsTraceBeforeFailingSession()
+    {
+        var backend = new ControlledCaptureBackend();
+        await using var bus = new RecordingEventBus(throwCaptureStartedSynchronously: true);
+        var coordinator = CreateCoordinator(backend, new ControlledAnalysisService(), bus);
+
+        var session = await coordinator.StartAsync(CancellationToken.None);
+
+        CollectionAssert.AreEqual(CancellationCalls, backend.Calls);
+        Assert.AreEqual(AnalysisSessionState.Failed, session.State);
+        AssertBoundary(backend, "cancel", AnalysisSessionState.Canceling);
+        Assert.HasCount(1, bus.Events.OfType<AnalysisFailed>());
+    }
+
+    [TestMethod]
+    public async Task FinishAsync_WhenCompletedPublicationThrowsSynchronously_KeepsCompletedState()
+    {
+        var calls = new List<string>();
+        var backend = new ControlledCaptureBackend(calls);
+        var analyzer = new ControlledAnalysisService(calls);
+        await using var bus = new RecordingEventBus(throwTerminalPublicationsSynchronously: true);
+        var coordinator = CreateCoordinator(backend, analyzer, bus);
+
+        var session = await coordinator.StartAsync(CancellationToken.None);
+        await coordinator.FinishAsync(session.Id, CancellationToken.None);
+
+        CollectionAssert.AreEqual(NormalCompletionCalls, calls);
+        Assert.AreEqual(AnalysisSessionState.Completed, session.State);
     }
 
     [TestMethod]
@@ -320,7 +352,7 @@ public sealed class AnalysisSessionCoordinatorTests
         Assert.AreEqual(expectedState, analyzer.Boundaries.Single(boundary => boundary.Operation == operation).State);
     }
 
-    private sealed class ControlledCaptureBackend : ICaptureBackend
+    private sealed class ControlledCaptureBackend(List<string>? orderedCalls = null) : ICaptureBackend
     {
         public List<string> Calls { get; } = [];
         public List<BackendBoundary> Boundaries { get; } = [];
@@ -370,6 +402,7 @@ public sealed class AnalysisSessionCoordinatorTests
         private void Record(string operation, AnalysisSession session, CancellationToken cancellationToken)
         {
             Calls.Add(operation);
+            orderedCalls?.Add(operation);
             Boundaries.Add(new BackendBoundary(operation, session.State, cancellationToken.CanBeCanceled));
         }
 
@@ -379,7 +412,7 @@ public sealed class AnalysisSessionCoordinatorTests
         }
     }
 
-    private sealed class ControlledAnalysisService : IAnalysisService
+    private sealed class ControlledAnalysisService(List<string>? orderedCalls = null) : IAnalysisService
     {
         public List<string> Calls { get; } = [];
         public List<BackendBoundary> Boundaries { get; } = [];
@@ -389,13 +422,17 @@ public sealed class AnalysisSessionCoordinatorTests
         public async Task AnalyzeAsync(AnalysisSession session, CancellationToken cancellationToken)
         {
             Calls.Add("analyze");
+            orderedCalls?.Add("analyze");
             Boundaries.Add(new BackendBoundary("analyze", session.State, cancellationToken.CanBeCanceled));
             AnalyzeEntered.TrySetResult();
             if (AnalyzeGate is not null) await AnalyzeGate.Task.ConfigureAwait(false);
         }
     }
 
-    private sealed class RecordingEventBus(bool failCaptureStarted = false) : IEventBus
+    private sealed class RecordingEventBus(
+        bool failCaptureStarted = false,
+        bool throwCaptureStartedSynchronously = false,
+        bool throwTerminalPublicationsSynchronously = false) : IEventBus
     {
         public List<IApplicationEvent> Events { get; } = [];
 
@@ -403,6 +440,17 @@ public sealed class AnalysisSessionCoordinatorTests
             where TEvent : IApplicationEvent
         {
             Events.Add(applicationEvent);
+            if (throwCaptureStartedSynchronously && applicationEvent is CaptureStarted)
+            {
+                throw new EventDeliveryException(typeof(CaptureStarted), "test-subscription");
+            }
+
+            if (throwTerminalPublicationsSynchronously
+                && applicationEvent is AnalysisCompleted or AnalysisCanceled or AnalysisFailed)
+            {
+                throw new EventDeliveryException(applicationEvent.GetType(), "test-subscription");
+            }
+
             return failCaptureStarted && applicationEvent is CaptureStarted
                 ? ValueTask.FromException(new EventDeliveryException(typeof(CaptureStarted), "test-subscription"))
                 : ValueTask.CompletedTask;

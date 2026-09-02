@@ -198,18 +198,22 @@ public sealed class AnalysisSessionCoordinator
 
     private async Task PublishCaptureStartedAsync(SessionEntry entry, CancellationToken cancellationToken)
     {
-        ValueTask publication;
-        lock (entry.SyncRoot)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            publication = _eventBus.PublishAsync(
-                new CaptureStarted(entry.Session.Id, _timeProvider.GetUtcNow(), Source),
-                CancellationToken.None);
-        }
-
         try
         {
+            ValueTask publication;
+            lock (entry.SyncRoot)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                publication = _eventBus.PublishAsync(
+                    new CaptureStarted(entry.Session.Id, _timeProvider.GetUtcNow(), Source),
+                    CancellationToken.None);
+            }
+
             await publication.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception)
         {
@@ -225,9 +229,16 @@ public sealed class AnalysisSessionCoordinator
         {
             cancellationToken.ThrowIfCancellationRequested();
             MoveTo(entry.Session, AnalysisSessionState.Completed);
-            publication = _eventBus.PublishAsync(
-                new AnalysisCompleted(entry.Session.Id, _timeProvider.GetUtcNow(), Source),
-                CancellationToken.None);
+            try
+            {
+                publication = _eventBus.PublishAsync(
+                    new AnalysisCompleted(entry.Session.Id, _timeProvider.GetUtcNow(), Source),
+                    CancellationToken.None);
+            }
+            catch (Exception)
+            {
+                return;
+            }
         }
 
         await IgnoreTerminalPublicationFailureAsync(publication).ConfigureAwait(false);
@@ -308,9 +319,16 @@ public sealed class AnalysisSessionCoordinator
             }
 
             MoveTo(entry.Session, AnalysisSessionState.Canceled);
-            publication = _eventBus.PublishAsync(
-                new AnalysisCanceled(entry.Session.Id, _timeProvider.GetUtcNow(), Source),
-                CancellationToken.None);
+            try
+            {
+                publication = _eventBus.PublishAsync(
+                    new AnalysisCanceled(entry.Session.Id, _timeProvider.GetUtcNow(), Source),
+                    CancellationToken.None);
+            }
+            catch (Exception)
+            {
+                return;
+            }
         }
 
         await IgnoreTerminalPublicationFailureAsync(publication).ConfigureAwait(false);
@@ -348,14 +366,21 @@ public sealed class AnalysisSessionCoordinator
             }
 
             MoveTo(entry.Session, AnalysisSessionState.Failed);
-            publication = _eventBus.PublishAsync(
-                new AnalysisFailed(
-                    entry.Session.Id,
-                    SessionFailureCode,
-                    SessionFailureMessage,
-                    _timeProvider.GetUtcNow(),
-                    Source),
-                CancellationToken.None);
+            try
+            {
+                publication = _eventBus.PublishAsync(
+                    new AnalysisFailed(
+                        entry.Session.Id,
+                        SessionFailureCode,
+                        SessionFailureMessage,
+                        _timeProvider.GetUtcNow(),
+                        Source),
+                    CancellationToken.None);
+            }
+            catch (Exception)
+            {
+                return;
+            }
         }
 
         await IgnoreTerminalPublicationFailureAsync(publication).ConfigureAwait(false);
