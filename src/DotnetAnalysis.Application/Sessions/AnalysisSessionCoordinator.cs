@@ -41,7 +41,18 @@ public sealed class AnalysisSessionCoordinator
             throw new InvalidOperationException("Could not register the analysis session.");
         }
 
-        await StartOperationAsync(entry, OperationKind.Start, () => StartCoreAsync(entry, cancellationToken)).ConfigureAwait(false);
+        Task start;
+        lock (entry.SyncRoot)
+        {
+            var operationCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            start = StartActiveOperationLocked(
+                entry,
+                OperationKind.Start,
+                operationCancellation,
+                token => StartCoreAsync(entry, token));
+        }
+
+        await start.ConfigureAwait(false);
         return session;
     }
 
@@ -52,37 +63,27 @@ public sealed class AnalysisSessionCoordinator
 
         lock (entry.SyncRoot)
         {
-            if (entry.ActiveOperation is not null)
-            {
-                return entry.ActiveOperation;
-            }
-
-            if (entry.Session.State != AnalysisSessionState.CapturingAllocations)
+            if (entry.CancellationOperation is not null)
             {
                 throw new InvalidOperationException($"Session {sessionId} cannot be finished from state {entry.Session.State}.");
             }
 
-            var finishCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            entry.FinishCancellation = finishCancellation;
-            return StartOperationAsync(entry, OperationKind.Finish, async () =>
+            if (entry.ActiveOperationKind == OperationKind.Finish)
             {
-                try
-                {
-                    await FinishCoreAsync(entry, finishCancellation.Token).ConfigureAwait(false);
-                }
-                finally
-                {
-                    lock (entry.SyncRoot)
-                    {
-                        if (ReferenceEquals(entry.FinishCancellation, finishCancellation))
-                        {
-                            entry.FinishCancellation = null;
-                        }
-                    }
+                return entry.ActiveOperation!;
+            }
 
-                    finishCancellation.Dispose();
-                }
-            });
+            if (entry.ActiveOperation is not null || entry.Session.State != AnalysisSessionState.CapturingAllocations)
+            {
+                throw new InvalidOperationException($"Session {sessionId} cannot be finished from state {entry.Session.State}.");
+            }
+
+            var operationCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            return StartActiveOperationLocked(
+                entry,
+                OperationKind.Finish,
+                operationCancellation,
+                token => FinishCoreAsync(entry, token));
         }
     }
 
@@ -93,19 +94,9 @@ public sealed class AnalysisSessionCoordinator
 
         lock (entry.SyncRoot)
         {
-            if (entry.ActiveOperation is not null)
+            if (entry.CancellationOperation is not null)
             {
-                if (entry.ActiveOperationKind == OperationKind.Finish)
-                {
-                    var finish = entry.ActiveOperation;
-                    entry.FinishCancellation!.Cancel();
-                    return StartOperationAsync(
-                        entry,
-                        OperationKind.Cancel,
-                        () => CancelAfterFinishAsync(entry, finish));
-                }
-
-                return entry.ActiveOperation;
+                return entry.CancellationOperation;
             }
 
             if (entry.Session.State is AnalysisSessionState.Completed
@@ -115,7 +106,17 @@ public sealed class AnalysisSessionCoordinator
                 throw new InvalidOperationException($"Session {sessionId} cannot be canceled from state {entry.Session.State}.");
             }
 
-            return StartOperationAsync(entry, OperationKind.Cancel, () => CancelCoreAsync(entry));
+            if (entry.ActiveOperation is not null)
+            {
+                var activeOperation = entry.ActiveOperation;
+                var activeCancellation = entry.ActiveOperationCancellation
+                    ?? throw new InvalidOperationException("The active operation has no cancellation token.");
+                var cancellation = StartCancellationOperationLocked(entry, () => CancelAfterActiveAsync(entry, activeOperation));
+                activeCancellation.Cancel();
+                return cancellation;
+            }
+
+            return StartCancellationOperationLocked(entry, () => CancelAndCompleteAsync(entry, failSession: false));
         }
     }
 
@@ -123,19 +124,14 @@ public sealed class AnalysisSessionCoordinator
     {
         try
         {
-            MoveTo(entry.Session, AnalysisSessionState.Preflighting);
-            MoveTo(entry.Session, AnalysisSessionState.CapturingAllocations);
-            await _captureBackend.StartAllocationTraceAsync(entry.Session, cancellationToken).ConfigureAwait(false);
+            var start = AdmitStartLocked(entry, cancellationToken);
+            await start.ConfigureAwait(false);
 
-            if (!await PublishActiveLifecycleEventAsync(
-                    new CaptureStarted(entry.Session.Id, _timeProvider.GetUtcNow(), Source)).ConfigureAwait(false))
-            {
-                return;
-            }
+            await PublishCaptureStartedAsync(entry, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            await CancelCoreAsync(entry).ConfigureAwait(false);
+            await CompleteCancellationFromActiveCoreAsync(entry).ConfigureAwait(false);
         }
         catch (Exception)
         {
@@ -147,25 +143,27 @@ public sealed class AnalysisSessionCoordinator
     {
         try
         {
-            MoveTo(entry.Session, AnalysisSessionState.FinishingTrace);
-            await _captureBackend.StopAllocationTraceAsync(entry.Session, cancellationToken).ConfigureAwait(false);
-            cancellationToken.ThrowIfCancellationRequested();
+            await AdmitStageLocked(
+                entry,
+                AnalysisSessionState.FinishingTrace,
+                _captureBackend.StopAllocationTraceAsync,
+                cancellationToken).ConfigureAwait(false);
+            await AdmitStageLocked(
+                entry,
+                AnalysisSessionState.CapturingHeapSnapshot,
+                _captureBackend.CaptureHeapSnapshotAsync,
+                cancellationToken).ConfigureAwait(false);
+            await AdmitStageLocked(
+                entry,
+                AnalysisSessionState.Analyzing,
+                _analysisService.AnalyzeAsync,
+                cancellationToken).ConfigureAwait(false);
 
-            MoveTo(entry.Session, AnalysisSessionState.CapturingHeapSnapshot);
-            await _captureBackend.CaptureHeapSnapshotAsync(entry.Session, cancellationToken).ConfigureAwait(false);
-            cancellationToken.ThrowIfCancellationRequested();
-
-            MoveTo(entry.Session, AnalysisSessionState.Analyzing);
-            await _analysisService.AnalyzeAsync(entry.Session, cancellationToken).ConfigureAwait(false);
-            cancellationToken.ThrowIfCancellationRequested();
-
-            MoveTo(entry.Session, AnalysisSessionState.Completed);
-            await PublishTerminalLifecycleEventAsync(
-                new AnalysisCompleted(entry.Session.Id, _timeProvider.GetUtcNow(), Source)).ConfigureAwait(false);
+            await CompleteSessionAsync(entry, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            await CancelCoreAsync(entry).ConfigureAwait(false);
+            await CompleteCancellationFromActiveCoreAsync(entry).ConfigureAwait(false);
         }
         catch (Exception)
         {
@@ -173,65 +171,240 @@ public sealed class AnalysisSessionCoordinator
         }
     }
 
-    private async Task CancelAfterFinishAsync(SessionEntry entry, Task finish)
+    private Task AdmitStartLocked(SessionEntry entry, CancellationToken cancellationToken)
+    {
+        lock (entry.SyncRoot)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            MoveTo(entry.Session, AnalysisSessionState.Preflighting);
+            MoveTo(entry.Session, AnalysisSessionState.CapturingAllocations);
+            return _captureBackend.StartAllocationTraceAsync(entry.Session, cancellationToken);
+        }
+    }
+
+    private static Task AdmitStageLocked(
+        SessionEntry entry,
+        AnalysisSessionState nextState,
+        Func<AnalysisSession, CancellationToken, Task> operation,
+        CancellationToken cancellationToken)
+    {
+        lock (entry.SyncRoot)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            MoveTo(entry.Session, nextState);
+            return operation(entry.Session, cancellationToken);
+        }
+    }
+
+    private async Task PublishCaptureStartedAsync(SessionEntry entry, CancellationToken cancellationToken)
+    {
+        ValueTask publication;
+        lock (entry.SyncRoot)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            publication = _eventBus.PublishAsync(
+                new CaptureStarted(entry.Session.Id, _timeProvider.GetUtcNow(), Source),
+                CancellationToken.None);
+        }
+
+        try
+        {
+            await publication.ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // A started trace must be cleaned up before bounded lifecycle publication failure becomes a session failure.
+            await BeginFailureCleanupAsync(entry).ConfigureAwait(false);
+        }
+    }
+
+    private async Task CompleteSessionAsync(SessionEntry entry, CancellationToken cancellationToken)
+    {
+        ValueTask publication;
+        lock (entry.SyncRoot)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            MoveTo(entry.Session, AnalysisSessionState.Completed);
+            publication = _eventBus.PublishAsync(
+                new AnalysisCompleted(entry.Session.Id, _timeProvider.GetUtcNow(), Source),
+                CancellationToken.None);
+        }
+
+        await IgnoreTerminalPublicationFailureAsync(publication).ConfigureAwait(false);
+    }
+
+    private async Task CancelAfterActiveAsync(SessionEntry entry, Task activeOperation)
     {
         try
         {
-            await finish.ConfigureAwait(false);
+            await activeOperation.ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
-            // Finish cancellation is converted to the durable canceled session state below.
         }
 
-        await CancelCoreAsync(entry).ConfigureAwait(false);
+        await CancelAndCompleteAsync(entry, failSession: false).ConfigureAwait(false);
     }
 
-    private async Task CancelCoreAsync(SessionEntry entry)
+    private async Task CompleteCancellationFromActiveCoreAsync(SessionEntry entry)
     {
-        if (entry.Session.State is AnalysisSessionState.Completed
-            or AnalysisSessionState.Canceled
-            or AnalysisSessionState.Failed)
+        Task cancellation;
+        lock (entry.SyncRoot)
         {
+            if (entry.CancellationOperation is not null)
+            {
+                return;
+            }
+
+            cancellation = StartCancellationOperationLocked(entry, () => CancelAndCompleteAsync(entry, failSession: false));
+        }
+
+        await cancellation.ConfigureAwait(false);
+    }
+
+    private async Task BeginFailureCleanupAsync(SessionEntry entry)
+    {
+        Task cleanup;
+        lock (entry.SyncRoot)
+        {
+            if (entry.CancellationOperation is not null)
+            {
+                return;
+            }
+
+            cleanup = StartCancellationOperationLocked(entry, () => CancelAndCompleteAsync(entry, failSession: true));
+        }
+
+        await cleanup.ConfigureAwait(false);
+    }
+
+    private async Task CancelAndCompleteAsync(SessionEntry entry, bool failSession)
+    {
+        Exception? cancellationFailure = null;
+        try
+        {
+            var cancel = AdmitCancelLocked(entry);
+            await cancel.ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            cancellationFailure = exception;
+        }
+
+        if (failSession || cancellationFailure is not null)
+        {
+            await FailSessionAsync(entry).ConfigureAwait(false);
             return;
         }
 
-        try
+        ValueTask publication;
+        lock (entry.SyncRoot)
         {
-            MoveTo(entry.Session, AnalysisSessionState.Canceling);
-            await _captureBackend.CancelAsync(entry.Session, CancellationToken.None).ConfigureAwait(false);
+            if (entry.Session.State is AnalysisSessionState.Completed
+                or AnalysisSessionState.Canceled
+                or AnalysisSessionState.Failed)
+            {
+                return;
+            }
+
             MoveTo(entry.Session, AnalysisSessionState.Canceled);
-            await PublishTerminalLifecycleEventAsync(
-                new AnalysisCanceled(entry.Session.Id, _timeProvider.GetUtcNow(), Source)).ConfigureAwait(false);
+            publication = _eventBus.PublishAsync(
+                new AnalysisCanceled(entry.Session.Id, _timeProvider.GetUtcNow(), Source),
+                CancellationToken.None);
         }
-        catch (Exception)
+
+        await IgnoreTerminalPublicationFailureAsync(publication).ConfigureAwait(false);
+    }
+
+    private Task AdmitCancelLocked(SessionEntry entry)
+    {
+        lock (entry.SyncRoot)
         {
-            await FailSessionAsync(entry).ConfigureAwait(false);
+            if (entry.Session.State is AnalysisSessionState.Completed
+                or AnalysisSessionState.Canceled)
+            {
+                return Task.CompletedTask;
+            }
+
+            if (entry.Session.State is not AnalysisSessionState.Canceling and not AnalysisSessionState.Failed)
+            {
+                MoveTo(entry.Session, AnalysisSessionState.Canceling);
+            }
+
+            return _captureBackend.CancelAsync(entry.Session, CancellationToken.None);
         }
     }
 
-    private static Task StartOperationAsync(SessionEntry entry, OperationKind operationKind, Func<Task> operation)
+    private async Task FailSessionAsync(SessionEntry entry)
+    {
+        ValueTask publication;
+        lock (entry.SyncRoot)
+        {
+            if (entry.Session.State is AnalysisSessionState.Completed
+                or AnalysisSessionState.Canceled
+                or AnalysisSessionState.Failed)
+            {
+                return;
+            }
+
+            MoveTo(entry.Session, AnalysisSessionState.Failed);
+            publication = _eventBus.PublishAsync(
+                new AnalysisFailed(
+                    entry.Session.Id,
+                    SessionFailureCode,
+                    SessionFailureMessage,
+                    _timeProvider.GetUtcNow(),
+                    Source),
+                CancellationToken.None);
+        }
+
+        await IgnoreTerminalPublicationFailureAsync(publication).ConfigureAwait(false);
+    }
+
+    private static async Task IgnoreTerminalPublicationFailureAsync(ValueTask publication)
+    {
+        try
+        {
+            await publication.ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // A terminal state is already committed; bounded subscriber admission cannot reopen the session.
+        }
+    }
+
+    private static Task StartActiveOperationLocked(
+        SessionEntry entry,
+        OperationKind operationKind,
+        CancellationTokenSource operationCancellation,
+        Func<CancellationToken, Task> operation)
     {
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         entry.ActiveOperation = completion.Task;
         entry.ActiveOperationKind = operationKind;
-        _ = ExecuteOperationAsync(entry, completion, operation);
+        entry.ActiveOperationCancellation = operationCancellation;
+        _ = ExecuteActiveOperationAsync(entry, completion, operationCancellation, operation);
         return completion.Task;
     }
 
-    private static async Task ExecuteOperationAsync(
+    private static Task StartCancellationOperationLocked(SessionEntry entry, Func<Task> operation)
+    {
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        entry.CancellationOperation = completion.Task;
+        _ = ExecuteCancellationOperationAsync(entry, completion, operation);
+        return completion.Task;
+    }
+
+    private static async Task ExecuteActiveOperationAsync(
         SessionEntry entry,
         TaskCompletionSource completion,
-        Func<Task> operation)
+        CancellationTokenSource operationCancellation,
+        Func<CancellationToken, Task> operation)
     {
         try
         {
-            await operation().ConfigureAwait(false);
+            await operation(operationCancellation.Token).ConfigureAwait(false);
             completion.TrySetResult();
-        }
-        catch (OperationCanceledException cancellationException)
-        {
-            completion.TrySetCanceled(cancellationException.CancellationToken);
         }
         catch (Exception exception)
         {
@@ -245,59 +418,37 @@ public sealed class AnalysisSessionCoordinator
                 {
                     entry.ActiveOperation = null;
                     entry.ActiveOperationKind = null;
+                    entry.ActiveOperationCancellation = null;
                 }
             }
+
+            operationCancellation.Dispose();
         }
     }
 
-    private async Task<bool> PublishActiveLifecycleEventAsync<TEvent>(TEvent applicationEvent)
-        where TEvent : IApplicationEvent
+    private static async Task ExecuteCancellationOperationAsync(
+        SessionEntry entry,
+        TaskCompletionSource completion,
+        Func<Task> operation)
     {
         try
         {
-            await _eventBus.PublishAsync(applicationEvent, CancellationToken.None).ConfigureAwait(false);
-            return true;
+            await operation().ConfigureAwait(false);
+            completion.TrySetResult();
         }
-        catch (Exception)
+        catch (Exception exception)
         {
-            // Queue admission is bounded: an active session becomes Failed instead of exposing a bus exception to the UI.
-            var sessionId = applicationEvent.SessionId;
-            if (sessionId is { } id && _sessions.TryGetValue(id, out var entry))
+            completion.TrySetException(exception);
+        }
+        finally
+        {
+            lock (entry.SyncRoot)
             {
-                await FailSessionAsync(entry).ConfigureAwait(false);
+                if (ReferenceEquals(entry.CancellationOperation, completion.Task))
+                {
+                    entry.CancellationOperation = null;
+                }
             }
-
-            return false;
-        }
-    }
-
-    private async Task FailSessionAsync(SessionEntry entry)
-    {
-        if (entry.Session.State is AnalysisSessionState.Completed or AnalysisSessionState.Canceled or AnalysisSessionState.Failed)
-        {
-            return;
-        }
-
-        MoveTo(entry.Session, AnalysisSessionState.Failed);
-        await PublishTerminalLifecycleEventAsync(
-            new AnalysisFailed(
-                entry.Session.Id,
-                SessionFailureCode,
-                SessionFailureMessage,
-                _timeProvider.GetUtcNow(),
-                Source)).ConfigureAwait(false);
-    }
-
-    private async Task PublishTerminalLifecycleEventAsync<TEvent>(TEvent applicationEvent)
-        where TEvent : IApplicationEvent
-    {
-        try
-        {
-            await _eventBus.PublishAsync(applicationEvent, CancellationToken.None).ConfigureAwait(false);
-        }
-        catch (Exception)
-        {
-            // Terminal state changes are durable even when a bounded event subscriber cannot admit the event.
         }
     }
 
@@ -326,13 +477,14 @@ public sealed class AnalysisSessionCoordinator
 
         public OperationKind? ActiveOperationKind { get; set; }
 
-        public CancellationTokenSource? FinishCancellation { get; set; }
+        public CancellationTokenSource? ActiveOperationCancellation { get; set; }
+
+        public Task? CancellationOperation { get; set; }
     }
 
     private enum OperationKind
     {
         Start,
-        Finish,
-        Cancel
+        Finish
     }
 }
