@@ -182,6 +182,9 @@ Created
 Created/Preflighting/CapturingAllocations/FinishingTrace/CapturingHeapSnapshot/Analyzing
   -> Canceling -> Canceled
 
+Canceling
+  -> Failed（活动阶段或清理失败）
+
 任意非终态
   -> Failed
 ```
@@ -194,7 +197,7 @@ Created/Preflighting/CapturingAllocations/FinishingTrace/CapturingHeapSnapshot/A
 
 **结束采集并分析**：`FinishCapture` 只在 `CapturingAllocations` 状态可执行。它先禁止重复结束请求，再停止并关闭追踪文件，进入 `FinishingTrace`；追踪文件确认可读后采集 `.gcdump`，进入 `CapturingHeapSnapshot`；快照确认可读后，按顺序执行堆读取、分配追踪读取、类型关联，进入 `Analyzing`；成功时生成不可变报告并进入 `Completed`。
 
-**取消/关闭**：`CancelCapture` 可以由“取消”命令、关闭采集页面或退出程序触发。它使会话进入 `Canceling`，取消 EventPipe 和解析任务，等待受控停止，删除临时采集文件，最后进入 `Canceled`。取消不会自动采集堆快照，也不会产生可浏览的结果页。
+**取消/关闭**：`CancelCapture` 可以由“取消”命令、关闭采集页面或退出程序触发。它使会话进入 `Canceling`，并发发出任务令牌取消与幂等的后端升级取消，等待两条路径受控收敛，删除临时采集文件，最后进入 `Canceled`。若活动阶段或清理失败，则在清理尝试完成后由 `Canceling` 进入 `Failed`。取消不会自动采集堆快照，也不会产生可浏览的结果页。
 
 **导入**：`ImportGcdump` 直接创建会话并进入 `Analyzing`，不允许在导入会话上执行开始、结束或取消附着的采集命令。
 
@@ -258,7 +261,7 @@ Subscribe<TEvent>(handler, subscriptionOptions) -> IDisposable
 - 进度事件使用“按会话和事件类型覆盖最新值”策略；UI 只需最新进度，不需要每一个中间值。
 - 队列满时，优先合并/丢弃可合并进度事件；若非可合并事件无法投递，记录总线故障并使所属会话以受控失败结束，不允许悄悄丢失终态事件。
 - 订阅处理器抛出异常时，记录原始异常并生成轻量 `ModuleFaulted` 通知。总线不得递归地为处理 `ModuleFaulted` 失败再次发布 `ModuleFaulted`。
-- 订阅按所有者会话或应用生命周期注册；会话终态后协调器释放该会话订阅，应用退出时释放全部订阅并停止消费循环。
+- 订阅按所有者会话或应用生命周期注册；会话终态后协调器释放该会话订阅。应用退出时停止接收新事件、释放全部订阅并请求处理器取消，排空已接收事件并等待合作处理器在有限关闭预算内完成；预算耗尽仍在运行的非合作处理器必须记录告警，不能无限阻塞 WPF 关闭，也不能声称可强制终止任意处理器代码。进程退出会终止仍残留的用户代码。
 
 ## 8. 分析模型与展示
 
