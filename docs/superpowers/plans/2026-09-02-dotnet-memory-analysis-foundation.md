@@ -354,6 +354,7 @@ git commit -m "feat: add analysis session state model"
 **Files:**
 - Create: src/DotnetAnalysis.Application/Events/IEventBus.cs
 - Create: src/DotnetAnalysis.Application/Events/EventSubscriptionOptions.cs
+- Create: src/DotnetAnalysis.Application/Events/EventDeliveryException.cs
 - Create: src/DotnetAnalysis.Application/Events/InProcessEventBus.cs
 - Create: src/DotnetAnalysis.Application/Events/CaptureStarted.cs
 - Create: src/DotnetAnalysis.Application/Events/CaptureProgressChanged.cs
@@ -438,7 +439,7 @@ public sealed record ModuleFaulted(SessionId? SessionId, string Module, string M
 
 - [ ] **Step 4: Implement independent bounded subscription queues**
 
-InProcessEventBus owns subscription objects, not a static global registry. Each subscription owns a bounded Channel and one consumer task. PublishAsync takes a snapshot of matching subscriptions and enqueues independently. CaptureStarted and ModuleFaulted must never coalesce.
+InProcessEventBus owns subscription objects, not a static global registry. Each subscription owns a bounded Channel and one consumer task. PublishAsync takes a snapshot of matching subscriptions and attempts synchronous, non-blocking admission to every matching subscription independently. CaptureStarted and ModuleFaulted must never coalesce. If one of those events cannot enter a matching subscription's full bounded queue, PublishAsync fails fast with EventDeliveryException containing the event type and subscription identity after still attempting the healthy subscriptions; it must not wait for queue space or silently drop the event.
 
 A handler exception is logged and causes one ModuleFaulted notification. If the handler that failed was processing ModuleFaulted, log only; do not recursively publish another ModuleFaulted.
 
@@ -473,7 +474,7 @@ Run the focused test and verify it fails before adding progress replacement.
 
 - [ ] **Step 6: Implement progress replacement and fault isolation**
 
-While a subscription is busy, retain only the newest CaptureProgressChanged for that SessionId. On disposal, remove the subscription, complete its channel, and ensure the bus DisposeAsync waits for each consumer task.
+While a subscription is busy, retain only the newest CaptureProgressChanged for that SessionId. Progress is best effort: a pending value is retained only after its per-session marker enters the bounded queue, so pending-progress state is bounded by QueueCapacity; a progress update with no available marker slot may be dropped. On subscription disposal, reject new events, complete the writer, and drain every event already admitted. The bus retains retired subscriptions until their consumer completes. On bus shutdown, request handler cancellation and wait only for a bounded timeout; log each non-cooperative handler still running at timeout rather than indefinitely blocking disposal or claiming to forcibly cancel handler code.
 
 Add a test with one throwing CaptureStarted subscriber and one healthy subscriber. Assert the healthy subscriber still receives CaptureStarted.
 

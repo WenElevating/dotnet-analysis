@@ -9,14 +9,27 @@ public sealed class InProcessEventBus : IEventBus
     private readonly object _gate = new();
     private readonly ILogger<InProcessEventBus> _logger;
     private readonly List<IEventSubscription> _subscriptions = [];
+    private readonly List<IEventSubscription> _retiredSubscriptions = [];
+    private readonly TimeSpan _shutdownTimeout;
+    private readonly Action<ILogger, string, Exception?> _shutdownTimedOut;
     private bool _disposed;
 
-    public InProcessEventBus(ILogger<InProcessEventBus> logger)
+    public InProcessEventBus(ILogger<InProcessEventBus> logger, TimeSpan? shutdownTimeout = null)
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _shutdownTimeout = shutdownTimeout ?? TimeSpan.FromSeconds(1);
+        if (_shutdownTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(shutdownTimeout), "Shutdown timeout must be greater than zero.");
+        }
+
+        _shutdownTimedOut = LoggerMessage.Define<string>(
+            LogLevel.Warning,
+            new EventId(2, "EventSubscriptionShutdownTimedOut"),
+            "Event subscription {SubscriptionIdentity} did not complete before the shutdown timeout.");
     }
 
-    public async ValueTask PublishAsync<TEvent>(TEvent applicationEvent, CancellationToken cancellationToken)
+    public ValueTask PublishAsync<TEvent>(TEvent applicationEvent, CancellationToken cancellationToken)
         where TEvent : IApplicationEvent
     {
         ArgumentNullException.ThrowIfNull(applicationEvent);
@@ -31,9 +44,16 @@ public sealed class InProcessEventBus : IEventBus
                 .ToArray();
         }
 
-        await Task.WhenAll(subscriptions
-            .Select(subscription => subscription.EnqueueAsync(applicationEvent, cancellationToken).AsTask()))
-            .ConfigureAwait(false);
+        EventDeliveryException? firstDeliveryFailure = null;
+        foreach (var subscription in subscriptions)
+        {
+            var deliveryFailure = subscription.TryEnqueue(applicationEvent);
+            firstDeliveryFailure ??= deliveryFailure;
+        }
+
+        return firstDeliveryFailure is null
+            ? ValueTask.CompletedTask
+            : ValueTask.FromException(firstDeliveryFailure);
     }
 
     public IDisposable Subscribe<TEvent>(
@@ -58,7 +78,8 @@ public sealed class InProcessEventBus : IEventBus
                 handler,
                 effectiveOptions,
                 _logger,
-                RemoveSubscription,
+                RetireSubscription,
+                ReleaseRetiredSubscription,
                 PublishFaultAsync);
             _subscriptions.Add(subscription);
             return subscription;
@@ -76,16 +97,27 @@ public sealed class InProcessEventBus : IEventBus
             }
 
             _disposed = true;
-            subscriptions = [.. _subscriptions];
+            subscriptions = [.. _subscriptions, .. _retiredSubscriptions];
             _subscriptions.Clear();
         }
 
         foreach (var subscription in subscriptions)
         {
             subscription.Dispose();
+            subscription.RequestHandlerCancellation();
         }
 
-        await Task.WhenAll(subscriptions.Select(subscription => subscription.Completion)).ConfigureAwait(false);
+        var completion = Task.WhenAll(subscriptions.Select(subscription => subscription.Completion));
+        if (await Task.WhenAny(completion, Task.Delay(_shutdownTimeout)).ConfigureAwait(false) == completion)
+        {
+            await completion.ConfigureAwait(false);
+            return;
+        }
+
+        foreach (var subscription in subscriptions.Where(subscription => !subscription.Completion.IsCompleted))
+        {
+            _shutdownTimedOut(_logger, subscription.Identity, null);
+        }
     }
 
     private ValueTask PublishFaultAsync(ModuleFaulted fault)
@@ -93,11 +125,23 @@ public sealed class InProcessEventBus : IEventBus
         return PublishAsync(fault, CancellationToken.None);
     }
 
-    private void RemoveSubscription(IEventSubscription subscription)
+    private void RetireSubscription(IEventSubscription subscription)
     {
         lock (_gate)
         {
             _subscriptions.Remove(subscription);
+            if (!_retiredSubscriptions.Contains(subscription))
+            {
+                _retiredSubscriptions.Add(subscription);
+            }
+        }
+    }
+
+    private void ReleaseRetiredSubscription(IEventSubscription subscription)
+    {
+        lock (_gate)
+        {
+            _retiredSubscriptions.Remove(subscription);
         }
     }
 
@@ -107,41 +151,55 @@ public sealed class InProcessEventBus : IEventBus
 
         Type EventType { get; }
 
-        ValueTask EnqueueAsync(IApplicationEvent @event, CancellationToken cancellationToken);
+        string Identity { get; }
+
+        EventDeliveryException? TryEnqueue(IApplicationEvent applicationEvent);
+
+        void RequestHandlerCancellation();
     }
 
     private sealed class EventSubscription<TEvent> : IEventSubscription
         where TEvent : IApplicationEvent
     {
-        private readonly CancellationTokenSource _shutdown = new();
-        private readonly object _progressGate = new();
+        private readonly CancellationTokenSource _handlerCancellation = new();
+        private readonly object _admissionGate = new();
         private readonly Channel<SubscriptionWorkItem> _queue;
         private readonly Func<TEvent, CancellationToken, ValueTask> _handler;
         private readonly ILogger _logger;
-        private readonly Action<IEventSubscription> _remove;
+        private readonly Action<IEventSubscription> _retire;
+        private readonly Action<IEventSubscription> _release;
         private readonly Func<ModuleFaulted, ValueTask> _publishFault;
         private readonly bool _coalesceProgressEvents;
         private readonly Dictionary<ProgressSessionKey, CaptureProgressChanged> _pendingProgress = [];
-        private readonly Dictionary<ProgressSessionKey, Task> _progressMarkers = [];
+        private readonly HashSet<ProgressSessionKey> _progressMarkers = [];
         private readonly Action<ILogger, string, Exception?> _handlerFailed;
-        private int _disposed;
+        private readonly Action<ILogger, Exception?> _faultPublicationFailed;
+        private readonly string _identity;
+        private bool _accepting = true;
 
         public EventSubscription(
             Func<TEvent, CancellationToken, ValueTask> handler,
             EventSubscriptionOptions options,
             ILogger logger,
-            Action<IEventSubscription> remove,
+            Action<IEventSubscription> retire,
+            Action<IEventSubscription> release,
             Func<ModuleFaulted, ValueTask> publishFault)
         {
             _handler = handler;
             _logger = logger;
-            _remove = remove;
+            _retire = retire;
+            _release = release;
             _publishFault = publishFault;
             _coalesceProgressEvents = options.CoalesceProgressEvents;
+            _identity = $"{typeof(TEvent).FullName}/{Guid.NewGuid():N}";
             _handlerFailed = LoggerMessage.Define<string>(
                 LogLevel.Error,
                 new EventId(1, "EventHandlerFailed"),
                 "Event handler failed for {EventType}.");
+            _faultPublicationFailed = LoggerMessage.Define(
+                LogLevel.Error,
+                new EventId(3, "ModuleFaultedDeliveryFailed"),
+                "Could not publish ModuleFaulted after an event handler failure.");
             _queue = Channel.CreateBounded<SubscriptionWorkItem>(new BoundedChannelOptions(options.QueueCapacity)
             {
                 FullMode = BoundedChannelFullMode.Wait,
@@ -156,44 +214,53 @@ public sealed class InProcessEventBus : IEventBus
 
         public Type EventType => typeof(TEvent);
 
-        public async ValueTask EnqueueAsync(IApplicationEvent applicationEvent, CancellationToken cancellationToken)
+        public string Identity => _identity;
+
+        public EventDeliveryException? TryEnqueue(IApplicationEvent applicationEvent)
         {
-            if (Volatile.Read(ref _disposed) != 0)
+            lock (_admissionGate)
             {
-                return;
-            }
+                if (!_accepting)
+                {
+                    return null;
+                }
 
-            if (_coalesceProgressEvents && applicationEvent is CaptureProgressChanged progress)
-            {
-                await EnqueueCoalescedProgressAsync(progress, cancellationToken).ConfigureAwait(false);
-                return;
-            }
+                if (_coalesceProgressEvents && applicationEvent is CaptureProgressChanged progress)
+                {
+                    TryEnqueueProgress(progress);
+                    return null;
+                }
 
-            try
-            {
-                await _queue.Writer.WriteAsync(
-                    new EventWorkItem((TEvent)applicationEvent),
-                    cancellationToken).ConfigureAwait(false);
-            }
-            catch (ChannelClosedException) when (Volatile.Read(ref _disposed) != 0)
-            {
+                return _queue.Writer.TryWrite(new EventWorkItem((TEvent)applicationEvent))
+                    ? null
+                    : new EventDeliveryException(applicationEvent.GetType(), Identity);
             }
         }
 
         public void Dispose()
         {
-            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            lock (_admissionGate)
             {
-                return;
+                if (!_accepting)
+                {
+                    return;
+                }
+
+                _accepting = false;
             }
 
-            _remove(this);
-            _shutdown.Cancel();
+            _retire(this);
             _queue.Writer.TryComplete();
-            lock (_progressGate)
+        }
+
+        public void RequestHandlerCancellation()
+        {
+            try
             {
-                _pendingProgress.Clear();
-                _progressMarkers.Clear();
+                _handlerCancellation.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
             }
         }
 
@@ -201,13 +268,8 @@ public sealed class InProcessEventBus : IEventBus
         {
             try
             {
-                await foreach (var workItem in _queue.Reader.ReadAllAsync(_shutdown.Token).ConfigureAwait(false))
+                await foreach (var workItem in _queue.Reader.ReadAllAsync().ConfigureAwait(false))
                 {
-                    if (Volatile.Read(ref _disposed) != 0)
-                    {
-                        return;
-                    }
-
                     if (!TryGetEvent(workItem, out var applicationEvent))
                     {
                         continue;
@@ -215,11 +277,10 @@ public sealed class InProcessEventBus : IEventBus
 
                     try
                     {
-                        await _handler(applicationEvent, _shutdown.Token).ConfigureAwait(false);
+                        await _handler(applicationEvent, _handlerCancellation.Token).ConfigureAwait(false);
                     }
-                    catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
+                    catch (OperationCanceledException) when (_handlerCancellation.IsCancellationRequested)
                     {
-                        return;
                     }
                     catch (Exception exception)
                     {
@@ -231,50 +292,25 @@ public sealed class InProcessEventBus : IEventBus
                     }
                 }
             }
-            catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
-            {
-            }
             finally
             {
-                _shutdown.Dispose();
+                _handlerCancellation.Dispose();
+                _release(this);
             }
         }
 
-        private async ValueTask EnqueueCoalescedProgressAsync(
-            CaptureProgressChanged progress,
-            CancellationToken cancellationToken)
+        private void TryEnqueueProgress(CaptureProgressChanged progress)
         {
             var sessionKey = new ProgressSessionKey(progress.SessionId?.Value);
-            Task markerWrite;
-            lock (_progressGate)
+            if (_progressMarkers.Contains(sessionKey))
             {
-                if (Volatile.Read(ref _disposed) != 0)
-                {
-                    return;
-                }
-
                 _pendingProgress[sessionKey] = progress;
-                if (!_progressMarkers.TryGetValue(sessionKey, out markerWrite!))
-                {
-                    markerWrite = EnqueueProgressMarkerAsync(new ProgressWorkItem(sessionKey));
-                    _progressMarkers.Add(sessionKey, markerWrite);
-                }
+                return;
             }
 
-            await markerWrite.WaitAsync(cancellationToken).ConfigureAwait(false);
-        }
-
-        private async Task EnqueueProgressMarkerAsync(ProgressWorkItem marker)
-        {
-            try
+            if (_queue.Writer.TryWrite(new ProgressWorkItem(sessionKey, progress)))
             {
-                await _queue.Writer.WriteAsync(marker, _shutdown.Token).ConfigureAwait(false);
-            }
-            catch (ChannelClosedException) when (Volatile.Read(ref _disposed) != 0)
-            {
-            }
-            catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
-            {
+                _progressMarkers.Add(sessionKey);
             }
         }
 
@@ -287,7 +323,7 @@ public sealed class InProcessEventBus : IEventBus
             }
 
             var progressWorkItem = (ProgressWorkItem)workItem;
-            lock (_progressGate)
+            lock (_admissionGate)
             {
                 _progressMarkers.Remove(progressWorkItem.SessionKey);
                 if (_pendingProgress.Remove(progressWorkItem.SessionKey, out var progress))
@@ -295,19 +331,11 @@ public sealed class InProcessEventBus : IEventBus
                     applicationEvent = (TEvent)(IApplicationEvent)progress;
                     return true;
                 }
+
+                applicationEvent = (TEvent)(IApplicationEvent)progressWorkItem.InitialProgress;
+                return true;
             }
-
-            applicationEvent = default!;
-            return false;
         }
-
-        private abstract record SubscriptionWorkItem;
-
-        private sealed record EventWorkItem(TEvent Event) : SubscriptionWorkItem;
-
-        private sealed record ProgressWorkItem(ProgressSessionKey SessionKey) : SubscriptionWorkItem;
-
-        private readonly record struct ProgressSessionKey(Guid? Value);
 
         private async ValueTask PublishHandlerFaultAsync(TEvent applicationEvent, Exception exception)
         {
@@ -323,6 +351,20 @@ public sealed class InProcessEventBus : IEventBus
             catch (ObjectDisposedException)
             {
             }
+            catch (EventDeliveryException deliveryException)
+            {
+                _faultPublicationFailed(_logger, deliveryException);
+            }
         }
+
+        private abstract record SubscriptionWorkItem;
+
+        private sealed record EventWorkItem(TEvent Event) : SubscriptionWorkItem;
+
+        private sealed record ProgressWorkItem(
+            ProgressSessionKey SessionKey,
+            CaptureProgressChanged InitialProgress) : SubscriptionWorkItem;
+
+        private readonly record struct ProgressSessionKey(Guid? Value);
     }
 }
