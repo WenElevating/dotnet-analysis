@@ -825,7 +825,7 @@ git commit -m "feat: add desktop application shell"
 - Consumes: all projects from Tasks 1–5.
 - Produces: a clean, verified baseline for the CoreCLR process-discovery and EventPipe capture plan.
 
-- [ ] **Step 1: Run all automated validation**
+- [x] **Step 1: Run all automated validation**
 
 ~~~powershell
 dotnet restore DotnetAnalysis.sln
@@ -836,7 +836,7 @@ dotnet format DotnetAnalysis.sln --verify-no-changes --no-restore
 
 Expected: every command exits 0; build and tests report zero warnings/errors.
 
-- [ ] **Step 2: Perform requirement QA**
+- [x] **Step 2: Perform requirement QA**
 
 Verify each item with source and test evidence:
 
@@ -852,7 +852,7 @@ Verify each item with source and test evidence:
 [ ] Application start and close leave no event-bus consumer task running.
 ~~~
 
-- [ ] **Step 3: Perform independent implementation QA**
+- [x] **Step 3: Perform independent implementation QA**
 
 Run:
 
@@ -864,11 +864,11 @@ dotnet list DotnetAnalysis.sln package --include-transitive
 
 Expected: no forbidden runtime dependency, no global event bus, no CLI wrapper, and no Desktop-to-Diagnostics reference.
 
-- [ ] **Step 4: Repair every actionable finding and repeat validation**
+- [x] **Step 4: Repair every actionable finding and repeat validation**
 
 For every finding: add a regression test, run it to observe failure, apply the smallest repair, rerun the focused test, then rerun Steps 1–3. Repeat no more than three review/repair loops. If a check is blocked by the machine, record the exact command and observed blocker in the delivery note.
 
-- [ ] **Step 5: Confirm repository state**
+- [x] **Step 5: Confirm repository state**
 
 Run:
 
