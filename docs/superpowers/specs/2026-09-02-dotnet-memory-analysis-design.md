@@ -1,337 +1,356 @@
-# .NET 内存分析工具：首版设计
+# .NET 内存分析工具：首版多快照诊断设计
 
-**日期：** 2026-09-02  
-**状态：** 已完成讨论，待书面评审  
-**范围：** Windows x64 本机 CoreCLR 进程的托管内存分析首版
+**日期：** 2026-09-02
+**状态：** 已完成设计讨论，待书面评审
+**范围：** Windows x64 本机 .NET 8、.NET 9、.NET 10 CoreCLR 进程的托管内存分析
 
-## 1. 目标与范围
+## 1. 目标、范围与术语
 
-首版面向 Windows x64 本机运行的 .NET 8、.NET 9 和 .NET 10 CoreCLR 进程，提供一个桌面端托管内存分析工作流：
+首版用于分析本机 Windows x64 上运行的 .NET 8、.NET 9 和 .NET 10 CoreCLR 进程。用户附着一个进程后，可以持续观察内存时间线，并在任意时刻多次截取内存快照。
 
-1. 用户选择运行中的目标进程并附着。
-2. 工具从附着成功时开始记录对象分配事件与调用栈。
-3. 用户显式点击“结束采集并分析”。
-4. 工具停止分配追踪、保存 `.nettrace`，再采集当前托管堆的 `.gcdump`。
-5. 后台分析两类采集文件，统一展示类型占用排行和分配调用栈。
+每一份快照回答两个不同的问题：
 
-首版还支持导入已有 `.gcdump`，导入后复用同一堆分析管线。
+1. **这一刻还占着内存的是什么？** 由 `.gcdump` 的堆图提供类型、对象和引用链。
+2. **从上一份成功快照到这一份快照，什么分配最热？** 由附着期间持续收集的分配样本提供类型级热点调用栈。
 
-首版不支持实际解析 `.dmp`，但架构应预留读取器扩展点。首版不做 GC Root 引用路径、对象字段浏览、支配树计算、远程进程、容器、Linux、.NET Framework 或常驻监控。
+本设计中的“快照文件”是成功保存的 `.gcdump`；不使用“制品”一词。
 
-## 2. 关键语义
+首版支持：
 
-`.gcdump` 与 `.nettrace` 提供不同证据，界面与模型必须严格区分：
+- 选择并附着运行中的进程。
+- 持续显示“托管堆”和“进程内存”两条时间线。
+- 多次截取 `.gcdump` 快照。
+- 查看类型占用、对象列表、引用链和区间分配热点调用栈。
+- 导入已有 `.gcdump`。
+- 为 `.dmp` 预留读取扩展点，但不实现 `.dmp` 解析。
 
-| 数据 | 来源 | 含义 |
-| --- | --- | --- |
-| 当前占用 | `.gcdump` | 结束采集时仍在托管堆中的对象和类型总量 |
-| 分配热点 | `.nettrace` | 附着到用户结束采集期间观察到的分配事件及调用栈 |
+首版不支持：远程进程、Linux、容器、.NET Framework、对象实例的精确创建栈、常驻历史录制、GC Root 以外的复杂堆图算法、符号自动下载或转储文件解析。
 
-两类结果只按规范化的类型标识关联，不声明某个当前对象可对应到其历史分配调用栈。
+最低操作系统前提为 Windows 10 22H2（含 2023-09 累积更新）或 Windows 11 22H2（含 2023-09 累积更新）及更高版本。该前提用于稳定取得与 Windows 任务管理器“内存”列一致的进程内存口径。
 
-分配追踪与大堆快照均可能产生采样/估算数据。所有相关结果必须带 `Exact` 或 `Estimated` 精度标记，避免将估算结果表述为精确结果。
+## 2. 关键产品语义
 
-## 3. 用户工作流与状态
-
-### 3.1 运行中进程采集
+### 2.1 附着、多快照与分配区间
 
 ```text
-选择进程
-  -> 运行时与权限预检
-  -> 附着并开始分配追踪
-  -> 用户复现问题
-  -> 结束采集并分析
-  -> 停止并保存 .nettrace
-  -> 采集 .gcdump
-  -> 后台分析
-  -> 显示结果
+附着进程
+  ├─ 持续采样
+  │    ├─ 托管堆
+  │    ├─ 进程内存
+  │    └─ 分配调用栈样本
+  │
+  └─ 用户多次截取快照
+       ├─ 立即开始采集当前 .gcdump
+       ├─ 保存当前堆中的类型、对象、引用链
+       └─ 封存上一成功快照到当前快照的分配热点
 ```
 
-采集没有固定时长。用户显式结束时，系统必须先完成分配追踪文件的停止与持久化，再开始堆快照采集。
+点击“截取快照”立即开始采集，不再有“结束录制后才采集一次快照”的流程。一次 `.gcdump` 采集可能造成目标进程短暂停顿，这是首版已接受的诊断成本。
 
-关闭采集窗口或退出程序视为取消：立即停止附着和后台工作、删除本次临时采集文件，不采集堆快照，不生成分析结果。
+每次成功快照都对应一个分配区间：
 
-### 3.2 文件导入
+| 快照 | 分配区间 |
+| --- | --- |
+| 快照 #1 | 附着成功到快照 #1 成功保存 |
+| 快照 #N | 快照 #N-1 成功保存到快照 #N 成功保存 |
 
-导入 `.gcdump` 跳过附着和采集，直接进入相同的堆读取、模型构建和结果展示流程。
+失败或取消的截取不创建快照，也不切分分配区间。后续成功快照继续从上一份成功快照开始统计。
 
-## 4. 工程结构
+`RequestedAtUtc` 记录用户点击时间，`CaptureStartedAtUtc` 记录诊断层开始采集时间，`CapturedAtUtc` 记录快照文件成功保存时间。分配区间以成功保存的 `CapturedAtUtc` 为边界，避免把失败采集误当成时间边界。
 
-```text
-src/
-  DotnetAnalysis.Desktop/       WPF 界面、ViewModel、窗口与用户交互
-  DotnetAnalysis.Application/   用例编排、采集会话状态机、接口与事件
-  DotnetAnalysis.Core/          纯领域模型、分析结果、值对象
-  DotnetAnalysis.Diagnostics/   EventPipe、采集文件读取与微软诊断库实现
-tests/
-  DotnetAnalysis.Tests/         Core、Application、Diagnostics 的测试
-```
+### 2.2 调用栈与引用链的语义
 
-依赖方向必须保持为：
+对某个类型查看“调用栈”时，展示的是：**该类型在所属分配区间内观测到的类型级分配热点调用栈**。它不是某一个对象实例的精确创建调用栈。
+
+对象详情中的引用链独立回答“这个对象为什么仍然存活”。调用栈和引用链不能相互推导，也不能宣称一一对应。
+
+分配热点始终是采样结果。即使采样流未发现中断，也不得向上层或 UI 表述为“记录了每一次分配”。
+
+### 2.3 时间线语义
+
+时间线固定包含两条：
+
+- **托管堆**：当前托管堆使用量。
+- **进程内存**：内部使用与 Windows 任务管理器“内存”列一致的私有工作集口径；上层和 UI 不暴露 Windows API 或性能计数器术语。
+
+时间线不把读数缺失画成零。每个点显式带状态，允许 UI 显示中断或会话结束。
+
+## 3. 分层架构与依赖方向
 
 ```text
 Desktop -> Application -> Core
-Diagnostics -> Application + Core
-Tests -> 被测项目
+                     ↑
+Diagnostics ---------+
 ```
 
-`Desktop` 不得直接访问 PID、EventPipe 或采集文件解析细节。`Core` 不得依赖 WPF、微软诊断库或文件系统。`Diagnostics` 是唯一允许引用微软诊断包的项目。
-
-### 4.1 项目职责与引用约束
-
-| 项目 | 允许依赖 | 负责内容 | 明确禁止 |
+| 项目 | 职责 | 允许依赖 | 明确禁止 |
 | --- | --- | --- | --- |
-| `DotnetAnalysis.Core` | 仅 BCL | 值对象、状态、分析结果、排序/聚合规则、接口共享的事件定义 | WPF、诊断 SDK、文件 I/O、依赖注入容器 |
-| `DotnetAnalysis.Application` | `Core`、BCL、日志抽象 | 用例、会话状态机、取消、事件总线、接口定义、错误映射 | WPF 控件、TraceEvent 具体类型、直接解析采集文件 |
-| `DotnetAnalysis.Diagnostics` | `Core`、`Application`、微软诊断包 | 本机 CoreCLR 发现与预检、EventPipe 追踪、快照采集、读取 `.gcdump` / `.nettrace` | ViewModel、窗口、业务流程状态机 |
-| `DotnetAnalysis.Desktop` | `Core`、`Application`、WPF | 组合根、轻量 MVVM、导航、命令绑定、UI 线程调度 | `Diagnostics` 的实现类型、采集文件格式细节 |
-| `DotnetAnalysis.Tests` | 被测项目、测试库 | 规则测试、状态机测试、采集文件样本测试、WPF ViewModel 测试 | 生产环境服务注册 |
+| `DotnetAnalysis.Core` | 值对象、不可变数据模型、状态转换规则、应用事件基础契约 | BCL | WPF、文件系统、诊断 SDK、DI 容器 |
+| `DotnetAnalysis.Application` | 用例编排、附着会话和快照工作流、事件总线、面向 UI 的诊断契约 | `Core`、BCL、日志抽象 | EventPipe/TraceEvent 具体类型、WPF 控件、诊断文件格式 |
+| `DotnetAnalysis.Diagnostics` | Windows 进程、EventPipe、`.gcdump` 采集与读取、内存采样 | `Application`、`Core`、诊断 SDK | ViewModel、窗口、Application 工作流状态 |
+| `DotnetAnalysis.Desktop` | WPF、轻量 MVVM、命令、导航、组合根、UI 线程切换 | `Application`、`Core`、WPF | 诊断实现类型、PID/文件格式/EventPipe 细节 |
+| `DotnetAnalysis.Tests` | 单元、集成和契约测试 | 被测项目、测试库 | 生产服务注册 |
 
-`Desktop` 不直接引用 `Diagnostics`。组合根在启动时只面向 `Application` 的接口注册诊断实现，因此 ViewModel 不会在编译期耦合 EventPipe、TraceEvent、`.gcdump` 或 `.nettrace`。
+`Desktop` 只依赖 `Application` 暴露的接口；组合根可以注册 `Diagnostics` 的实现，但 ViewModel 不得引用其实现类型。`Core` 不得知道诊断连接、磁盘路径或 UI。
 
-### 4.2 框架目录与关键类型
+## 4. 上层稳定诊断契约
+
+上层只认识以下诊断对象：
 
 ```text
-src/
-  DotnetAnalysis.Core/
-    Processes/                 TargetProcess, RuntimeCapability
-    Sessions/                  AnalysisSession, AnalysisSessionState, SessionId
-    Results/                   HeapTypeRow, HeapObjectSample, AllocationCallTree
-    Events/                    IApplicationEvent, 事件记录类型
-  DotnetAnalysis.Application/
-    Contracts/                 IProcessCatalog, ICaptureCoordinator, IAnalysisService
-    UseCases/                  StartCapture, FinishCapture, CancelCapture, ImportGcdump
-    Sessions/                  AnalysisSessionCoordinator, 会话状态机
-    Events/                    IEventBus, InProcessEventBus, 订阅生命周期
-    Errors/                    AnalysisFailure, 用户可见错误映射
-  DotnetAnalysis.Diagnostics/
-    Processes/                 CoreClrProcessCatalog, RuntimeProbe
-    Capture/                   EventPipeAllocationTraceCapture, GcDumpSnapshotCapture
-    Readers/                   GcDumpReader, NetTraceReader, IAnalysisFileReader
-    Analysis/                  HeapAnalyzer, AllocationAnalyzer, ResultCorrelator
-  DotnetAnalysis.Desktop/
-    Infrastructure/            ObservableObject, RelayCommand, AsyncRelayCommand
-    ViewModels/                ProcessList, Capture, Results, TypeDetail
-    Views/                     对应 XAML 页面
-    Composition/               服务注册、UI 调度器适配器
+IProcessDiagnostics
+IProcessDiagnosticsSession
+TargetProcess
+MemoryUsageSample
+MemorySnapshot
+MemorySnapshotAnalysis
+AllocationProfile
 ```
 
-接口、会话状态和结果模型的命名以领域含义为准；采集器和读取器的具体技术名仅停留在 `Diagnostics` 内部。
+```csharp
+public interface IProcessDiagnostics
+{
+    Task<IReadOnlyList<TargetProcess>> GetProcessesAsync(
+        CancellationToken cancellationToken);
 
-## 5. 技术栈
+    Task<IProcessDiagnosticsSession> AttachAsync(
+        TargetProcess process,
+        CancellationToken cancellationToken);
 
-- .NET 10，使用 `global.json` 固定 SDK 版本。
-- WPF 桌面界面。
-- 自研极简 MVVM，不引入第三方 MVVM 包。
-  - `ObservableObject`：`INotifyPropertyChanged` 和 `SetProperty`。
-  - `RelayCommand`：同步命令。
-  - `AsyncRelayCommand`：异步执行状态、取消入口和异常回传。
-- 内置依赖注入和日志抽象。
-- `Microsoft.Diagnostics.NETCore.Client`：进程发现、诊断连接、EventPipe 会话和 dump 相关能力。
-- TraceEvent：`.gcdump` / `.nettrace` 读取和事件分析。
-- 后续 `.dmp` 读取器将接入 ClrMD，但不是首版依赖。
+    Task<MemorySnapshot> OpenSnapshotAsync(
+        string filePath,
+        CancellationToken cancellationToken);
+}
 
-不使用外部 `dotnet-gcdump` 或 `dotnet-trace` 进程作为运行时依赖；这些 CLI 工具仅用于人工交叉验证和测试数据准备。
+public interface IProcessDiagnosticsSession : IAsyncDisposable
+{
+    TargetProcess Process { get; }
 
-### 5.1 包与版本策略
+    IAsyncEnumerable<MemoryUsageSample> GetMemoryUsageAsync(
+        CancellationToken cancellationToken);
 
-| 位置 | 技术/包 | 作用 | 版本策略 |
-| --- | --- | --- | --- |
-| 全部项目 | .NET 10 / C# | 运行时与语言基线 | 用 `global.json` 固定已验证 SDK；不跟随本机预览 SDK 漂移 |
-| `Desktop` | WPF | Windows 桌面 UI | 仅使用框架自带控件和自研 MVVM 基础类 |
-| `Application` | `Microsoft.Extensions.DependencyInjection`、`Microsoft.Extensions.Logging.Abstractions` | 组合根依赖注入、结构化日志抽象 | 只使用必要基础包，不引入通用消息总线框架 |
-| `Diagnostics` | `Microsoft.Diagnostics.NETCore.Client` | PID 诊断连接与 EventPipe 会话 | 与支持的 .NET 运行时组合做兼容性测试 |
-| `Diagnostics` | TraceEvent | `.gcdump`、`.nettrace` 的读取和事件处理 | 先以固定版本验证样本，再做升级 |
-| 未来扩展 | ClrMD | `.dmp` 读取与离线堆分析 | 不进入首版项目引用 |
+    Task<MemorySnapshot> CaptureSnapshotAsync(
+        CancellationToken cancellationToken);
+}
+```
 
-首版不使用 ORM、数据库、第三方 MVVM、第三方事件总线、反射扫描式容器、源生成命令或网络符号下载。它们都不解决首版核心问题，并会扩大启动、调试或诊断过程的复杂度。
+`IProcessDiagnostics` 是应用级入口，负责列出进程、附着和打开已有快照。`IProcessDiagnosticsSession` 是一个已经附着的、带状态的诊断上下文；它的生命周期跟随“附着”，而非任一份快照。
 
-## 6. 应用层接口与职责
+`TargetProcess` 至少包含 `ProcessId` 和 `StartedAtUtc`。附着前和每次采集前都复核这两个值，防止 PID 被复用后误采集其他进程。
 
-`Application` 提供明确的用例入口，至少包括：
+诊断 SDK、EventPipe Session、TraceEvent、文件路径、临时目录和底层异常都不得穿过上述边界。
 
-- 列出并预检可分析进程。
-- 开始采集会话。
-- 正常结束采集并开始分析。
-- 取消采集会话。
-- 导入 `.gcdump`。
-- 查询分析会话、类型排行、类型详情和分配调用树。
+## 5. 数据模型
 
-`Diagnostics` 通过接口实现下列能力：
+### 5.1 时间线与分配数据
 
-- 进程发现与 CoreCLR 能力探测。
-- 分配追踪的开始、停止与文件写入。
-- 堆快照采集。
-- `.gcdump` 读取。
-- `.nettrace` 读取。
-- 未来 `.dmp` 读取。
+```csharp
+public sealed record MemoryUsageSample(
+    DateTimeOffset ObservedAtUtc,
+    long? ManagedHeapBytes,
+    long? ProcessMemoryBytes,
+    MemoryUsageSampleState State);
+```
 
-首版在单个桌面进程中运行采集与分析；应用层接口不暴露进程内实现，以便未来增加本地提权采集助手而不改 UI 或分析模型。
-
-### 6.1 会话状态机
+`MemoryUsageSampleState` 使用 `Measured`、`Unavailable`、`SessionEnded` 三种清晰状态。`Unavailable` 表示本次无法取得读数；字段为 `null`，不得用 `0` 替代。
 
 ```text
-Created
-  -> Preflighting
-  -> CapturingAllocations
-  -> FinishingTrace
-  -> CapturingHeapSnapshot
-  -> Analyzing
-  -> Completed
-
-Created/Preflighting/CapturingAllocations/FinishingTrace/CapturingHeapSnapshot/Analyzing
-  -> Canceling -> Canceled
-
-Canceling
-  -> Failed（活动阶段或清理失败）
-
-任意非终态
-  -> Failed
+AllocationProfile
+├─ IntervalStartUtc
+├─ IntervalEndUtc
+├─ DataQuality: Continuous | Interrupted | NotAvailable
+└─ Hotspots
+   ├─ TypeIdentity
+   ├─ ObservedAllocatedBytes
+   ├─ SampleCount
+   └─ CallStack
 ```
 
-状态机只允许 `Application` 的 `AnalysisSessionCoordinator` 写入。UI、采集器和分析器只能请求动作或发布事实，不得跳过状态机修改会话状态。
+- `Continuous`：本区间未检测到分配采样流中断。
+- `Interrupted`：仍有热点结果，但区间内出现丢失、断开或无法判定的采样缺口。
+- `NotAvailable`：没有对应的附着期间分配样本，例如直接导入 `.gcdump`。
 
-### 6.2 关键用例的责任链
+`ObservedAllocatedBytes` 是采样观测到并聚合的字节数，不命名为“总分配字节数”或“精确分配字节数”。
 
-**开始采集**：`StartCapture` 创建 `SessionId` 与临时工作区，执行目标进程预检，写入 `Preflighting`，预检成功后启动 EventPipe 分配追踪，状态变为 `CapturingAllocations`。
+### 5.2 快照与分析结果
 
-**结束采集并分析**：`FinishCapture` 只在 `CapturingAllocations` 状态可执行。它先禁止重复结束请求，再停止并关闭追踪文件，进入 `FinishingTrace`；追踪文件确认可读后采集 `.gcdump`，进入 `CapturingHeapSnapshot`；快照确认可读后，按顺序执行堆读取、分配追踪读取、类型关联，进入 `Analyzing`；成功时生成不可变报告并进入 `Completed`。
+`MemorySnapshot` 是已经安全保存、可以重新打开的快照。实时采集快照同时关联内部保存的区间分配数据；导入快照只包含原始 `.gcdump`。
 
-**取消/关闭**：`CancelCapture` 可以由“取消”命令、关闭采集页面或退出程序触发。它使会话进入 `Canceling`，并发发出任务令牌取消与幂等的后端升级取消，等待两条路径受控收敛，删除临时采集文件，最后进入 `Canceled`。若活动阶段或清理失败，则在清理尝试完成后由 `Canceling` 进入 `Failed`。取消不会自动采集堆快照，也不会产生可浏览的结果页。
+`MemorySnapshotAnalysis` 是对 `MemorySnapshot` 的可重试分析结果，包含：
 
-**导入**：`ImportGcdump` 直接创建会话并进入 `Analyzing`，不允许在导入会话上执行开始、结束或取消附着的采集命令。
+- 按对象总大小排序的类型列表；
+- 选定类型的对象列表；
+- 对象的引用链；
+- 当前快照对应区间的 `AllocationProfile`。
 
-### 6.3 错误与访问能力
+分析失败不会损坏或删除成功保存的快照文件。重新分析只读取已有快照和已有区间分配数据，不重新连接目标进程。
 
-进程预检必须把原始异常映射为稳定、可显示的能力状态：非 CoreCLR、架构不匹配、诊断连接不可用、访问被拒绝、目标已退出、存储空间不足、采集超时、解析失败和用户取消。UI 根据能力状态决定是否允许开始采集；不得依赖异常字符串或日志文本控制按钮状态。
+分析由 Application 内部的 `MemorySnapshotAnalysisService` 执行：它输入 `MemorySnapshot`，输出 `MemorySnapshotAnalysis`。该服务是 `MemorySnapshotOperation` 的实现细节，不提供给 Desktop，也不把文件读取器或堆图对象泄漏给调用方。
 
-## 7. 事件总线
+## 6. 生命周期与并发规则
 
-模块间自研强类型事件总线位于 `Application`，用于状态变化与广播通知；命令、查询、返回值和取消仍使用显式接口调用。
-
-事件总线要求：
-
-- 不使用静态全局单例、字符串 Topic、反射或序列化。
-- 使用不可变强类型事件。
-- 所有会话相关事件都携带 `SessionId`。
-- 提供 `PublishAsync<TEvent>()` 和 `Subscribe<TEvent>()`，订阅返回可释放句柄。
-- 采用有界异步队列；进度事件允许合并并只保留最新状态，慢订阅者不得阻塞采集文件写入。
-- 单个订阅者异常隔离并发布 `ModuleFaulted`，不得中断其他订阅者。
-- 会话关闭或取消时释放该会话订阅，防止内存泄漏。
-- WPF 层订阅后通过 UI 调度器更新 ViewModel。
-
-### 7.1 事件总线的精确边界
-
-事件总线是**进程内、强类型、异步发布订阅**机制。它不跨进程、不落盘、不支持回放、不保证消息在应用重启后保留，也不是命令总线。
-
-需要结果、失败反馈、取消语义或严格先后关系的调用，必须使用接口方法并等待返回；例如 `FinishCaptureAsync`、`CancelCaptureAsync`、读取分析结果。事件总线只发布已经发生的状态变化，让 UI、日志或独立模块被动响应。
-
-建议的最小 API 语义为：
+### 6.1 附着会话
 
 ```text
-PublishAsync<TEvent>(TEvent event, CancellationToken)
-Subscribe<TEvent>(handler, subscriptionOptions) -> IDisposable
+Attaching -> Monitoring -> Ending -> Ended
+                    \--------------> Failed
 ```
 
-`TEvent` 必须实现 `IApplicationEvent`，并包含 `OccurredAt`、可空 `SessionId`、事件来源模块标识。发布后事件对象不可再修改。
+`ProcessDiagnosticsSession` 进入 `Monitoring` 后，持续提供时间线并持续接收分配样本。目标进程自行退出时，会话以 `Ended` 收尾；诊断基础设施故障导致无法继续运行时进入 `Failed`。
 
-### 7.2 首版事件目录
+### 6.2 单次快照
 
-| 事件 | 发布者 | 用途 | 是否允许合并 |
-| --- | --- | --- | --- |
-| `ProcessProbeCompleted` | 进程预检 | 更新可分析进程状态 | 是，同 PID 仅保留最新 |
-| `CaptureStarted` | 会话协调器 | 进入采集页面状态 | 否 |
-| `CaptureProgressChanged` | 采集器 | 文件写入量、持续时间、当前阶段 | 是，同会话仅保留最新 |
-| `CaptureStopRequested` | 会话协调器 | 记录用户请求停止 | 否 |
-| `TraceSaved` | 采集器 | `.nettrace` 已完整关闭 | 否 |
-| `HeapSnapshotSaved` | 采集器 | `.gcdump` 已完整写入 | 否 |
-| `AnalysisStarted` | 会话协调器 | 结果页进入分析中状态 | 否 |
-| `AnalysisProgressChanged` | 分析器 | 当前分析阶段和进度 | 是，同会话仅保留最新 |
-| `AnalysisCompleted` | 会话协调器 | 不可变报告已可查询 | 否 |
-| `AnalysisCanceled` | 会话协调器 | 会话取消完成 | 否 |
-| `AnalysisFailed` | 会话协调器 | 结构化失败原因 | 否 |
-| `ModuleFaulted` | 事件总线/模块边界 | 订阅处理异常或模块故障 | 否 |
+```text
+Pending -> Capturing -> Analyzing -> Ready
+                    ├-> Failed
+                    └-> Canceled
+```
 
-事件不携带完整对象图、完整调用树或大量字节数组。大结果由 `IAnalysisService` 按会话 ID 查询，事件只传递状态、标识和轻量摘要。
+- 单个附着会话同一时刻只允许一个 `Capturing` 快照。Application 在该状态禁用下一次截取，不排队第二次请求。
+- 原始 `.gcdump` 成功保存后，快照进入 `Analyzing`；分析不再需要目标进程仍然存在。
+- 用户结束附着时，停止时间线和分配采样，取消正在采集的快照；已保存快照保留，已开始的本地分析允许完成。
+- 用户关闭应用时，取消正在采集和正在分析的工作；已完整保存的快照保留，下次可重新打开。
+- 任何不完整文件都必须删除；已完整保存的快照不因结束附着而删除。
 
-### 7.3 队列、顺序与失败处理
+### 6.3 Application 中的状态所有者
 
-- 每个订阅拥有独立的有界队列和单一消费循环；一个慢订阅者不阻塞其他订阅者，也不阻塞诊断采集线程。
-- 同一订阅内，非进度事件按发布顺序串行处理。会话结束、失败、取消等终态事件不得被合并或静默丢弃。
-- 进度事件使用“按会话和事件类型覆盖最新值”策略；UI 只需最新进度，不需要每一个中间值。
-- 队列满时，优先合并/丢弃可合并进度事件；若非可合并事件无法投递，记录总线故障并使所属会话以受控失败结束，不允许悄悄丢失终态事件。
-- 订阅处理器抛出异常时，记录原始异常并生成轻量 `ModuleFaulted` 通知。总线不得递归地为处理 `ModuleFaulted` 失败再次发布 `ModuleFaulted`。
-- 订阅按所有者会话或应用生命周期注册；会话终态后协调器释放该会话订阅。应用退出时停止接收新事件、释放全部订阅并请求处理器取消，排空已接收事件并等待合作处理器在有限关闭预算内完成；预算耗尽仍在运行的非合作处理器必须记录告警，不能无限阻塞 WPF 关闭，也不能声称可强制终止任意处理器代码。进程退出会终止仍残留的用户代码。
+`AttachedProcessSession` 管理一个附着会话的生命周期、时间线订阅和 `IProcessDiagnosticsSession` 的释放。
 
-## 8. 分析模型与展示
+`MemorySnapshotOperation` 管理一次截取、保存后的分析、分析重试以及快照状态。两者都发布事实事件，但事件总线不是状态来源；状态只能由相应对象持有并通过查询读取。
 
-`Core` 中的稳定模型至少包括：
+## 7. Diagnostics 实现组成
 
-- `TargetProcess`：进程身份、运行时信息、可用能力。
-- `AnalysisSession`：会话身份、状态、时间范围、采集文件位置和失败信息。
-- `HeapTypeRow`：类型名、程序集、对象数、对象总大小、平均大小、精度。
-- `HeapObjectSample`：类型详情中的最大对象样本与大小分布。
-- `AllocationCallTree`：按类型聚合的分配调用树、采样分配字节数、采样次数、时间范围与精度。
-- `MemoryAnalysisReport`：会话概览、类型排行、类型详情与分配来源的查询入口。
+`WindowsProcessDiagnostics` 是 `IProcessDiagnostics` 的 Windows 实现。内部名称采用“对象名 + 责任”的形式，避免 `Helper`、`Manager`、`Complete` 等无法表达职责的命名。
 
-首版结果页包含：
+```text
+WindowsProcessDiagnostics
+├─ ProcessEnumerator
+├─ ProcessIdentityValidator
+├─ RuntimeCapabilitiesResolver
+├─ ProcessDiagnosticsSession
+│  ├─ ProcessMemorySampler
+│  ├─ AllocationSampleCollector
+│  ├─ GCDumpSnapshotCollector
+│  └─ AllocationProfileBuilder
+├─ MemorySnapshotStore
+└─ MemorySnapshotReaderRegistry
+   ├─ GCDumpSnapshotReader
+   └─ DumpSnapshotReader（未来实现）
+```
 
-1. 会话概览：目标进程、运行时版本、采集时间和分析状态。
-2. 类型排行：类型名、对象数、对象总大小、平均对象大小和精度标记。
-3. 类型详情：最大对象样本、大小分布和所属程序集。
-4. 分配来源：调用树、采集窗口内的分配字节数、采样次数、时间范围与精度标记。
+| 组件 | 单一职责 |
+| --- | --- |
+| `ProcessEnumerator` | 枚举候选进程，并创建 `TargetProcess`。 |
+| `ProcessIdentityValidator` | 验证 PID 与进程启动时间仍对应同一目标。 |
+| `RuntimeCapabilitiesResolver` | 确认 Windows x64、本机 CoreCLR、运行时版本与可用诊断能力。未来低版本支持在这里扩展能力表和适配实现。 |
+| `ProcessMemorySampler` | 持续读取托管堆与进程内存时间线。 |
+| `AllocationSampleCollector` | 在附着期间持续读取 EventPipe 分配事件与调用栈样本。 |
+| `GCDumpSnapshotCollector` | 为一次截取创建临时 `.gcdump`、验证其可读并交给存储层完成保存。 |
+| `AllocationProfileBuilder` | 以成功快照时间边界封存一个分配区间，生成 `AllocationProfile`。 |
+| `MemorySnapshotStore` | 管理临时文件、原子保存、已保存快照和区间分配数据；不向上层泄漏路径策略。 |
+| `MemorySnapshotReaderRegistry` | 根据输入格式选择读取器。首版只注册 `GCDumpSnapshotReader`；后续可注册 `DumpSnapshotReader` 而不改变上层接口。 |
+| `GCDumpSnapshotReader` | 从 `.gcdump` 构建类型、对象和引用链分析数据。 |
 
-调用栈仅使用追踪中已有的方法和程序集信息；本地符号无法解析时显示原始帧，不联网下载符号。
+`AllocationSampleCollector` 与 `GCDumpSnapshotCollector` 必须是独立职责：前者是整个附着期的持续 EventPipe 采样，后者只在用户点击时执行一次快照采集。采集器、读取器和采样器均不得决定 Application 状态转换。
 
-### 8.1 类型关联规则
+## 8. 文件保存、导入与重试
 
-类型关联使用 `TypeIdentity`。优先键为“程序集标识 + 完整类型名”；当追踪数据只包含类型名时，降级为规范化完整类型名，并将关联质量标记为 `NameOnly`。泛型类型名、嵌套类型和数组类型必须经过同一规范化函数后才能参与关联。
+实时采集的快照写入应用管理的本地存储。写入过程为：临时文件 -> 可读性验证 -> 原子改为正式快照文件 -> 保存对应分配区间数据。取消、失败或应用关闭只删除临时文件。
 
-没有匹配到堆快照的分配热点仍应显示，标记为“采集窗口内发生分配，但结束时未在快照中匹配到存活类型”；没有匹配到分配事件的高占用类型仍应显示，标记为“当前占用高，但采集窗口内未观察到分配来源”。
+导入 `.gcdump` 不改写、移动或删除用户选择的源文件。它创建一个可分析的 `MemorySnapshot`；因为不存在对应附着期间的分配样本，其 `AllocationProfile.DataQuality` 为 `NotAvailable`。
 
-### 8.2 查询与 UI 数据量控制
+首版不把 `.dmp` 伪装成可用格式：当读取器注册表没有支持该格式的读取器时，明确返回 `SnapshotFormatNotSupported`。
 
-结果服务按查询返回页面模型，而不是把完整堆图推给 UI：
+## 9. 错误边界
 
-- 类型排行支持排序、筛选和分页。
-- 只有选中类型后才构造其最大对象样本、大小分布和分配调用树。
-- 调用树节点按需展开；每一层只返回直接子节点摘要。
-- `MemoryAnalysisReport` 是不可变会话结果索引，不是 UI 持有完整原始数据的容器。
+上层只处理 `DiagnosticsException` 及以下错误码：
 
-## 9. 性能、并发与资源约束
+| 错误码 | 触发场景 |
+| --- | --- |
+| `AccessDenied` | 没有权限打开或诊断目标进程。 |
+| `TargetExited` | 目标进程在附着、采样或采集期间退出。 |
+| `TargetChanged` | PID 仍存在但启动时间不一致，说明目标身份已变化。 |
+| `RuntimeNotSupported` | 不是受支持的 Windows x64 CoreCLR 或运行时能力不满足首版要求。 |
+| `SnapshotFormatNotSupported` | 输入不是支持的快照格式，或未来格式阅读器尚未实现。 |
+| `CaptureFailed` | EventPipe、快照写入或校验失败。 |
+| `CaptureCancelled` | 用户、会话结束或应用关闭取消了采集。 |
 
-- 采集文件写入和解析不得运行在 UI 线程。
-- `.nettrace` 采集时直接顺序写入临时文件；停止后先完成文件关闭，再采集 `.gcdump`。
-- 后台解析按阶段执行，不并行持有大型对象图和大型追踪数据，控制工具自身峰值内存。
-- UI 仅持有面向页面的汇总行、分页/延迟加载的对象样本与调用树节点，不持有完整原始图。
-- 每个会话有独立取消令牌和临时目录；取消必须停止诊断会话、等待受控收尾并删除临时目录。
-- 错误以结构化会话状态和用户可理解的失败原因呈现，底层异常仅进入诊断日志。
+文件 I/O、P/Invoke、EventPipe 和解析器的原始异常保留在内部日志与 `InnerException`，但 UI 和 Application 不依赖异常文本进行流程判断。
 
-### 9.1 任务所有权
+## 10. 事件总线
 
-`AnalysisSessionCoordinator` 是每个会话的唯一任务所有者，持有会话级 `CancellationTokenSource` 和受控任务集合。采集器只负责开始/停止自己的 EventPipe 会话；读取器和分析器只接受文件路径、取消令牌和进度回调；它们不得创建脱离会话的后台任务。
+沿用已有的 `IEventBus` 和 `InProcessEventBus`，不新增第二套事件总线。它已经是实例级、强类型、异步、有界且可释放订阅的进程内事件机制。
 
-所有状态转换、采集文件改名、删除临时目录和完成/失败事件都由协调器串行编排。任何阶段失败都取消尚未开始或仍在运行的后续阶段，并清理不完整文件。
+新的诊断工作流替换旧的一次性采集事件，但不改变总线的边界：
 
-### 9.2 内存预算原则
+- 生命周期事件：`ProcessDiagnosticsSessionStateChanged`、`MemorySnapshotCaptureStarted`、`MemorySnapshotCaptured`、`MemorySnapshotCaptureFailed`、`MemorySnapshotAnalysisStarted`、`MemorySnapshotAnalysisCompleted`、`MemorySnapshotAnalysisFailed`、`ProcessDiagnosticsSessionEnded`。
+- 高频事件：`ProcessMemoryUsageUpdated`、分配采样的轻量状态更新。
 
-首版不承诺任意大小进程都可在固定内存内完成分析，但必须遵守：不在 UI 线程加载原始数据；不同时保留堆图与完整追踪事件列表；优先流式读取和增量聚合；对类型排行、对象样本、调用树均设置页面级上限和延迟展开。超出安全预算时以明确失败状态结束，不允许工具自身无限增长或无响应。
+事件对象只携带标识、时间、状态、轻量摘要和失败码；类型列表、对象列表、引用链和调用树仍通过所属会话或快照操作查询，不经事件总线传递。
 
-## 10. 测试策略
+当前总线仅对 `CaptureProgressChanged` 做硬编码合并。重构时将它泛化为事件自身声明的投递策略：
 
-- `Core`：类型标识规范化、精度传播、调用树聚合、结果排序。
-- `Application`：正常结束、取消关闭、导入、失败状态转换、事件顺序、订阅释放。
-- `Diagnostics`：使用采集文件样本验证 `.gcdump` / `.nettrace` 读取；对 EventPipe 客户端使用可替代边界测试错误映射。
-- `Desktop`：ViewModel 状态和命令测试；不把真实进程附着作为常规单元测试前提。
-- 手工/集成验证：选取受控 .NET 8/9/10 x64 示例进程，与本机 `dotnet-gcdump`、`dotnet-trace` 结果交叉比较。
+```text
+ApplicationEventDeliveryMode
+├─ Ordered      // 生命周期事件：按顺序投递，不允许合并
+└─ LatestOnly   // 时间线事件：同一会话、同一事件类型只保留最新值
+```
 
-## 11. 明确的后续扩展点
+`LatestOnly` 事件携带明确的 `DeliveryKey`，例如“会话 ID + 进程内存时间线”。每个订阅仍有独立有界队列和单线程消费循环：慢 UI 可以丢弃过期时间线点，但不得阻塞诊断采样；生命周期事件队列无法接收时快速报告 `EventDeliveryException`，不能静默丢弃。
 
-- `.dmp` 文件读取器（ClrMD）。
-- 低版本或不同 CLR 运行时适配器。
+订阅处理异常仍隔离为 `ModuleFaulted`，且处理 `ModuleFaulted` 自身失败时不得递归发布。应用关闭时，总线停止接收、取消订阅处理器并在有限预算内收尾；非合作订阅者只记录告警，不能无限阻塞退出。
+
+## 11. 技术栈
+
+- .NET 10 与固定的 `global.json` SDK。
+- WPF 桌面端。
+- 自研轻量 MVVM：`ObservableObject`、`RelayCommand`、`AsyncRelayCommand`；不引入第三方 MVVM 框架。
+- `Microsoft.Extensions.DependencyInjection` 与 `Microsoft.Extensions.Logging` 基础抽象。
+- `Microsoft.Diagnostics.NETCore.Client`：诊断连接、EventPipe 和运行中进程的采集能力。
+- TraceEvent：首版内部用于读取诊断数据和 `.gcdump` 分析。
+- ClrMD：仅作为未来 `.dmp` 阅读器候选，首版不引用。
+
+不启动 `dotnet-gcdump` 或 `dotnet-trace` 子进程；它们仅用于人工交叉验证和准备测试数据，不能成为应用运行时依赖。
+
+## 12. 性能、资源与取消
+
+- EventPipe 读取、快照写入和堆图分析均不运行在 UI 线程。
+- `ProcessMemorySampler` 和 `AllocationSampleCollector` 不能被慢事件订阅者反压。
+- 不同时长期持有完整堆图和完整原始事件列表；读取时优先流式处理、增量聚合和按需构建对象详情。
+- UI 只保存页面所需的汇总行和按需展开的数据，不持有整个堆图。
+- 结束附着和应用关闭使用协作取消；临时文件清理由 `MemorySnapshotStore` 保证幂等。
+- 每次快照采集前都复核目标身份；采集成功后先确保文件完整可读，再发布“已保存”状态。
+
+## 13. 测试与验证
+
+### 13.1 单元与契约测试
+
+- `TargetProcess` 身份比较与 PID 复用防护。
+- 附着会话和单次快照状态转换。
+- 快照失败、取消和目标退出不切分分配区间。
+- 快照保存成功后分析失败可重试，且不重新采集。
+- 导入 `.gcdump` 的类型、对象和引用链分析；热点数据必须为 `NotAvailable`。
+- 分配热点按类型、调用栈聚合，并正确标注 `Continuous`、`Interrupted`、`NotAvailable`。
+- 现有事件总线的生命周期投递与订阅释放回归；新增时间线事件的 `LatestOnly` 合并不影响 `Ordered` 事件。
+
+### 13.2 Windows 集成测试
+
+使用受控的 .NET 8、.NET 9、.NET 10 x64 测试进程，验证：
+
+- 枚举、附着、时间线、截取和会话释放。
+- 目标退出、访问失败和 PID 身份变化的错误映射。
+- `.gcdump` 可重新打开并得到类型、对象和引用链。
+- 截取期间的临时文件清理与成功快照保留。
+- 进程内存读数与 Windows 任务管理器对应口径的交叉核对。
+
+诊断库升级、Windows 版本升级或未来加入低版本 CoreCLR 支持时，必须重新运行此组集成测试。
+
+## 14. 后续扩展点
+
+- `DumpSnapshotReader`：以 ClrMD 支持 `.dmp`，不改变 `IProcessDiagnostics.OpenSnapshotAsync`。
+- 扩展 `RuntimeCapabilitiesResolver` 与采集实现，逐步支持更低版本 CoreCLR。
+- GC Root、支配树、对象字段浏览和快照差异对比。
 - 本地提权采集助手。
-- GC Root 引用路径、支配树和对象字段浏览。
-- 多快照增长对比。
-- 导出报告。
+- 快照导出和报告生成。
 
-这些能力均不得改变首版的 `Core` 结果模型、`Application` 用例入口和 WPF 调用路径，只能新增具体读取器、分析器或展示页面。
+这些扩展不得要求 Desktop 了解诊断库，不得改变 `IProcessDiagnostics`、`IProcessDiagnosticsSession`、`MemorySnapshot` 和 `MemorySnapshotAnalysis` 的既有语义。
