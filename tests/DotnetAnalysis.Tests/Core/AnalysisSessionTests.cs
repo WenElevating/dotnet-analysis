@@ -72,6 +72,16 @@ public sealed class AnalysisSessionTests
     }
 
     [TestMethod]
+    public void Canceling_CanMoveToFailedWhenCancellationBackendFaults()
+    {
+        var session = AnalysisSession.Create(SessionId.New(), DateTimeOffset.UtcNow);
+        Assert.IsTrue(session.TryMoveTo(AnalysisSessionState.Canceling));
+
+        Assert.IsTrue(session.TryMoveTo(AnalysisSessionState.Failed));
+        Assert.AreEqual(AnalysisSessionState.Failed, session.State);
+    }
+
+    [TestMethod]
     public void ActiveStates_CanMoveToCancelingOrFailed()
     {
         var activeStates = new[]

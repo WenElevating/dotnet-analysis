@@ -24,7 +24,8 @@ public static class AnalysisSessionTransitionRules
             AnalysisSessionState.Analyzing => to is AnalysisSessionState.Completed
                 or AnalysisSessionState.Canceling
                 or AnalysisSessionState.Failed,
-            AnalysisSessionState.Canceling => to is AnalysisSessionState.Canceled,
+            AnalysisSessionState.Canceling => to is AnalysisSessionState.Canceled
+                or AnalysisSessionState.Failed,
             _ => false
         };
     }
