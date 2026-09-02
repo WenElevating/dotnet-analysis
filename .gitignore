@@ -1,1 +1,10 @@
+.vs/
 .worktrees/
+bin/
+obj/
+TestResults/
+*.user
+*.suo
+*.gcdump
+*.nettrace
+*.dmp
