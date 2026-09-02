@@ -836,6 +836,8 @@ dotnet format DotnetAnalysis.sln --verify-no-changes --no-restore
 
 Expected: every command exits 0; build and tests report zero warnings/errors.
 
+Tracked raw evidence: `docs/superpowers/evidence/2026-09-02-dotnet-memory-analysis-foundation-quality-gate.md`.
+
 - [x] **Step 2: Perform requirement QA**
 
 Verify each item with source and test evidence:
