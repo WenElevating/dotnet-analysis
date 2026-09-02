@@ -216,3 +216,62 @@ git diff --check: exit 0; no whitespace errors.
 ```
 
 The round 2 diff was reread after validation. The reservation is visible before token signaling, prevents the inline active path from creating duplicate cancellation work, and the backend path does not begin until token signaling returns. No actionable implementation-QA finding remains.
+
+## Round 3 cancellation callback repair evidence
+
+- Re-review source: `final-review-repair-round-2-rereview.md`
+- Repair commit: `5a8344ba75311707714a3399ab3705592af22afe`
+- Remaining Important findings after repair: none
+- Remaining Minor findings after repair: none
+
+### Throwing cancellation callback red-green
+
+The regression backend registers a throwing callback on the active-operation token before exposing `StartEntered`. The active start and backend cancellation each have independent deterministic gates. Backend `CancelAsync` releases the start gate, while the cancellation gate keeps duplicate requests in flight long enough to prove task coalescing.
+
+RED against `67c4de6`:
+
+```text
+dotnet test tests\DotnetAnalysis.Tests\DotnetAnalysis.Tests.csproj --configuration Debug --no-restore --filter "FullyQualifiedName~CancelAsync_WhenActiveTokenCallbackThrows_StillConvergesAndClearsCancellationOperation"
+Failed: 1/1
+System.AggregateException: One or more errors occurred. (Cancellation callback failed.)
+at AnalysisSessionCoordinator.StartCancellationOperationLocked(...) line 437
+at AnalysisSessionCoordinator.CancelAsync(...) line 136
+```
+
+The test's `finally` block released both gates and awaited the active start, so the red run left no blocked operation.
+
+GREEN after protecting token signaling:
+
+```text
+Focused callback-failure regression: 1/1 passed.
+Coordinator tests: 24/24 passed.
+```
+
+The completed scenario proves that backend `CancelAsync` runs exactly once, duplicate in-flight cancellation returns the same task, no `CaptureStarted` event is published, the session terminates as `Failed`, and a later cancellation is rejected from the terminal state. Structured `SignalCancellation` logging retains the `AggregateException` and the original callback exception as its inner exception.
+
+### Repeated race validation
+
+The callback-failure regression and the round 2 inline-completion regression ran together for 25 consecutive iterations:
+
+```text
+25/25 runs passed.
+2 tests per run; aggregate 50/50 passed.
+```
+
+### Round 3 validation
+
+```text
+dotnet format DotnetAnalysis.sln --verify-no-changes --no-restore
+Exit 0; 0 of 55 files required formatting.
+
+dotnet build DotnetAnalysis.sln --configuration Debug --no-restore --verbosity minimal
+Exit 0; 0 warnings, 0 errors.
+
+dotnet test DotnetAnalysis.sln --configuration Debug --no-build --no-restore
+Exit 0; 49 passed, 0 failed, 0 skipped.
+
+git diff --check
+Exit 0; no whitespace errors.
+```
+
+Implementation QA first found that the regression asserted the single backend invocation only while cancellation was blocked. The test was strengthened to assert the same count after terminal convergence, then the focused regression and all 49 solution tests were rerun successfully. A second raw-diff review found no remaining actionable issue. Internal confidence scores after repair: requirement coverage 10/10, correctness 9/10, robustness 9/10, security 9/10, performance 9/10, maintainability 9/10, test coverage 10/10, overall confidence 9/10.
