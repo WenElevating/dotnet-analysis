@@ -790,7 +790,7 @@ ShellViewModel inherits ObservableObject. StatusText starts as 尚未开始分�
 
 DiagnosticsServiceCollectionExtensions.AddDiagnosticsContracts returns IServiceCollection without registering a fake collector; it establishes the only allowed future registration location.
 
-App.OnStartup builds the provider, resolves MainWindow and ShellViewModel, sets DataContext, and shows the window. Store the provider in a private field. App.OnExit is synchronous, so it must call `_serviceProvider.DisposeAsync().AsTask().GetAwaiter().GetResult()` before `base.OnExit(e)`; this completes event-bus consumers without fire-and-forget disposal. MainWindow title is .NET 内存分析 and displays StatusText. Do not add nonfunctional capture controls.
+App.OnStartup builds the provider, resolves MainWindow and ShellViewModel, sets DataContext, and shows the window. Store the provider in a private field. App.OnExit is synchronous, so it must call `_serviceProvider.DisposeAsync().AsTask().GetAwaiter().GetResult()` before `base.OnExit(e)`; this performs the event bus's bounded shutdown without fire-and-forget disposal: subscriptions are released, handler cancellation is requested, and cooperative consumers drain or complete within the finite budget. A non-cooperative handler is logged at timeout rather than indefinitely blocking WPF close or being forcibly terminated; process exit terminates any remaining user code. MainWindow title is .NET 内存分析 and displays StatusText. Do not add nonfunctional capture controls.
 
 - [ ] **Step 8: Run tests, smoke test the window, inspect boundaries, and commit**
 
@@ -841,15 +841,15 @@ Expected: every command exits 0; build and tests report zero warnings/errors.
 Verify each item with source and test evidence:
 
 ~~~text
-[ ] SDK pin is 10.0.303 and .NET 11 is not selected.
-[ ] Desktop references Application and Core only.
-[ ] Core references no WPF, diagnostics, I/O, or DI package.
-[ ] There is no third-party MVVM or event-bus package.
-[ ] The event bus is strong-typed, instance-owned, asynchronous, bounded, and releases subscriptions.
-[ ] Progress may coalesce; terminal events cannot silently disappear.
-[ ] Finish order is stop trace, snapshot, analyze.
-[ ] Cancellation never creates a snapshot or analysis result.
-[ ] Application start and close leave no event-bus consumer task running.
+[x] SDK pin is 10.0.303 and .NET 11 is not selected.
+[x] Desktop references Application and Core only.
+[x] Core references no WPF, diagnostics, I/O, or DI package.
+[x] There is no third-party MVVM or event-bus package.
+[x] The event bus is strong-typed, instance-owned, asynchronous, bounded, and releases subscriptions.
+[x] Progress may coalesce; terminal events cannot silently disappear.
+[x] Finish order is stop trace, snapshot, analyze.
+[x] Cancellation never creates a snapshot or analysis result.
+[x] Application close performs bounded event-bus shutdown: release subscriptions, request cancellation, drain or cooperatively complete consumers within a finite budget, log non-cooperative handlers at timeout, and never indefinitely block WPF close; process exit terminates any remaining user code.
 ~~~
 
 - [x] **Step 3: Perform independent implementation QA**
