@@ -97,7 +97,7 @@ tests/
 - Consumes: none.
 - Produces: the solution and reference graph required by every subsequent task.
 
-- [ ] **Step 1: Initialize Git and create the five projects**
+- [x] **Step 1: Initialize Git and create the five projects**
 
 Run:
 
@@ -112,7 +112,7 @@ dotnet new wpf --name DotnetAnalysis.Desktop --output src/DotnetAnalysis.Desktop
 dotnet new mstest --name DotnetAnalysis.Tests --output tests/DotnetAnalysis.Tests --framework net10.0
 ~~~
 
-- [ ] **Step 2: Add projects and only the allowed references**
+- [x] **Step 2: Add projects and only the allowed references**
 
 Run:
 
@@ -133,7 +133,7 @@ dotnet add tests/DotnetAnalysis.Tests/DotnetAnalysis.Tests.csproj package Micros
 dotnet add tests/DotnetAnalysis.Tests/DotnetAnalysis.Tests.csproj package Microsoft.Extensions.Logging.Abstractions --version 10.0.11
 ~~~
 
-- [ ] **Step 3: Write the SDK and compiler policy**
+- [x] **Step 3: Write the SDK and compiler policy**
 
 Create global.json:
 
@@ -167,7 +167,7 @@ Set the Desktop target to net10.0-windows, set UseWPF to true, and enforce
 RuntimeIdentifier or self-contained publishing policy. Delete generated
 Class1.cs files and the generated MSTest sample file.
 
-- [ ] **Step 4: Add ignored diagnostic output and verify the build fails before restore**
+- [x] **Step 4: Add ignored diagnostic output and verify the build fails before restore**
 
 Create .gitignore:
 
@@ -192,7 +192,7 @@ dotnet build DotnetAnalysis.sln --configuration Debug --no-restore
 
 Expected: fail because restore has not occurred.
 
-- [ ] **Step 5: Restore, build, and prove the test host starts**
+- [x] **Step 5: Restore, build, and prove the test host starts**
 
 Run:
 
@@ -205,7 +205,7 @@ dotnet list DotnetAnalysis.sln reference
 
 Expected: zero warnings/errors; Desktop lists Core and Application only, never Diagnostics.
 
-- [ ] **Step 6: Inspect and commit the framework bootstrap**
+- [x] **Step 6: Inspect and commit the framework bootstrap**
 
 Run:
 
@@ -234,7 +234,7 @@ Expected: no build output is staged.
 - Consumes: Core project from Task 1.
 - Produces: SessionId, AnalysisSessionState, AnalysisSession, AnalysisSessionTransitionRules, and IApplicationEvent.
 
-- [ ] **Step 1: Write failing state-transition tests**
+- [x] **Step 1: Write failing state-transition tests**
 
 ~~~csharp
 [TestClass]
@@ -270,7 +270,7 @@ public sealed class AnalysisSessionTests
 }
 ~~~
 
-- [ ] **Step 2: Run the test and verify the initial failure**
+- [x] **Step 2: Run the test and verify the initial failure**
 
 Run:
 
@@ -280,7 +280,7 @@ dotnet test tests/DotnetAnalysis.Tests/DotnetAnalysis.Tests.csproj --filter Full
 
 Expected: fail because the session types do not exist.
 
-- [ ] **Step 3: Implement the value types and transition table**
+- [x] **Step 3: Implement the value types and transition table**
 
 Create this public surface:
 
@@ -320,13 +320,13 @@ Created -> Preflighting -> CapturingAllocations -> FinishingTrace
 FinishingTrace -> CapturingHeapSnapshot -> Analyzing -> Completed
 ~~~
 
-Every nonterminal state may transition to Canceling or Failed. Canceling may transition only to Canceled. Completed, Canceled, and Failed are terminal. AnalysisSession.TryMoveTo uses this table and changes state only after a valid transition.
+Every nonterminal state may transition to Canceling or Failed. Canceling normally transitions to Canceled, but may transition to Failed when cleanup itself fails or an already-active stage reports a non-cancellation failure while cleanup is converging. Completed, Canceled, and Failed are terminal. AnalysisSession.TryMoveTo uses this table and changes state only after a valid transition.
 
-- [ ] **Step 4: Add terminal-state regression tests**
+- [x] **Step 4: Add terminal-state regression tests**
 
-Add tests that Completed, Canceled, and Failed reject every next state, and that Canceling rejects Completed.
+Add tests that Completed, Canceled, and Failed reject every next state, that Canceling rejects Completed, and that Canceling can move to Failed when cleanup fails.
 
-- [ ] **Step 5: Run focused tests and review the state names**
+- [x] **Step 5: Run focused tests and review the state names**
 
 Run:
 
@@ -337,7 +337,7 @@ dotnet build src/DotnetAnalysis.Core/DotnetAnalysis.Core.csproj --no-restore
 
 Expected: all tests pass with zero warnings/errors.
 
-- [ ] **Step 6: Commit the Core model**
+- [x] **Step 6: Commit the Core model**
 
 Review that the enum uses FinishingTrace, not FinishedTrace, and that terminal sessions cannot restart. Then run:
 
@@ -365,7 +365,7 @@ git commit -m "feat: add analysis session state model"
 - Consumes: IApplicationEvent and SessionId from Task 2.
 - Produces: IEventBus for Task 4 and the Desktop layer.
 
-- [ ] **Step 1: Write failing lifecycle delivery and disposal tests**
+- [x] **Step 1: Write failing lifecycle delivery and disposal tests**
 
 ~~~csharp
 [TestMethod]
@@ -404,7 +404,7 @@ public async Task DisposedSubscription_DoesNotReceiveSubsequentEvents()
 }
 ~~~
 
-- [ ] **Step 2: Run the event-bus tests and verify failure**
+- [x] **Step 2: Run the event-bus tests and verify failure**
 
 Run:
 
@@ -414,7 +414,7 @@ dotnet test tests/DotnetAnalysis.Tests/DotnetAnalysis.Tests.csproj --filter Full
 
 Expected: fail because IEventBus, InProcessEventBus, and event records do not exist.
 
-- [ ] **Step 3: Define the event bus contract and event records**
+- [x] **Step 3: Define the event bus contract and event records**
 
 ~~~csharp
 public interface IEventBus : IAsyncDisposable
@@ -437,13 +437,13 @@ public sealed record CaptureProgressChanged(SessionId? SessionId, int Percent, D
 public sealed record ModuleFaulted(SessionId? SessionId, string Module, string Message, DateTimeOffset OccurredAt, string Source) : IApplicationEvent;
 ~~~
 
-- [ ] **Step 4: Implement independent bounded subscription queues**
+- [x] **Step 4: Implement independent bounded subscription queues**
 
 InProcessEventBus owns subscription objects, not a static global registry. Each subscription owns a bounded Channel and one consumer task. PublishAsync takes a snapshot of matching subscriptions and attempts synchronous, non-blocking admission to every matching subscription independently. CaptureStarted and ModuleFaulted must never coalesce. If one of those events cannot enter a matching subscription's full bounded queue, PublishAsync fails fast with EventDeliveryException containing the event type and subscription identity after still attempting the healthy subscriptions; it must not wait for queue space or silently drop the event.
 
 A handler exception is logged and causes one ModuleFaulted notification. If the handler that failed was processing ModuleFaulted, log only; do not recursively publish another ModuleFaulted.
 
-- [ ] **Step 5: Write the failing slow-subscriber progress test**
+- [x] **Step 5: Write the failing slow-subscriber progress test**
 
 ~~~csharp
 [TestMethod]
@@ -486,13 +486,13 @@ The test must be gate-driven; do not use Task.Delay or a last-value-only asserti
 
 Run the focused tests and verify they fail before adding progress replacement.
 
-- [ ] **Step 6: Implement progress replacement and fault isolation**
+- [x] **Step 6: Implement progress replacement and fault isolation**
 
 While a subscription is busy, retain only the newest CaptureProgressChanged for that SessionId. Progress is best effort: a pending value is retained only after its per-session marker enters the bounded queue, so pending-progress state is bounded by QueueCapacity; a progress update with no available marker slot may be dropped. On subscription disposal, reject new events, complete the writer, and drain every event already admitted. The bus retains retired subscriptions until their consumer completes. On bus shutdown, request handler cancellation and wait only for a bounded timeout; log each non-cooperative handler still running at timeout rather than indefinitely blocking disposal or claiming to forcibly cancel handler code.
 
 Add a test with one throwing CaptureStarted subscriber and one healthy subscriber. Assert the healthy subscriber still receives CaptureStarted.
 
-- [ ] **Step 7: Run focused tests and commit**
+- [x] **Step 7: Run focused tests and commit**
 
 Run:
 
@@ -523,7 +523,7 @@ Expected: tests pass and the search has no matches.
 - Consumes: session model from Task 2 and IEventBus from Task 3.
 - Produces: AnalysisSessionCoordinator and the contracts implemented by the later Diagnostics vertical slice.
 
-- [ ] **Step 1: Write the failing normal completion test**
+- [x] **Step 1: Write the failing normal completion test**
 
 ~~~csharp
 [TestMethod]
@@ -543,7 +543,7 @@ public async Task FinishAsync_StopsTraceBeforeSnapshotBeforeAnalysis()
 }
 ~~~
 
-- [ ] **Step 2: Run the coordinator test and verify failure**
+- [x] **Step 2: Run the coordinator test and verify failure**
 
 Run:
 
@@ -553,7 +553,7 @@ dotnet test tests/DotnetAnalysis.Tests/DotnetAnalysis.Tests.csproj --filter Full
 
 Expected: fail because coordinator and contracts do not exist.
 
-- [ ] **Step 3: Define capture and analysis contracts**
+- [x] **Step 3: Define capture and analysis contracts**
 
 ~~~csharp
 public interface ICaptureBackend
@@ -570,9 +570,11 @@ public interface IAnalysisService
 }
 ~~~
 
+`ICaptureBackend.CancelAsync` is an idempotent escalation signal for active backend work. The coordinator may invoke it concurrently with cancellation-token signaling, and implementations must tolerate repeated calls without duplicating destructive cleanup.
+
 Create immutable AnalysisCompleted, AnalysisCanceled, and AnalysisFailed records. AnalysisFailed carries a stable user-facing failure code and message, never a raw exception.
 
-- [ ] **Step 4: Implement the normal completion order**
+- [x] **Step 4: Implement the normal completion order**
 
 AnalysisSessionCoordinator keeps sessions indexed by SessionId and serializes each session's operations. StartAsync creates a session, moves Created to Preflighting to CapturingAllocations, calls StartAllocationTraceAsync, then publishes CaptureStarted.
 
@@ -585,9 +587,9 @@ Analyzing -> AnalyzeAsync
 Completed -> publish AnalysisCompleted
 ~~~
 
-If a non-cancellation exception occurs, move to Failed, publish AnalysisFailed, and do not start the next stage.
+If a non-cancellation exception occurs, record the original exception with the session and stage, perform idempotent backend cleanup, then move to Failed and publish AnalysisFailed. Do not start the next stage.
 
-- [ ] **Step 5: Write and run the failing cancellation regression test**
+- [x] **Step 5: Write and run the failing cancellation regression test**
 
 ~~~csharp
 [TestMethod]
@@ -599,7 +601,8 @@ public async Task CancelAsync_DoesNotCaptureSnapshotOrAnalyze()
         new RecordingCaptureBackend(calls),
         new RecordingAnalysisService(calls),
         bus,
-        TimeProvider.System);
+        TimeProvider.System,
+        NullLogger<AnalysisSessionCoordinator>.Instance);
 
     var session = await coordinator.StartAsync(CancellationToken.None);
     await coordinator.CancelAsync(session.Id, CancellationToken.None);
@@ -611,15 +614,15 @@ public async Task CancelAsync_DoesNotCaptureSnapshotOrAnalyze()
 
 Run the focused test and verify it fails before implementing CancelAsync.
 
-- [ ] **Step 6: Implement cancellation and duplicate-request guards**
+- [x] **Step 6: Implement cancellation and duplicate-request guards**
 
-CancelAsync accepts nonterminal sessions, moves to Canceling, invokes ICaptureBackend.CancelAsync, moves to Canceled, and publishes AnalysisCanceled. It never calls CaptureHeapSnapshotAsync or AnalyzeAsync.
+CancelAsync accepts nonterminal sessions, moves to Canceling, promptly invokes ICaptureBackend.CancelAsync while also signaling the active operation token, waits for both paths to converge, then moves to Canceled and publishes AnalysisCanceled. It never calls CaptureHeapSnapshotAsync or AnalyzeAsync. If the active stage or cleanup fails, cleanup still precedes the Canceling -> Failed terminal transition.
 
 Repeated FinishAsync or CancelAsync while the same session operation is active returns the same in-flight Task and never invokes backend methods twice.
 
-- [ ] **Step 7: Add failure coverage, validate, and commit**
+- [x] **Step 7: Add failure coverage, validate, and commit**
 
-Add a backend fake that throws from StopAllocationTraceAsync. Assert snapshot and analyzer are not called, state becomes Failed, and AnalysisFailed is published.
+Add backend fakes that throw from start, stop, snapshot, and analysis. Assert each failure invokes backend cleanup before Failed and AnalysisFailed publication, later stages do not start, and structured diagnostics retain the session, stage, and original exception. Cover terminal-publication rejection separately and verify that it is logged without reopening the terminal state.
 
 Run:
 
@@ -655,7 +658,7 @@ git commit -m "feat: add analysis session coordinator"
 - Consumes: IEventBus and AnalysisSessionCoordinator from Tasks 3–4.
 - Produces: a WPF application that starts, resolves services, and disposes the event bus on shutdown without diagnostics coupling.
 
-- [ ] **Step 1: Write failing ObservableObject and RelayCommand tests**
+- [x] **Step 1: Write failing ObservableObject and RelayCommand tests**
 
 ~~~csharp
 [TestMethod]
@@ -688,7 +691,7 @@ public void RelayCommand_UsesCanExecutePredicate()
 }
 ~~~
 
-- [ ] **Step 2: Run the MVVM tests and verify failure**
+- [x] **Step 2: Run the MVVM tests and verify failure**
 
 Run:
 
@@ -698,7 +701,7 @@ dotnet test tests/DotnetAnalysis.Tests/DotnetAnalysis.Tests.csproj --filter "Ful
 
 Expected: fail because the MVVM types do not exist.
 
-- [ ] **Step 3: Implement ObservableObject and RelayCommand**
+- [x] **Step 3: Implement ObservableObject and RelayCommand**
 
 ~~~csharp
 public abstract class ObservableObject : INotifyPropertyChanged
@@ -717,7 +720,7 @@ public abstract class ObservableObject : INotifyPropertyChanged
 
 RelayCommand takes Action execute and optional Func<bool> canExecute, implements ICommand, and exposes NotifyCanExecuteChanged. It uses no reflection and no generic message service.
 
-- [ ] **Step 4: Write the failing async-command cancellation test**
+- [x] **Step 4: Write the failing async-command cancellation test**
 
 ~~~csharp
 [TestMethod]
@@ -745,7 +748,7 @@ public async Task AsyncRelayCommand_Cancel_CancelsCurrentExecutionAndRestoresSta
 
 Run this test and verify failure before implementation.
 
-- [ ] **Step 5: Implement AsyncRelayCommand and the dispatcher boundary**
+- [x] **Step 5: Implement AsyncRelayCommand and the dispatcher boundary**
 
 AsyncRelayCommand accepts Func<CancellationToken, Task>, exposes IsRunning, CanCancel, ExecutionTask, LastError, Cancel(), and NotifyCanExecuteChanged(). It treats cancellation from its own token as normal completion; any other exception sets LastError and raises ExecutionFailed.
 
@@ -760,7 +763,7 @@ public interface IUiDispatcher
 
 WpfUiDispatcher wraps Application.Current.Dispatcher.InvokeAsync. No Application type references Dispatcher.
 
-- [ ] **Step 6: Write the failing composition-root test**
+- [x] **Step 6: Write the failing composition-root test**
 
 ~~~csharp
 [TestMethod]
@@ -782,7 +785,7 @@ public void AddDesktopApplication_ResolvesShellAndSingleEventBus()
 
 Run it and verify failure before the registration extension is written.
 
-- [ ] **Step 7: Compose the application shell**
+- [x] **Step 7: Compose the application shell**
 
 DesktopServiceCollectionExtensions.AddDesktopApplication first calls `services.AddLogging()`, then registers InProcessEventBus, AnalysisSessionCoordinator, IUiDispatcher, and ShellViewModel as singletons.
 
@@ -792,7 +795,7 @@ DiagnosticsServiceCollectionExtensions.AddDiagnosticsContracts returns IServiceC
 
 App.OnStartup builds the provider, resolves MainWindow and ShellViewModel, sets DataContext, and shows the window. Store the provider in a private field. App.OnExit is synchronous, so it must call `_serviceProvider.DisposeAsync().AsTask().GetAwaiter().GetResult()` before `base.OnExit(e)`; this performs the event bus's bounded shutdown without fire-and-forget disposal: subscriptions are released, handler cancellation is requested, and cooperative consumers drain or complete within the finite budget. A non-cooperative handler is logged at timeout rather than indefinitely blocking WPF close or being forcibly terminated; process exit terminates any remaining user code. MainWindow title is .NET 内存分析 and displays StatusText. Do not add nonfunctional capture controls.
 
-- [ ] **Step 8: Run tests, smoke test the window, inspect boundaries, and commit**
+- [x] **Step 8: Run tests, smoke test the window, inspect boundaries, and commit**
 
 Run:
 

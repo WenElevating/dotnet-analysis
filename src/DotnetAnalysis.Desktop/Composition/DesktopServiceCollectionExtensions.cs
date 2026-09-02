@@ -13,6 +13,7 @@ public static class DesktopServiceCollectionExtensions
         ArgumentNullException.ThrowIfNull(services);
 
         services.AddLogging();
+        services.AddSingleton<TimeProvider>(TimeProvider.System);
         services.AddSingleton<IEventBus, InProcessEventBus>();
         services.AddSingleton<AnalysisSessionCoordinator>();
         services.AddSingleton<IUiDispatcher, WpfUiDispatcher>();

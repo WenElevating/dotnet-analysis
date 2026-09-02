@@ -4,6 +4,8 @@ using DotnetAnalysis.Application.Events;
 using DotnetAnalysis.Application.Sessions;
 using DotnetAnalysis.Core.Events;
 using DotnetAnalysis.Core.Sessions;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace DotnetAnalysis.Tests.Application;
 
@@ -17,7 +19,8 @@ public sealed class AnalysisSessionCoordinatorTests
     private static readonly string[] CancellationBeforeAnalyzeCalls = ["start", "stop", "snapshot", "cancel"];
     private static readonly string[] CancellationAfterAnalyzeBackendCalls = ["start", "stop", "snapshot", "cancel"];
     private static readonly string[] CancellationAfterStageFailureCalls = ["start", "stop", "cancel"];
-    private static readonly string[] StopFailureCalls = ["start", "stop"];
+    private static readonly string[] StopFailureCalls = ["start", "stop", "cancel"];
+    private static readonly string[] SnapshotFailureCalls = ["start", "stop", "snapshot", "cancel"];
     private static readonly string[] AnalyzeCalls = ["analyze"];
 
     [TestMethod]
@@ -75,19 +78,39 @@ public sealed class AnalysisSessionCoordinatorTests
     }
 
     [TestMethod]
-    public async Task FinishAsync_WhenCompletedPublicationThrowsSynchronously_KeepsCompletedState()
+    public async Task FinishAsync_WhenCompletedPublicationThrowsSynchronously_LogsFailureAndKeepsCompletedState()
     {
         var calls = new List<string>();
         var backend = new ControlledCaptureBackend(calls);
         var analyzer = new ControlledAnalysisService(calls);
-        await using var bus = new RecordingEventBus(throwTerminalPublicationsSynchronously: true);
-        var coordinator = CreateCoordinator(backend, analyzer, bus);
+        var publicationFailure = new EventDeliveryException(typeof(AnalysisCompleted), "test-subscription");
+        await using var bus = new RecordingEventBus(synchronousTerminalPublicationException: publicationFailure);
+        var logger = new RecordingLogger<AnalysisSessionCoordinator>();
+        var coordinator = CreateCoordinator(backend, analyzer, bus, logger);
 
         var session = await coordinator.StartAsync(CancellationToken.None);
         await coordinator.FinishAsync(session.Id, CancellationToken.None);
 
         CollectionAssert.AreEqual(NormalCompletionCalls, calls);
         Assert.AreEqual(AnalysisSessionState.Completed, session.State);
+        AssertTerminalPublicationFailure(logger, session.Id, nameof(AnalysisCompleted), publicationFailure);
+    }
+
+    [TestMethod]
+    public async Task CancelAsync_WhenCanceledPublicationFailsAsynchronously_LogsFailureAndKeepsCanceledState()
+    {
+        var publicationFailure = new EventDeliveryException(typeof(AnalysisCanceled), "test-subscription");
+        var backend = new ControlledCaptureBackend();
+        await using var bus = new RecordingEventBus(asynchronousTerminalPublicationException: publicationFailure);
+        var logger = new RecordingLogger<AnalysisSessionCoordinator>();
+        var coordinator = CreateCoordinator(backend, new ControlledAnalysisService(), bus, logger);
+
+        var session = await coordinator.StartAsync(CancellationToken.None);
+        await coordinator.CancelAsync(session.Id, CancellationToken.None);
+
+        CollectionAssert.AreEqual(CancellationCalls, backend.Calls);
+        Assert.AreEqual(AnalysisSessionState.Canceled, session.State);
+        AssertTerminalPublicationFailure(logger, session.Id, nameof(AnalysisCanceled), publicationFailure);
     }
 
     [TestMethod]
@@ -128,6 +151,38 @@ public sealed class AnalysisSessionCoordinatorTests
         CollectionAssert.AreEqual(CancellationCalls, backend.Calls);
         Assert.AreEqual(AnalysisSessionState.Canceled, session.State);
         Assert.IsEmpty(bus.Events.OfType<CaptureStarted>());
+    }
+
+    [TestMethod]
+    public async Task CancelAsync_DuringNonTokenResponsiveStart_InvokesBackendCancellationPromptly()
+    {
+        var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var backend = new ControlledCaptureBackend
+        {
+            StartGate = startGate,
+            OnCancel = () => startGate.TrySetResult()
+        };
+        await using var bus = new RecordingEventBus();
+        var coordinator = CreateCoordinator(backend, new ControlledAnalysisService(), bus);
+
+        var start = coordinator.StartAsync(CancellationToken.None);
+        await backend.StartEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        var session = backend.LastSession!;
+        var cancellation = coordinator.CancelAsync(session.Id, CancellationToken.None);
+
+        try
+        {
+            await backend.CancelEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+            await Task.WhenAll(start, cancellation).WaitAsync(TimeSpan.FromSeconds(1));
+        }
+        finally
+        {
+            startGate.TrySetResult();
+            await Task.WhenAll(start, cancellation).WaitAsync(TimeSpan.FromSeconds(1));
+        }
+
+        CollectionAssert.AreEqual(CancellationCalls, backend.Calls);
+        Assert.AreEqual(AnalysisSessionState.Canceled, session.State);
     }
 
     [TestMethod]
@@ -306,28 +361,164 @@ public sealed class AnalysisSessionCoordinatorTests
     }
 
     [TestMethod]
-    public async Task FinishAsync_WhenStoppingTraceFails_PublishesFailureWithoutStartingLaterStages()
+    public async Task StartAsync_WhenStartingTraceFails_CleansUpBeforePublishingFailure()
     {
-        var backend = new ControlledCaptureBackend { StopException = new InvalidOperationException("Stop failed.") };
+        var cancelGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stageFailure = new InvalidOperationException("Start failed.");
+        var backend = new ControlledCaptureBackend
+        {
+            StartException = stageFailure,
+            CancelGate = cancelGate
+        };
+        await using var bus = new RecordingEventBus();
+        var logger = new RecordingLogger<AnalysisSessionCoordinator>();
+        var coordinator = CreateCoordinator(backend, new ControlledAnalysisService(), bus, logger);
+
+        var start = coordinator.StartAsync(CancellationToken.None);
+
+        try
+        {
+            await backend.CancelEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+            Assert.AreEqual(AnalysisSessionState.Canceling, backend.LastSession!.State);
+            Assert.IsEmpty(bus.Events.OfType<AnalysisFailed>());
+        }
+        finally
+        {
+            cancelGate.TrySetResult();
+        }
+
+        var session = await start.WaitAsync(TimeSpan.FromSeconds(1));
+        CollectionAssert.AreEqual(CancellationCalls, backend.Calls);
+        Assert.AreEqual(AnalysisSessionState.Failed, session.State);
+        AssertBoundary(backend, "cancel", AnalysisSessionState.Canceling);
+        Assert.HasCount(1, bus.Events.OfType<AnalysisFailed>());
+        AssertStageFailure(logger, session.Id, "StartAllocationTrace", stageFailure);
+    }
+
+    [TestMethod]
+    public async Task FinishAsync_WhenStoppingTraceFails_CleansUpBeforePublishingFailure()
+    {
+        var cancelGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stageFailure = new InvalidOperationException("Stop failed.");
+        var backend = new ControlledCaptureBackend
+        {
+            StopException = stageFailure,
+            CancelGate = cancelGate
+        };
         var analyzer = new ControlledAnalysisService();
         await using var bus = new RecordingEventBus();
-        var coordinator = CreateCoordinator(backend, analyzer, bus);
+        var logger = new RecordingLogger<AnalysisSessionCoordinator>();
+        var coordinator = CreateCoordinator(backend, analyzer, bus, logger);
 
         var session = await coordinator.StartAsync(CancellationToken.None);
-        await coordinator.FinishAsync(session.Id, CancellationToken.None);
+        var finish = coordinator.FinishAsync(session.Id, CancellationToken.None);
+
+        try
+        {
+            await backend.CancelEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+            Assert.AreEqual(AnalysisSessionState.Canceling, session.State);
+            Assert.IsEmpty(bus.Events.OfType<AnalysisFailed>());
+        }
+        finally
+        {
+            cancelGate.TrySetResult();
+        }
+
+        await finish.WaitAsync(TimeSpan.FromSeconds(1));
 
         CollectionAssert.AreEqual(StopFailureCalls, backend.Calls);
         Assert.IsEmpty(analyzer.Calls);
         Assert.AreEqual(AnalysisSessionState.Failed, session.State);
+        AssertBoundary(backend, "cancel", AnalysisSessionState.Canceling);
         Assert.HasCount(1, bus.Events.OfType<AnalysisFailed>());
+        AssertStageFailure(logger, session.Id, "StopAllocationTrace", stageFailure);
+    }
+
+    [TestMethod]
+    public async Task FinishAsync_WhenSnapshotFails_CleansUpBeforePublishingFailure()
+    {
+        var cancelGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stageFailure = new InvalidOperationException("Snapshot failed.");
+        var backend = new ControlledCaptureBackend
+        {
+            SnapshotException = stageFailure,
+            CancelGate = cancelGate
+        };
+        var analyzer = new ControlledAnalysisService();
+        await using var bus = new RecordingEventBus();
+        var logger = new RecordingLogger<AnalysisSessionCoordinator>();
+        var coordinator = CreateCoordinator(backend, analyzer, bus, logger);
+
+        var session = await coordinator.StartAsync(CancellationToken.None);
+        var finish = coordinator.FinishAsync(session.Id, CancellationToken.None);
+
+        try
+        {
+            await backend.CancelEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+            Assert.AreEqual(AnalysisSessionState.Canceling, session.State);
+            Assert.IsEmpty(bus.Events.OfType<AnalysisFailed>());
+        }
+        finally
+        {
+            cancelGate.TrySetResult();
+        }
+
+        await finish.WaitAsync(TimeSpan.FromSeconds(1));
+
+        CollectionAssert.AreEqual(SnapshotFailureCalls, backend.Calls);
+        Assert.IsEmpty(analyzer.Calls);
+        Assert.AreEqual(AnalysisSessionState.Failed, session.State);
+        AssertBoundary(backend, "cancel", AnalysisSessionState.Canceling);
+        Assert.HasCount(1, bus.Events.OfType<AnalysisFailed>());
+        AssertStageFailure(logger, session.Id, "CaptureHeapSnapshot", stageFailure);
+    }
+
+    [TestMethod]
+    public async Task FinishAsync_WhenAnalysisFails_CleansUpBeforePublishingFailure()
+    {
+        var cancelGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var backend = new ControlledCaptureBackend { CancelGate = cancelGate };
+        var stageFailure = new InvalidOperationException("Analysis failed.");
+        var analyzer = new ControlledAnalysisService
+        {
+            AnalyzeException = stageFailure
+        };
+        await using var bus = new RecordingEventBus();
+        var logger = new RecordingLogger<AnalysisSessionCoordinator>();
+        var coordinator = CreateCoordinator(backend, analyzer, bus, logger);
+
+        var session = await coordinator.StartAsync(CancellationToken.None);
+        var finish = coordinator.FinishAsync(session.Id, CancellationToken.None);
+
+        try
+        {
+            await backend.CancelEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+            Assert.AreEqual(AnalysisSessionState.Canceling, session.State);
+            Assert.IsEmpty(bus.Events.OfType<AnalysisFailed>());
+        }
+        finally
+        {
+            cancelGate.TrySetResult();
+        }
+
+        await finish.WaitAsync(TimeSpan.FromSeconds(1));
+
+        CollectionAssert.AreEqual(SnapshotFailureCalls, backend.Calls);
+        CollectionAssert.AreEqual(AnalyzeCalls, analyzer.Calls);
+        Assert.AreEqual(AnalysisSessionState.Failed, session.State);
+        AssertBoundary(backend, "cancel", AnalysisSessionState.Canceling);
+        Assert.HasCount(1, bus.Events.OfType<AnalysisFailed>());
+        AssertStageFailure(logger, session.Id, "Analyze", stageFailure);
     }
 
     [TestMethod]
     public async Task CancelAsync_WhenBackendFails_TransitionsToFailedAndPublishesFailure()
     {
-        var backend = new ControlledCaptureBackend { CancelException = new InvalidOperationException("Cancellation failed.") };
+        var stageFailure = new InvalidOperationException("Cancellation failed.");
+        var backend = new ControlledCaptureBackend { CancelException = stageFailure };
         await using var bus = new RecordingEventBus();
-        var coordinator = CreateCoordinator(backend, new ControlledAnalysisService(), bus);
+        var logger = new RecordingLogger<AnalysisSessionCoordinator>();
+        var coordinator = CreateCoordinator(backend, new ControlledAnalysisService(), bus, logger);
 
         var session = await coordinator.StartAsync(CancellationToken.None);
         await coordinator.CancelAsync(session.Id, CancellationToken.None);
@@ -335,11 +526,21 @@ public sealed class AnalysisSessionCoordinatorTests
         CollectionAssert.AreEqual(CancellationCalls, backend.Calls);
         Assert.AreEqual(AnalysisSessionState.Failed, session.State);
         Assert.HasCount(1, bus.Events.OfType<AnalysisFailed>());
+        AssertStageFailure(logger, session.Id, "Cancel", stageFailure);
     }
 
-    private static AnalysisSessionCoordinator CreateCoordinator(ICaptureBackend backend, IAnalysisService analyzer, IEventBus bus)
+    private static AnalysisSessionCoordinator CreateCoordinator(
+        ICaptureBackend backend,
+        IAnalysisService analyzer,
+        IEventBus bus,
+        ILogger<AnalysisSessionCoordinator>? logger = null)
     {
-        return new AnalysisSessionCoordinator(backend, analyzer, bus, TimeProvider.System);
+        return new AnalysisSessionCoordinator(
+            backend,
+            analyzer,
+            bus,
+            TimeProvider.System,
+            logger ?? NullLogger<AnalysisSessionCoordinator>.Instance);
     }
 
     private static void AssertBoundary(ControlledCaptureBackend backend, string operation, AnalysisSessionState expectedState)
@@ -350,6 +551,32 @@ public sealed class AnalysisSessionCoordinatorTests
     private static void AssertBoundary(ControlledAnalysisService analyzer, string operation, AnalysisSessionState expectedState)
     {
         Assert.AreEqual(expectedState, analyzer.Boundaries.Single(boundary => boundary.Operation == operation).State);
+    }
+
+    private static void AssertStageFailure(
+        RecordingLogger<AnalysisSessionCoordinator> logger,
+        SessionId sessionId,
+        string stage,
+        Exception expectedException)
+    {
+        var entry = logger.Entries.Single(log => log.EventId.Name == "SessionStageFailed");
+        Assert.AreEqual(LogLevel.Error, entry.LogLevel);
+        Assert.AreSame(expectedException, entry.Exception);
+        Assert.AreEqual(sessionId, entry.Properties["SessionId"]);
+        Assert.AreEqual(stage, entry.Properties["Stage"]);
+    }
+
+    private static void AssertTerminalPublicationFailure(
+        RecordingLogger<AnalysisSessionCoordinator> logger,
+        SessionId sessionId,
+        string eventType,
+        Exception expectedException)
+    {
+        var entry = logger.Entries.Single(log => log.EventId.Name == "TerminalEventPublicationFailed");
+        Assert.AreEqual(LogLevel.Error, entry.LogLevel);
+        Assert.AreSame(expectedException, entry.Exception);
+        Assert.AreEqual(sessionId, entry.Properties["SessionId"]);
+        Assert.AreEqual(eventType, entry.Properties["EventType"]);
     }
 
     private sealed class ControlledCaptureBackend(List<string>? orderedCalls = null) : ICaptureBackend
@@ -364,8 +591,11 @@ public sealed class AnalysisSessionCoordinatorTests
         public TaskCompletionSource? StopGate { get; init; }
         public TaskCompletionSource? SnapshotGate { get; init; }
         public TaskCompletionSource? CancelGate { get; init; }
+        public Exception? StartException { get; init; }
         public Exception? StopException { get; init; }
+        public Exception? SnapshotException { get; init; }
         public Exception? CancelException { get; init; }
+        public Action? OnCancel { get; init; }
         public AnalysisSession? LastSession { get; private set; }
 
         public async Task StartAllocationTraceAsync(AnalysisSession session, CancellationToken cancellationToken)
@@ -374,6 +604,7 @@ public sealed class AnalysisSessionCoordinatorTests
             Record("start", session, cancellationToken);
             StartEntered.TrySetResult();
             await WaitForGateAsync(StartGate).ConfigureAwait(false);
+            if (StartException is not null) throw StartException;
         }
 
         public async Task StopAllocationTraceAsync(AnalysisSession session, CancellationToken cancellationToken)
@@ -389,12 +620,14 @@ public sealed class AnalysisSessionCoordinatorTests
             Record("snapshot", session, cancellationToken);
             SnapshotEntered.TrySetResult();
             await WaitForGateAsync(SnapshotGate).ConfigureAwait(false);
+            if (SnapshotException is not null) throw SnapshotException;
         }
 
         public async Task CancelAsync(AnalysisSession session, CancellationToken cancellationToken)
         {
             Record("cancel", session, cancellationToken);
             CancelEntered.TrySetResult();
+            OnCancel?.Invoke();
             await WaitForGateAsync(CancelGate).ConfigureAwait(false);
             if (CancelException is not null) throw CancelException;
         }
@@ -418,6 +651,7 @@ public sealed class AnalysisSessionCoordinatorTests
         public List<BackendBoundary> Boundaries { get; } = [];
         public TaskCompletionSource AnalyzeEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource? AnalyzeGate { get; init; }
+        public Exception? AnalyzeException { get; init; }
 
         public async Task AnalyzeAsync(AnalysisSession session, CancellationToken cancellationToken)
         {
@@ -426,13 +660,15 @@ public sealed class AnalysisSessionCoordinatorTests
             Boundaries.Add(new BackendBoundary("analyze", session.State, cancellationToken.CanBeCanceled));
             AnalyzeEntered.TrySetResult();
             if (AnalyzeGate is not null) await AnalyzeGate.Task.ConfigureAwait(false);
+            if (AnalyzeException is not null) throw AnalyzeException;
         }
     }
 
     private sealed class RecordingEventBus(
         bool failCaptureStarted = false,
         bool throwCaptureStartedSynchronously = false,
-        bool throwTerminalPublicationsSynchronously = false) : IEventBus
+        Exception? synchronousTerminalPublicationException = null,
+        Exception? asynchronousTerminalPublicationException = null) : IEventBus
     {
         public List<IApplicationEvent> Events { get; } = [];
 
@@ -445,15 +681,21 @@ public sealed class AnalysisSessionCoordinatorTests
                 throw new EventDeliveryException(typeof(CaptureStarted), "test-subscription");
             }
 
-            if (throwTerminalPublicationsSynchronously
+            if (synchronousTerminalPublicationException is not null
                 && applicationEvent is AnalysisCompleted or AnalysisCanceled or AnalysisFailed)
             {
-                throw new EventDeliveryException(applicationEvent.GetType(), "test-subscription");
+                throw synchronousTerminalPublicationException;
             }
 
-            return failCaptureStarted && applicationEvent is CaptureStarted
-                ? ValueTask.FromException(new EventDeliveryException(typeof(CaptureStarted), "test-subscription"))
-                : ValueTask.CompletedTask;
+            if (failCaptureStarted && applicationEvent is CaptureStarted)
+            {
+                return ValueTask.FromException(new EventDeliveryException(typeof(CaptureStarted), "test-subscription"));
+            }
+
+            return asynchronousTerminalPublicationException is not null
+                && applicationEvent is AnalysisCompleted or AnalysisCanceled or AnalysisFailed
+                    ? ValueTask.FromException(asynchronousTerminalPublicationException)
+                    : ValueTask.CompletedTask;
         }
 
         public IDisposable Subscribe<TEvent>(Func<TEvent, CancellationToken, ValueTask> handler, EventSubscriptionOptions? options = null)
@@ -468,5 +710,50 @@ public sealed class AnalysisSessionCoordinatorTests
         public void Dispose() { }
     }
 
+    private sealed class RecordingLogger<T> : ILogger<T>
+    {
+        private readonly object _syncRoot = new();
+        private readonly List<LogEntry> _entries = [];
+
+        public IReadOnlyList<LogEntry> Entries
+        {
+            get
+            {
+                lock (_syncRoot)
+                {
+                    return [.. _entries];
+                }
+            }
+        }
+
+        public IDisposable? BeginScope<TState>(TState state)
+            where TState : notnull => NoOpDisposable.Instance;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            var properties = state is IEnumerable<KeyValuePair<string, object?>> values
+                ? values.ToDictionary(pair => pair.Key, pair => pair.Value)
+                : new Dictionary<string, object?>();
+
+            lock (_syncRoot)
+            {
+                _entries.Add(new LogEntry(logLevel, eventId, exception, properties));
+            }
+        }
+    }
+
     private sealed record BackendBoundary(string Operation, AnalysisSessionState State, bool TokenCanBeCanceled);
+
+    private sealed record LogEntry(
+        LogLevel LogLevel,
+        EventId EventId,
+        Exception? Exception,
+        IReadOnlyDictionary<string, object?> Properties);
 }

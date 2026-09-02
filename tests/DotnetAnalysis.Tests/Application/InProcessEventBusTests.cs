@@ -35,9 +35,15 @@ public sealed class InProcessEventBusTests
     {
         await using var bus = new InProcessEventBus(NullLogger<InProcessEventBus>.Instance);
         var calls = 0;
+        var healthyReceived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var subscription = bus.Subscribe<CaptureStarted>((_, _) =>
         {
             calls++;
+            return ValueTask.CompletedTask;
+        });
+        using var healthySubscription = bus.Subscribe<CaptureStarted>((_, _) =>
+        {
+            healthyReceived.TrySetResult();
             return ValueTask.CompletedTask;
         });
 
@@ -45,7 +51,7 @@ public sealed class InProcessEventBusTests
         await bus.PublishAsync(
             new CaptureStarted(SessionId.New(), DateTimeOffset.UtcNow, "Coordinator"),
             CancellationToken.None);
-        await Task.Delay(50);
+        await healthyReceived.Task.WaitAsync(TimeSpan.FromSeconds(1));
 
         Assert.AreEqual(0, calls);
     }
@@ -249,13 +255,37 @@ public sealed class InProcessEventBusTests
     {
         await using var bus = new InProcessEventBus(NullLogger<InProcessEventBus>.Instance);
         var faultReceived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstBarrierProcessed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondBarrierProcessed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var faultDeliveries = 0;
-        using var throwingFaultSubscription = bus.Subscribe<ModuleFaulted>((_, _) =>
+        using var throwingFaultSubscription = bus.Subscribe<ModuleFaulted>((@event, _) =>
         {
+            if (@event.Source == "barrier-1")
+            {
+                firstBarrierProcessed.TrySetResult();
+                return ValueTask.CompletedTask;
+            }
+
+            if (@event.Source == "barrier-2")
+            {
+                return ValueTask.CompletedTask;
+            }
+
             throw new InvalidOperationException("Fault handler failure.");
         });
-        using var healthyFaultSubscription = bus.Subscribe<ModuleFaulted>((_, _) =>
+        using var healthyFaultSubscription = bus.Subscribe<ModuleFaulted>((@event, _) =>
         {
+            if (@event.Source == "barrier-2")
+            {
+                secondBarrierProcessed.TrySetResult();
+                return ValueTask.CompletedTask;
+            }
+
+            if (@event.Source == "barrier-1")
+            {
+                return ValueTask.CompletedTask;
+            }
+
             Interlocked.Increment(ref faultDeliveries);
             faultReceived.TrySetResult();
             return ValueTask.CompletedTask;
@@ -269,7 +299,14 @@ public sealed class InProcessEventBusTests
             new CaptureStarted(SessionId.New(), DateTimeOffset.UtcNow, "Coordinator"),
             CancellationToken.None);
         await faultReceived.Task.WaitAsync(TimeSpan.FromSeconds(1));
-        await Task.Delay(100);
+        await bus.PublishAsync(
+            new ModuleFaulted(null, "barrier", "barrier", DateTimeOffset.UtcNow, "barrier-1"),
+            CancellationToken.None);
+        await firstBarrierProcessed.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        await bus.PublishAsync(
+            new ModuleFaulted(null, "barrier", "barrier", DateTimeOffset.UtcNow, "barrier-2"),
+            CancellationToken.None);
+        await secondBarrierProcessed.Task.WaitAsync(TimeSpan.FromSeconds(1));
 
         Assert.AreEqual(1, Volatile.Read(ref faultDeliveries));
     }

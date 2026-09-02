@@ -3,6 +3,7 @@ using DotnetAnalysis.Application.Contracts;
 using DotnetAnalysis.Application.Events;
 using DotnetAnalysis.Core.Events;
 using DotnetAnalysis.Core.Sessions;
+using Microsoft.Extensions.Logging;
 
 namespace DotnetAnalysis.Application.Sessions;
 
@@ -11,23 +12,44 @@ public sealed class AnalysisSessionCoordinator
     private const string Source = nameof(AnalysisSessionCoordinator);
     private const string SessionFailureCode = "analysis_session_failed";
     private const string SessionFailureMessage = "The memory analysis session could not be completed.";
+    private const string StartAllocationTraceStage = "StartAllocationTrace";
+    private const string PublishCaptureStartedStage = "PublishCaptureStarted";
+    private const string StopAllocationTraceStage = "StopAllocationTrace";
+    private const string CaptureHeapSnapshotStage = "CaptureHeapSnapshot";
+    private const string AnalyzeStage = "Analyze";
+    private const string CancelStage = "Cancel";
+
+    private static readonly Action<ILogger, SessionId, string, Exception?> s_sessionStageFailed =
+        LoggerMessage.Define<SessionId, string>(
+            LogLevel.Error,
+            new EventId(1, "SessionStageFailed"),
+            "Analysis session {SessionId} failed during {Stage}.");
+
+    private static readonly Action<ILogger, SessionId, string, Exception?> s_terminalEventPublicationFailed =
+        LoggerMessage.Define<SessionId, string>(
+            LogLevel.Error,
+            new EventId(2, "TerminalEventPublicationFailed"),
+            "Analysis session {SessionId} could not publish terminal event {EventType}.");
 
     private readonly ICaptureBackend _captureBackend;
     private readonly IAnalysisService _analysisService;
     private readonly IEventBus _eventBus;
     private readonly TimeProvider _timeProvider;
+    private readonly ILogger<AnalysisSessionCoordinator> _logger;
     private readonly ConcurrentDictionary<SessionId, SessionEntry> _sessions = new();
 
     public AnalysisSessionCoordinator(
         ICaptureBackend captureBackend,
         IAnalysisService analysisService,
         IEventBus eventBus,
-        TimeProvider timeProvider)
+        TimeProvider timeProvider,
+        ILogger<AnalysisSessionCoordinator> logger)
     {
         _captureBackend = captureBackend ?? throw new ArgumentNullException(nameof(captureBackend));
         _analysisService = analysisService ?? throw new ArgumentNullException(nameof(analysisService));
         _eventBus = eventBus ?? throw new ArgumentNullException(nameof(eventBus));
         _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
     public async Task<AnalysisSession> StartAsync(CancellationToken cancellationToken)
@@ -122,25 +144,29 @@ public sealed class AnalysisSessionCoordinator
 
     private async Task StartCoreAsync(SessionEntry entry, CancellationToken cancellationToken)
     {
+        var stage = StartAllocationTraceStage;
         try
         {
             var start = AdmitStartLocked(entry, cancellationToken);
             await start.ConfigureAwait(false);
 
+            stage = PublishCaptureStartedStage;
             await PublishCaptureStartedAsync(entry, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             await CompleteCancellationFromActiveCoreAsync(entry).ConfigureAwait(false);
         }
-        catch (Exception)
+        catch (Exception exception)
         {
-            await FailSessionAsync(entry).ConfigureAwait(false);
+            LogStageFailure(entry, stage, exception);
+            await BeginFailureCleanupAsync(entry).ConfigureAwait(false);
         }
     }
 
     private async Task FinishCoreAsync(SessionEntry entry, CancellationToken cancellationToken)
     {
+        var stage = StopAllocationTraceStage;
         try
         {
             await AdmitStageLocked(
@@ -148,11 +174,13 @@ public sealed class AnalysisSessionCoordinator
                 AnalysisSessionState.FinishingTrace,
                 _captureBackend.StopAllocationTraceAsync,
                 cancellationToken).ConfigureAwait(false);
+            stage = CaptureHeapSnapshotStage;
             await AdmitStageLocked(
                 entry,
                 AnalysisSessionState.CapturingHeapSnapshot,
                 _captureBackend.CaptureHeapSnapshotAsync,
                 cancellationToken).ConfigureAwait(false);
+            stage = AnalyzeStage;
             await AdmitStageLocked(
                 entry,
                 AnalysisSessionState.Analyzing,
@@ -165,9 +193,10 @@ public sealed class AnalysisSessionCoordinator
         {
             await CompleteCancellationFromActiveCoreAsync(entry).ConfigureAwait(false);
         }
-        catch (Exception)
+        catch (Exception exception)
         {
-            await FailSessionAsync(entry).ConfigureAwait(false);
+            LogStageFailure(entry, stage, exception);
+            await BeginFailureCleanupAsync(entry).ConfigureAwait(false);
         }
     }
 
@@ -198,54 +227,34 @@ public sealed class AnalysisSessionCoordinator
 
     private async Task PublishCaptureStartedAsync(SessionEntry entry, CancellationToken cancellationToken)
     {
-        try
-        {
-            ValueTask publication;
-            lock (entry.SyncRoot)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                publication = _eventBus.PublishAsync(
-                    new CaptureStarted(entry.Session.Id, _timeProvider.GetUtcNow(), Source),
-                    CancellationToken.None);
-            }
-
-            await publication.ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception)
-        {
-            // A started trace must be cleaned up before bounded lifecycle publication failure becomes a session failure.
-            await BeginFailureCleanupAsync(entry).ConfigureAwait(false);
-        }
-    }
-
-    private async Task CompleteSessionAsync(SessionEntry entry, CancellationToken cancellationToken)
-    {
         ValueTask publication;
         lock (entry.SyncRoot)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            MoveTo(entry.Session, AnalysisSessionState.Completed);
-            try
-            {
-                publication = _eventBus.PublishAsync(
-                    new AnalysisCompleted(entry.Session.Id, _timeProvider.GetUtcNow(), Source),
-                    CancellationToken.None);
-            }
-            catch (Exception)
-            {
-                return;
-            }
+            publication = _eventBus.PublishAsync(
+                new CaptureStarted(entry.Session.Id, _timeProvider.GetUtcNow(), Source),
+                CancellationToken.None);
         }
 
-        await IgnoreTerminalPublicationFailureAsync(publication).ConfigureAwait(false);
+        await publication.ConfigureAwait(false);
+    }
+
+    private async Task CompleteSessionAsync(SessionEntry entry, CancellationToken cancellationToken)
+    {
+        AnalysisCompleted completed;
+        lock (entry.SyncRoot)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            MoveTo(entry.Session, AnalysisSessionState.Completed);
+            completed = new AnalysisCompleted(entry.Session.Id, _timeProvider.GetUtcNow(), Source);
+        }
+
+        await PublishTerminalEventAsync(entry.Session.Id, completed).ConfigureAwait(false);
     }
 
     private async Task CancelAfterActiveAsync(SessionEntry entry, Task activeOperation)
     {
+        var backendCancellation = TryCancelBackendAsync(entry);
         try
         {
             await activeOperation.ConfigureAwait(false);
@@ -254,7 +263,8 @@ public sealed class AnalysisSessionCoordinator
         {
         }
 
-        await CancelAndCompleteAsync(entry, failSession: false).ConfigureAwait(false);
+        var cancellationFailure = await backendCancellation.ConfigureAwait(false);
+        await CompleteCancellationAsync(entry, cancellationFailure is not null).ConfigureAwait(false);
     }
 
     private async Task CompleteCancellationFromActiveCoreAsync(SessionEntry entry)
@@ -278,6 +288,7 @@ public sealed class AnalysisSessionCoordinator
         Task cleanup;
         lock (entry.SyncRoot)
         {
+            entry.FailureDetected = true;
             if (entry.CancellationOperation is not null)
             {
                 return;
@@ -291,24 +302,24 @@ public sealed class AnalysisSessionCoordinator
 
     private async Task CancelAndCompleteAsync(SessionEntry entry, bool failSession)
     {
-        Exception? cancellationFailure = null;
-        try
+        var cancellationFailure = await TryCancelBackendAsync(entry).ConfigureAwait(false);
+        await CompleteCancellationAsync(entry, failSession || cancellationFailure is not null).ConfigureAwait(false);
+    }
+
+    private async Task CompleteCancellationAsync(SessionEntry entry, bool failSession)
+    {
+        lock (entry.SyncRoot)
         {
-            var cancel = AdmitCancelLocked(entry);
-            await cancel.ConfigureAwait(false);
-        }
-        catch (Exception exception)
-        {
-            cancellationFailure = exception;
+            failSession |= entry.FailureDetected;
         }
 
-        if (failSession || cancellationFailure is not null)
+        if (failSession)
         {
             await FailSessionAsync(entry).ConfigureAwait(false);
             return;
         }
 
-        ValueTask publication;
+        AnalysisCanceled canceled;
         lock (entry.SyncRoot)
         {
             if (entry.Session.State is AnalysisSessionState.Completed
@@ -319,19 +330,25 @@ public sealed class AnalysisSessionCoordinator
             }
 
             MoveTo(entry.Session, AnalysisSessionState.Canceled);
-            try
-            {
-                publication = _eventBus.PublishAsync(
-                    new AnalysisCanceled(entry.Session.Id, _timeProvider.GetUtcNow(), Source),
-                    CancellationToken.None);
-            }
-            catch (Exception)
-            {
-                return;
-            }
+            canceled = new AnalysisCanceled(entry.Session.Id, _timeProvider.GetUtcNow(), Source);
         }
 
-        await IgnoreTerminalPublicationFailureAsync(publication).ConfigureAwait(false);
+        await PublishTerminalEventAsync(entry.Session.Id, canceled).ConfigureAwait(false);
+    }
+
+    private async Task<Exception?> TryCancelBackendAsync(SessionEntry entry)
+    {
+        try
+        {
+            var cancel = AdmitCancelLocked(entry);
+            await cancel.ConfigureAwait(false);
+            return null;
+        }
+        catch (Exception exception)
+        {
+            LogStageFailure(entry, CancelStage, exception);
+            return exception;
+        }
     }
 
     private Task AdmitCancelLocked(SessionEntry entry)
@@ -355,7 +372,7 @@ public sealed class AnalysisSessionCoordinator
 
     private async Task FailSessionAsync(SessionEntry entry)
     {
-        ValueTask publication;
+        AnalysisFailed failed;
         lock (entry.SyncRoot)
         {
             if (entry.Session.State is AnalysisSessionState.Completed
@@ -366,36 +383,33 @@ public sealed class AnalysisSessionCoordinator
             }
 
             MoveTo(entry.Session, AnalysisSessionState.Failed);
-            try
-            {
-                publication = _eventBus.PublishAsync(
-                    new AnalysisFailed(
-                        entry.Session.Id,
-                        SessionFailureCode,
-                        SessionFailureMessage,
-                        _timeProvider.GetUtcNow(),
-                        Source),
-                    CancellationToken.None);
-            }
-            catch (Exception)
-            {
-                return;
-            }
+            failed = new AnalysisFailed(
+                entry.Session.Id,
+                SessionFailureCode,
+                SessionFailureMessage,
+                _timeProvider.GetUtcNow(),
+                Source);
         }
 
-        await IgnoreTerminalPublicationFailureAsync(publication).ConfigureAwait(false);
+        await PublishTerminalEventAsync(entry.Session.Id, failed).ConfigureAwait(false);
     }
 
-    private static async Task IgnoreTerminalPublicationFailureAsync(ValueTask publication)
+    private async Task PublishTerminalEventAsync<TEvent>(SessionId sessionId, TEvent terminalEvent)
+        where TEvent : IApplicationEvent
     {
         try
         {
-            await publication.ConfigureAwait(false);
+            await _eventBus.PublishAsync(terminalEvent, CancellationToken.None).ConfigureAwait(false);
         }
-        catch (Exception)
+        catch (Exception exception)
         {
-            // A terminal state is already committed; bounded subscriber admission cannot reopen the session.
+            s_terminalEventPublicationFailed(_logger, sessionId, typeof(TEvent).Name, exception);
         }
+    }
+
+    private void LogStageFailure(SessionEntry entry, string stage, Exception exception)
+    {
+        s_sessionStageFailed(_logger, entry.Session.Id, stage, exception);
     }
 
     private static Task StartActiveOperationLocked(
@@ -505,6 +519,8 @@ public sealed class AnalysisSessionCoordinator
         public CancellationTokenSource? ActiveOperationCancellation { get; set; }
 
         public Task? CancellationOperation { get; set; }
+
+        public bool FailureDetected { get; set; }
     }
 
     private enum OperationKind

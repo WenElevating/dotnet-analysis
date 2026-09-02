@@ -1,5 +1,8 @@
 using System.Diagnostics.CodeAnalysis;
+using DotnetAnalysis.Application.Contracts;
 using DotnetAnalysis.Application.Events;
+using DotnetAnalysis.Application.Sessions;
+using DotnetAnalysis.Core.Sessions;
 using DotnetAnalysis.Desktop.Composition;
 using DotnetAnalysis.Desktop.Infrastructure;
 using DotnetAnalysis.Desktop.ViewModels;
@@ -35,6 +38,22 @@ public sealed class CompositionTests
     }
 
     [TestMethod]
+    public async Task AddDesktopApplication_WithAdapterServices_ResolvesCoordinator()
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton<ICaptureBackend, StubCaptureBackend>();
+        services.AddSingleton<IAnalysisService, StubAnalysisService>();
+        services.AddDesktopApplication();
+        await using var provider = services.BuildServiceProvider(validateScopes: true);
+
+        var coordinator = provider.GetRequiredService<AnalysisSessionCoordinator>();
+        var timeProvider = provider.GetRequiredService<TimeProvider>();
+
+        Assert.IsNotNull(coordinator);
+        Assert.AreSame(TimeProvider.System, timeProvider);
+    }
+
+    [TestMethod]
     public async Task ShellViewModel_WhenUiDispatchFails_ContainsHandlerFailure()
     {
         // Arrange
@@ -45,9 +64,18 @@ public sealed class CompositionTests
             dispatcher,
             NullLogger<ShellViewModel>.Instance);
         var faultReceived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        using var faultSubscription = eventBus.Subscribe<ModuleFaulted>((_, _) =>
+        var faultBarrierReceived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var faultSubscription = eventBus.Subscribe<ModuleFaulted>((@event, _) =>
         {
-            faultReceived.TrySetResult();
+            if (@event.Source == "barrier")
+            {
+                faultBarrierReceived.TrySetResult();
+            }
+            else
+            {
+                faultReceived.TrySetResult();
+            }
+
             return ValueTask.CompletedTask;
         });
 
@@ -55,22 +83,61 @@ public sealed class CompositionTests
         await eventBus.PublishAsync(
             new CaptureStarted(null, DateTimeOffset.UtcNow, "test"),
             CancellationToken.None);
-        await dispatcher.Invoked.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        await dispatcher.FirstInvocation.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        await eventBus.PublishAsync(
+            new CaptureStarted(null, DateTimeOffset.UtcNow, "barrier"),
+            CancellationToken.None);
+        await dispatcher.SecondInvocation.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        await eventBus.PublishAsync(
+            new ModuleFaulted(null, "barrier", "barrier", DateTimeOffset.UtcNow, "barrier"),
+            CancellationToken.None);
+        await faultBarrierReceived.Task.WaitAsync(TimeSpan.FromSeconds(1));
 
         // Assert
-        await Task.Delay(50);
         Assert.IsFalse(faultReceived.Task.IsCompleted);
         Assert.AreEqual("尚未开始分析", shell.StatusText);
     }
 
     private sealed class ThrowingUiDispatcher : IUiDispatcher
     {
-        public TaskCompletionSource Invoked { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _invocationCount;
+
+        public TaskCompletionSource FirstInvocation { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource SecondInvocation { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public Task InvokeAsync(Action action, CancellationToken cancellationToken = default)
         {
-            Invoked.TrySetResult();
+            if (Interlocked.Increment(ref _invocationCount) == 1)
+            {
+                FirstInvocation.TrySetResult();
+            }
+            else
+            {
+                SecondInvocation.TrySetResult();
+            }
+
             return Task.FromException(new InvalidOperationException("Dispatcher unavailable."));
         }
+    }
+
+    private sealed class StubCaptureBackend : ICaptureBackend
+    {
+        public Task StartAllocationTraceAsync(AnalysisSession session, CancellationToken cancellationToken) =>
+            Task.CompletedTask;
+
+        public Task StopAllocationTraceAsync(AnalysisSession session, CancellationToken cancellationToken) =>
+            Task.CompletedTask;
+
+        public Task CaptureHeapSnapshotAsync(AnalysisSession session, CancellationToken cancellationToken) =>
+            Task.CompletedTask;
+
+        public Task CancelAsync(AnalysisSession session, CancellationToken cancellationToken) =>
+            Task.CompletedTask;
+    }
+
+    private sealed class StubAnalysisService : IAnalysisService
+    {
+        public Task AnalyzeAsync(AnalysisSession session, CancellationToken cancellationToken) => Task.CompletedTask;
     }
 }
