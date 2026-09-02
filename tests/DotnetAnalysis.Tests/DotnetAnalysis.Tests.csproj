@@ -17,10 +17,19 @@
     <Using Include="Microsoft.VisualStudio.TestTools.UnitTesting" />
   </ItemGroup>
 
+  <ItemGroup Condition="'$(CoreDiagnosticsOnly)' == 'true'">
+    <Compile Remove="Application\**\*.cs" />
+    <Compile Remove="Desktop\**\*.cs" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\..\src\DotnetAnalysis.Core\DotnetAnalysis.Core.csproj" />
-    <ProjectReference Include="..\..\src\DotnetAnalysis.Application\DotnetAnalysis.Application.csproj" />
-    <ProjectReference Include="..\..\src\DotnetAnalysis.Desktop\DotnetAnalysis.Desktop.csproj" />
+    <ProjectReference
+      Include="..\..\src\DotnetAnalysis.Application\DotnetAnalysis.Application.csproj"
+      Condition="'$(CoreDiagnosticsOnly)' != 'true'" />
+    <ProjectReference
+      Include="..\..\src\DotnetAnalysis.Desktop\DotnetAnalysis.Desktop.csproj"
+      Condition="'$(CoreDiagnosticsOnly)' != 'true'" />
   </ItemGroup>
 
 </Project>
