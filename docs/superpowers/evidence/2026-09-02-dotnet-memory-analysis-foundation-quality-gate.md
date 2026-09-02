@@ -1,7 +1,7 @@
 # .NET 内存分析基础框架质量门证据
 
-工作目录：`D:\AIProject\dotnet-analysis\.worktrees\foundation`  
-采集日期：2026-09-02  
+工作目录：`D:\AIProject\dotnet-analysis\.worktrees\foundation`
+采集日期：2026-09-02
 范围：Task 6 的 SDK、自动化验证、独立 QA 与最终仓库确认。
 
 除 `git diff main -- src tests` 外，本记录保留命令的原始输出、时间戳和退出码。该 diff 已实际执行；因其完整输出为不可管理的大型源代码补丁，按审查要求不嵌入本记录，改以确定性的变更文件清单、提交摘要和已检查结论保留证据。
@@ -246,4 +246,36 @@ EXIT 0
 
 ## 最终仓库确认
 
-本节将在该证据记录首次提交后，使用同一文件追加跟踪的 `git status --short`、`git diff --check` 和 `git log --oneline -6` 原始输出。这样可在提交时得到真实的干净仓库状态，而不伪造提交前的结果。
+以下输出在证据首次提交 `ea2ade4` 后采集；三项 Task 6 最终仓库确认命令均成功。
+
+命令：`git status --short`
+
+```text
+TIMESTAMP 2026-09-02T15:08:35.5382175+08:00
+COMMAND git status --short
+EXIT 0
+```
+
+命令：`git diff --check`
+
+```text
+TIMESTAMP 2026-09-02T15:08:35.6693849+08:00
+COMMAND git diff --check
+EXIT 0
+```
+
+命令：`git log --oneline -6`
+
+```text
+TIMESTAMP 2026-09-02T15:08:35.7845059+08:00
+COMMAND git log --oneline -6
+ea2ade4 docs: preserve foundation quality gate evidence
+9500fe3 docs: clarify bounded event bus shutdown
+0b3159a docs: record foundation quality gates
+223304c fix: preserve command UI context
+b0a71ce feat: add desktop application shell
+3bbb373 fix: handle synchronous lifecycle publication failures
+EXIT 0
+```
+
+补充提交质量检查 `git show --check --stat --oneline HEAD` 曾报告本文件第 3、4 行尾随空白（退出码 2）。该发现仅涉及 Markdown 格式，已在本提交中删除；后续提交后将再次运行 `git diff --check` 与 `git show --check`。
