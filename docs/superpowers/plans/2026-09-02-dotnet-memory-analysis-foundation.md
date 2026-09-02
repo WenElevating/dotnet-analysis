@@ -126,6 +126,11 @@ dotnet add src/DotnetAnalysis.Application/DotnetAnalysis.Application.csproj refe
 dotnet add src/DotnetAnalysis.Diagnostics/DotnetAnalysis.Diagnostics.csproj reference src/DotnetAnalysis.Core/DotnetAnalysis.Core.csproj src/DotnetAnalysis.Application/DotnetAnalysis.Application.csproj
 dotnet add src/DotnetAnalysis.Desktop/DotnetAnalysis.Desktop.csproj reference src/DotnetAnalysis.Core/DotnetAnalysis.Core.csproj src/DotnetAnalysis.Application/DotnetAnalysis.Application.csproj
 dotnet add tests/DotnetAnalysis.Tests/DotnetAnalysis.Tests.csproj reference src/DotnetAnalysis.Core/DotnetAnalysis.Core.csproj src/DotnetAnalysis.Application/DotnetAnalysis.Application.csproj src/DotnetAnalysis.Desktop/DotnetAnalysis.Desktop.csproj
+dotnet add src/DotnetAnalysis.Application/DotnetAnalysis.Application.csproj package Microsoft.Extensions.Logging.Abstractions --version 10.0.11
+dotnet add src/DotnetAnalysis.Desktop/DotnetAnalysis.Desktop.csproj package Microsoft.Extensions.DependencyInjection --version 10.0.11
+dotnet add src/DotnetAnalysis.Desktop/DotnetAnalysis.Desktop.csproj package Microsoft.Extensions.Logging --version 10.0.11
+dotnet add tests/DotnetAnalysis.Tests/DotnetAnalysis.Tests.csproj package Microsoft.Extensions.DependencyInjection --version 10.0.11
+dotnet add tests/DotnetAnalysis.Tests/DotnetAnalysis.Tests.csproj package Microsoft.Extensions.Logging.Abstractions --version 10.0.11
 ~~~
 
 - [ ] **Step 3: Write the SDK and compiler policy**
@@ -305,7 +310,7 @@ public interface IApplicationEvent
 }
 ~~~
 
-Implement AnalysisSessionTransitionRules.CanMove(from, to). Permit only this normal sequence:
+AnalysisSession exposes a read-only `SessionId Id` supplied by its Create factory and a read-only `AnalysisSessionState State` initialized to Created. Implement AnalysisSessionTransitionRules.CanMove(from, to). Permit only this normal sequence:
 
 ~~~text
 Created -> Preflighting -> CapturingAllocations -> FinishingTrace
@@ -423,8 +428,8 @@ public interface IEventBus : IAsyncDisposable
 EventSubscriptionOptions defaults QueueCapacity to 64 and CoalesceProgressEvents to true. Add immutable record events:
 
 ~~~csharp
-public sealed record CaptureStarted(SessionId SessionId, DateTimeOffset OccurredAt, string Source) : IApplicationEvent;
-public sealed record CaptureProgressChanged(SessionId SessionId, int Percent, DateTimeOffset OccurredAt, string Source) : IApplicationEvent;
+public sealed record CaptureStarted(SessionId? SessionId, DateTimeOffset OccurredAt, string Source) : IApplicationEvent;
+public sealed record CaptureProgressChanged(SessionId? SessionId, int Percent, DateTimeOffset OccurredAt, string Source) : IApplicationEvent;
 public sealed record ModuleFaulted(SessionId? SessionId, string Module, string Message, DateTimeOffset OccurredAt, string Source) : IApplicationEvent;
 ~~~
 
@@ -761,7 +766,7 @@ Run it and verify failure before the registration extension is written.
 
 - [ ] **Step 7: Compose the application shell**
 
-DesktopServiceCollectionExtensions.AddDesktopApplication registers InProcessEventBus, AnalysisSessionCoordinator, IUiDispatcher, and ShellViewModel as singletons.
+DesktopServiceCollectionExtensions.AddDesktopApplication first calls `services.AddLogging()`, then registers InProcessEventBus, AnalysisSessionCoordinator, IUiDispatcher, and ShellViewModel as singletons.
 
 ShellViewModel inherits ObservableObject. StatusText starts as 尚未开始分析. Its event handlers use IUiDispatcher.InvokeAsync before setting bindable state.
 
