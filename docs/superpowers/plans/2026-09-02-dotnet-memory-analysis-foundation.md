@@ -447,30 +447,44 @@ A handler exception is logged and causes one ModuleFaulted notification. If the 
 
 ~~~csharp
 [TestMethod]
-public async Task PublishAsync_CoalescesProgressToLatestValueForSlowSubscriber()
+public async Task PublishAsync_CoalescesProgressToExactFirstAndLatestValuesForSlowSubscriber()
 {
     await using var bus = new InProcessEventBus(NullLogger<InProcessEventBus>.Instance);
     var gate = new TaskCompletionSource();
     var received = new List<int>();
+    var firstHandlerStarted = new TaskCompletionSource();
+    var latestReceived = new TaskCompletionSource();
     using var subscription = bus.Subscribe<CaptureProgressChanged>(async (@event, _) =>
     {
-        await gate.Task;
         received.Add(@event.Percent);
+        if (@event.Percent == 1)
+        {
+            firstHandlerStarted.TrySetResult();
+            await gate.Task;
+        }
+        else if (@event.Percent == 100)
+        {
+            latestReceived.TrySetResult();
+        }
     });
 
     var sessionId = SessionId.New();
-    for (var percent = 1; percent <= 100; percent++)
+    await bus.PublishAsync(new CaptureProgressChanged(sessionId, 1, DateTimeOffset.UtcNow, "Capture"), CancellationToken.None);
+    await firstHandlerStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+    for (var percent = 2; percent <= 100; percent++)
     {
         await bus.PublishAsync(new CaptureProgressChanged(sessionId, percent, DateTimeOffset.UtcNow, "Capture"), CancellationToken.None);
     }
 
     gate.SetResult();
-    await Task.Delay(100);
-    Assert.AreEqual(100, received[^1]);
+    await latestReceived.Task.WaitAsync(TimeSpan.FromSeconds(1));
+    CollectionAssert.AreEqual(new[] { 1, 100 }, received);
 }
 ~~~
 
-Run the focused test and verify it fails before adding progress replacement.
+The test must be gate-driven; do not use Task.Delay or a last-value-only assertion. Add a second deterministic test that blocks session A's first progress handler, publishes updates for session A and session B, releases the gate, and asserts independent coalescing: session A receives 1 then 2, while session B receives only its latest value 20.
+
+Run the focused tests and verify they fail before adding progress replacement.
 
 - [ ] **Step 6: Implement progress replacement and fault isolation**
 
