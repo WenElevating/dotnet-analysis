@@ -186,6 +186,31 @@ public sealed class AnalysisSessionCoordinatorTests
     }
 
     [TestMethod]
+    public async Task CancelAsync_WhenBackendReleasesActiveStartInline_CancelsWithoutDisposedTokenRace()
+    {
+        var startGate = new TaskCompletionSource();
+        var backend = new ControlledCaptureBackend
+        {
+            StartGate = startGate,
+            OnCancel = () => startGate.TrySetResult()
+        };
+        await using var bus = new RecordingEventBus();
+        var coordinator = CreateCoordinator(backend, new ControlledAnalysisService(), bus);
+
+        var start = coordinator.StartAsync(CancellationToken.None);
+        await backend.StartEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        var session = backend.LastSession!;
+
+        var cancellation = coordinator.CancelAsync(session.Id, CancellationToken.None);
+        await Task.WhenAll(start, cancellation).WaitAsync(TimeSpan.FromSeconds(1));
+
+        CollectionAssert.AreEqual(CancellationCalls, backend.Calls);
+        Assert.AreEqual(1, backend.Calls.Count(call => call == "cancel"));
+        Assert.IsEmpty(bus.Events.OfType<CaptureStarted>());
+        Assert.AreEqual(AnalysisSessionState.Canceled, session.State);
+    }
+
+    [TestMethod]
     public async Task CancelAsync_ImmediatelyBeforeSnapshotAdmission_SkipsSnapshotAndAnalysis()
     {
         var stopGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);

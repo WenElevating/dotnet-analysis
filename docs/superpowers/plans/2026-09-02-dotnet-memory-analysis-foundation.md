@@ -398,7 +398,7 @@ public async Task DisposedSubscription_DoesNotReceiveSubsequentEvents()
 
     subscription.Dispose();
     await bus.PublishAsync(new CaptureStarted(SessionId.New(), DateTimeOffset.UtcNow, "Coordinator"), CancellationToken.None);
-    await Task.Delay(50);
+    await bus.DisposeAsync();
 
     Assert.AreEqual(0, calls);
 }
@@ -533,7 +533,12 @@ public async Task FinishAsync_StopsTraceBeforeSnapshotBeforeAnalysis()
     var backend = new RecordingCaptureBackend(calls);
     var analyzer = new RecordingAnalysisService(calls);
     await using var bus = new InProcessEventBus(NullLogger<InProcessEventBus>.Instance);
-    var coordinator = new AnalysisSessionCoordinator(backend, analyzer, bus, TimeProvider.System);
+    var coordinator = new AnalysisSessionCoordinator(
+        backend,
+        analyzer,
+        bus,
+        TimeProvider.System,
+        NullLogger<AnalysisSessionCoordinator>.Instance);
 
     var session = await coordinator.StartAsync(CancellationToken.None);
     await coordinator.FinishAsync(session.Id, CancellationToken.None);
@@ -616,7 +621,7 @@ Run the focused test and verify it fails before implementing CancelAsync.
 
 - [x] **Step 6: Implement cancellation and duplicate-request guards**
 
-CancelAsync accepts nonterminal sessions, moves to Canceling, promptly invokes ICaptureBackend.CancelAsync while also signaling the active operation token, waits for both paths to converge, then moves to Canceled and publishes AnalysisCanceled. It never calls CaptureHeapSnapshotAsync or AnalyzeAsync. If the active stage or cleanup fails, cleanup still precedes the Canceling -> Failed terminal transition.
+CancelAsync accepts nonterminal sessions, reserves the shared cancellation task, signals the active operation token, then promptly invokes ICaptureBackend.CancelAsync and waits for both paths to converge before moving to Canceled and publishing AnalysisCanceled. It never calls CaptureHeapSnapshotAsync or AnalyzeAsync. If the active stage or cleanup fails, cleanup still precedes the Canceling -> Failed terminal transition.
 
 Repeated FinishAsync or CancelAsync while the same session operation is active returns the same in-flight Task and never invokes backend methods twice.
 
@@ -787,7 +792,7 @@ Run it and verify failure before the registration extension is written.
 
 - [x] **Step 7: Compose the application shell**
 
-DesktopServiceCollectionExtensions.AddDesktopApplication first calls `services.AddLogging()`, then registers InProcessEventBus, AnalysisSessionCoordinator, IUiDispatcher, and ShellViewModel as singletons.
+DesktopServiceCollectionExtensions.AddDesktopApplication first calls `services.AddLogging()`, registers `TimeProvider.System`, then registers InProcessEventBus, AnalysisSessionCoordinator, IUiDispatcher, and ShellViewModel as singletons.
 
 ShellViewModel inherits ObservableObject. StatusText starts as 尚未开始分析. Its event handlers use IUiDispatcher.InvokeAsync before setting bindable state.
 

@@ -52,6 +52,8 @@ public sealed class InProcessEventBusTests
             new CaptureStarted(SessionId.New(), DateTimeOffset.UtcNow, "Coordinator"),
             CancellationToken.None);
         await healthyReceived.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        healthySubscription.Dispose();
+        await bus.DisposeAsync();
 
         Assert.AreEqual(0, calls);
     }

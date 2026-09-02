@@ -133,9 +133,10 @@ public sealed class AnalysisSessionCoordinator
                 var activeOperation = entry.ActiveOperation;
                 var activeCancellation = entry.ActiveOperationCancellation
                     ?? throw new InvalidOperationException("The active operation has no cancellation token.");
-                var cancellation = StartCancellationOperationLocked(entry, () => CancelAfterActiveAsync(entry, activeOperation));
-                activeCancellation.Cancel();
-                return cancellation;
+                return StartCancellationOperationLocked(
+                    entry,
+                    () => CancelAfterActiveAsync(entry, activeOperation),
+                    activeCancellation);
             }
 
             return StartCancellationOperationLocked(entry, () => CancelAndCompleteAsync(entry, failSession: false));
@@ -426,10 +427,14 @@ public sealed class AnalysisSessionCoordinator
         return completion.Task;
     }
 
-    private static Task StartCancellationOperationLocked(SessionEntry entry, Func<Task> operation)
+    private static Task StartCancellationOperationLocked(
+        SessionEntry entry,
+        Func<Task> operation,
+        CancellationTokenSource? activeOperationCancellation = null)
     {
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         entry.CancellationOperation = completion.Task;
+        activeOperationCancellation?.Cancel();
         _ = ExecuteCancellationOperationAsync(entry, completion, operation);
         return completion.Task;
     }
