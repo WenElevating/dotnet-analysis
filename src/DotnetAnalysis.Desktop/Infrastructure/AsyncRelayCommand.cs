@@ -90,7 +90,7 @@ public sealed class AsyncRelayCommand : ObservableObject, ICommand
     {
         try
         {
-            await _executeAsync(cancellationTokenSource.Token).ConfigureAwait(false);
+            await _executeAsync(cancellationTokenSource.Token);
         }
         catch (OperationCanceledException) when (cancellationTokenSource.IsCancellationRequested)
         {
