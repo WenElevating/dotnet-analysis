@@ -2,9 +2,9 @@
 
 Baseline: `dotnet test DotnetAnalysis.sln --no-restore` is blocked by `global.json` requiring SDK 10.0.303; the host currently has 10.0.400, 10.0.100-preview, and 8.0.401. Development verification may invoke the solution from outside the repository root so SDK 10.0.400 is selected, without changing the repository pin.
 
-Task 1: complete (commit 8cd696c; Core diagnostics models/state tests verified)
-Task 2: complete (stable contracts, attached session, retryable operation, lifecycle tests, and event publication verified; base commit dd0feb8 plus final validation commit)
-Task 3: complete (event self-declared delivery policy, LatestOnly/Ordered behavior, bounded queues, and fault isolation verified; base commit dd0feb8 plus final validation commit)
+Task 1: complete (commit 0669e1f; Core diagnostics models/state tests verified)
+Task 2: complete (stable contracts, attached session, retryable operation, lifecycle tests, and event publication verified; base commit 9f01e0a plus final validation commit)
+Task 3: complete (event self-declared delivery policy, LatestOnly/Ordered behavior, bounded queues, and fault isolation verified; base commit 9f01e0a plus final validation commit)
 Task 4: complete (Windows process enumeration, identity/runtime guards, EventPipe managed heap sampling, and private working-set reader verified across net8/net9/net10)
 Task 5: complete (allocation sampling, verified FastSerialization .gcdump capture, atomic storage, allocation interval persistence, and cleanup verified)
 Task 6: complete (reader registry, import catalog, TraceEvent/EventPipe heap graph analysis, object/reference queries, and retryable analysis verified)

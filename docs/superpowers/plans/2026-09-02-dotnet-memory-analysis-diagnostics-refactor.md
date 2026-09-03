@@ -10,7 +10,7 @@
 
 ## 当前执行状态（2026-09-03）
 
-- 任务 1–7：实现、聚焦测试和集成所需代码已完成。任务 1 已由 `8cd696c` 提交，任务 2–3 的基础实现已由 `dd0feb8` 提交；本轮完成后的任务 4–8 收尾变更将以 Lore 提交归档。
+- 任务 1–7：实现、聚焦测试和集成所需代码已完成。任务 1 已由 `0669e1f` 提交，任务 2–3 的基础实现已由 `9f01e0a` 提交；本轮完成后的任务 4–8 收尾变更将以 Lore 提交归档。
 - 任务 8：使用本机 .NET SDK 10.0.400 完成构建、全量测试、真实 net8/net9/net10 EventPipe/.gcdump 集成测试、格式检查、前置脚本、依赖与层级边界检查。当前机器已安装 .NET 8.0.30、9.0.19 与 10.0.11 runtime，三运行时受控矩阵均可执行。
 - 已完成：Windows 任务管理器人工内存交叉核对和全部自动化门禁；当前仅执行最终 Lore 提交归档。
 - 最近验证结果：`dotnet build` 0 警告/0 错误；`dotnet test DotnetAnalysis.sln --no-restore` 主测试 51 通过、集成测试 11 通过且 0 跳过；三运行时 net8/net9/net10 真实 EventPipe/.gcdump 集成测试全部通过；`dotnet format --verify-no-changes` 通过；三 runtime 前置脚本通过；`git diff --check` 无输出。
@@ -227,7 +227,7 @@ public static class MemorySnapshotTransitionRules
 
 预期：通过状态迁移、非法输入、Unavailable 空值和 NotAvailable 数据质量测试。
 
-- [x] **步骤 6：提交**（已由 `8cd696c` 完成）
+- [x] **步骤 6：提交**（已由 `0669e1f` 完成）
 
 ~~~bash
 git add src/DotnetAnalysis.Core tests/DotnetAnalysis.Tests/Core
@@ -411,7 +411,7 @@ public sealed class DiagnosticsException : Exception
 
 预期：并发捕获拒绝、重试不重捕获、取消、目标结束、状态转换全部通过。
 
-- [x] **步骤 8：提交**（基础实现已由 `dd0feb8` 完成；本轮收尾变更统一归档）
+- [x] **步骤 8：提交**（基础实现已由 `9f01e0a` 完成；本轮收尾变更统一归档）
 
 ~~~bash
 git add src/DotnetAnalysis.Application tests/DotnetAnalysis.Tests/Application
@@ -544,7 +544,7 @@ public async Task Ordered_WhenQueueIsFull_ReportsDeliveryFailure()
 
 预期：通过通用 LatestOnly、Ordered、故障隔离、订阅释放和有界关闭测试，且没有旧事件引用。
 
-- [x] **步骤 6：提交**（基础实现已由 `dd0feb8` 完成；本轮收尾变更统一归档）
+- [x] **步骤 6：提交**（基础实现已由 `9f01e0a` 完成；本轮收尾变更统一归档）
 
 ~~~bash
 git add src/DotnetAnalysis.Application/Events tests/DotnetAnalysis.Tests/Application/InProcessEventBusTests.cs
@@ -662,7 +662,7 @@ ProcessMemorySampler 在后台任务中持续读取 EventPipe System.Runtime 计
 
 预期：通过稳定错误码、PID 复用防护、空值时间线和 UI 线程隔离测试。
 
-- [x] **步骤 7：提交**（基础实现已由 `dd0feb8` 完成；本轮收尾变更统一归档）
+- [x] **步骤 7：提交**（基础实现已由 `9f01e0a` 完成；本轮收尾变更统一归档）
 
 ~~~bash
 git add src/DotnetAnalysis.Diagnostics tests/DotnetAnalysis.Tests/Diagnostics
@@ -785,7 +785,7 @@ MemorySnapshotStore 先写临时 dump，再在临时清单中准备快照 ID、�
 
 预期：通过原子可见性、幂等清理、成功边界、数据质量和事件顺序测试。
 
-- [x] **步骤 8：提交**（基础实现已由 `dd0feb8` 完成；本轮收尾变更统一归档）
+- [x] **步骤 8：提交**（基础实现已由 `9f01e0a` 完成；本轮收尾变更统一归档）
 
 ~~~bash
 git add src/DotnetAnalysis.Diagnostics tests/DotnetAnalysis.Tests/Diagnostics
@@ -914,7 +914,7 @@ MemorySnapshotAnalysisService 以读取到的类型摘要和 AllocationProfile �
 
 预期：通过导入源文件不变、.dmp 稳定拒绝、堆图释放、无需目标进程的重试测试。
 
-- [x] **步骤 7：提交**（基础实现已由 `dd0feb8` 完成；本轮收尾变更统一归档）
+- [x] **步骤 7：提交**（基础实现已由 `9f01e0a` 完成；本轮收尾变更统一归档）
 
 ~~~bash
 git add src/DotnetAnalysis.Diagnostics src/DotnetAnalysis.Application/Snapshots tests/DotnetAnalysis.Tests
@@ -1010,7 +1010,7 @@ public async Task Composition_ResolvesDiagnosticsOnlyAfterRootRegistration()
 
 预期：通过 Application-only ViewModel、组合根注册、事件状态显示与 UI 线程切换测试。
 
-- [x] **步骤 7：提交**（基础实现已由 `dd0feb8` 完成；本轮收尾变更统一归档）
+- [x] **步骤 7：提交**（基础实现已由 `9f01e0a` 完成；本轮收尾变更统一归档）
 
 ~~~bash
 git add src/DotnetAnalysis.Desktop tests/DotnetAnalysis.Tests/Desktop
