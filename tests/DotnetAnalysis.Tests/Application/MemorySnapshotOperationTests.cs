@@ -1,8 +1,10 @@
 using System.Globalization;
 using System.Diagnostics.CodeAnalysis;
 using DotnetAnalysis.Application.Contracts.Diagnostics;
+using DotnetAnalysis.Application.Events;
 using DotnetAnalysis.Application.Snapshots;
 using DotnetAnalysis.Core.Diagnostics;
+using DotnetAnalysis.Core.Events;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -99,6 +101,25 @@ public sealed class MemorySnapshotOperationTests
         Assert.AreEqual(1, analysisService.GetReferencePathCalls);
     }
 
+    [TestMethod]
+    public async Task AnalyzeAsync_PublishesSnapshotLifecycleEvents()
+    {
+        var eventBus = new RecordingEventBus();
+        var sessionId = ProcessDiagnosticsSessionId.New();
+        var operation = CreateOperation(
+            Snapshot(MemorySnapshotState.Analyzing),
+            new ControlledSnapshotAnalysisService(),
+            eventBus,
+            sessionId);
+
+        await operation.AnalyzeAsync(CancellationToken.None);
+
+        Assert.AreEqual(1, eventBus.Events.OfType<MemorySnapshotAnalysisStarted>().Count());
+        Assert.AreEqual(1, eventBus.Events.OfType<MemorySnapshotAnalysisCompleted>().Count());
+        Assert.AreEqual(sessionId, eventBus.Events.OfType<MemorySnapshotAnalysisStarted>().Single().SessionId);
+        Assert.AreEqual(sessionId, eventBus.Events.OfType<MemorySnapshotAnalysisCompleted>().Single().SessionId);
+    }
+
     private static MemorySnapshotOperation CreateOperation(
         MemorySnapshot snapshot,
         ControlledSnapshotAnalysisService analysisService,
@@ -107,6 +128,22 @@ public sealed class MemorySnapshotOperationTests
         return new MemorySnapshotOperation(
             snapshot,
             analysisService,
+            TimeProvider.System,
+            logger ?? NullLogger<MemorySnapshotOperation>.Instance);
+    }
+
+    private static MemorySnapshotOperation CreateOperation(
+        MemorySnapshot snapshot,
+        ControlledSnapshotAnalysisService analysisService,
+        RecordingEventBus eventBus,
+        ProcessDiagnosticsSessionId sessionId,
+        ILogger<MemorySnapshotOperation>? logger = null)
+    {
+        return new MemorySnapshotOperation(
+            snapshot,
+            analysisService,
+            eventBus,
+            sessionId,
             TimeProvider.System,
             logger ?? NullLogger<MemorySnapshotOperation>.Instance);
     }
@@ -229,4 +266,26 @@ public sealed class MemorySnapshotOperationTests
         EventId EventId,
         Exception? Exception,
         IReadOnlyDictionary<string, object?> Properties);
+
+    private sealed class RecordingEventBus : IEventBus
+    {
+        private readonly List<IApplicationEvent> _events = [];
+
+        public IReadOnlyList<IApplicationEvent> Events => _events;
+
+        public ValueTask PublishAsync<TEvent>(TEvent applicationEvent, CancellationToken cancellationToken)
+            where TEvent : IApplicationEvent
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            _events.Add(applicationEvent);
+            return ValueTask.CompletedTask;
+        }
+
+        public IDisposable Subscribe<TEvent>(
+            Func<TEvent, CancellationToken, ValueTask> handler,
+            EventSubscriptionOptions? options = null)
+            where TEvent : IApplicationEvent => throw new NotSupportedException();
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
 }

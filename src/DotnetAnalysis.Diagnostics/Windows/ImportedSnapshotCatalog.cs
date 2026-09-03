@@ -14,4 +14,6 @@ public sealed class ImportedSnapshotCatalog
     }
 
     public bool TryResolve(MemorySnapshotId id, out string path) => _paths.TryGetValue(id, out path!);
+
+    public void Remove(MemorySnapshotId id) => _paths.TryRemove(id, out _);
 }

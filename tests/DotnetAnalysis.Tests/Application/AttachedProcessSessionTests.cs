@@ -2,8 +2,10 @@ using System.Collections;
 using System.Globalization;
 using System.Diagnostics.CodeAnalysis;
 using DotnetAnalysis.Application.Contracts.Diagnostics;
+using DotnetAnalysis.Application.Events;
 using DotnetAnalysis.Application.Sessions;
 using DotnetAnalysis.Core.Diagnostics;
+using DotnetAnalysis.Core.Events;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -98,6 +100,35 @@ public sealed class AttachedProcessSessionTests
         }
 
         Assert.AreEqual(ProcessDiagnosticsSessionState.Ended, session.State);
+    }
+
+    [TestMethod]
+    public async Task EndAsync_PublishesSessionLifecycleEvents()
+    {
+        var eventBus = new RecordingEventBus();
+        await using var session = new AttachedProcessSession(
+            ProcessDiagnosticsSessionId.New(),
+            new ControlledDiagnosticsSession(_process),
+            eventBus,
+            TimeProvider.System,
+            NullLogger<AttachedProcessSession>.Instance);
+
+        await session.EndAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(1));
+
+        var stateTransitions = eventBus.Events
+            .OfType<ProcessDiagnosticsSessionStateChanged>()
+            .Select(@event => @event.State)
+            .ToArray();
+
+        CollectionAssert.AreEqual(
+            new[]
+            {
+                ProcessDiagnosticsSessionState.Monitoring,
+                ProcessDiagnosticsSessionState.Ending,
+                ProcessDiagnosticsSessionState.Ended
+            },
+            stateTransitions);
+        Assert.AreEqual(1, eventBus.Events.OfType<ProcessDiagnosticsSessionEnded>().Count());
     }
 
     [TestMethod]
@@ -277,4 +308,26 @@ public sealed class AttachedProcessSessionTests
         EventId EventId,
         Exception? Exception,
         IReadOnlyDictionary<string, object?> Properties);
+
+    private sealed class RecordingEventBus : IEventBus
+    {
+        private readonly List<IApplicationEvent> _events = [];
+
+        public IReadOnlyList<IApplicationEvent> Events => _events;
+
+        public ValueTask PublishAsync<TEvent>(TEvent applicationEvent, CancellationToken cancellationToken)
+            where TEvent : IApplicationEvent
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            _events.Add(applicationEvent);
+            return ValueTask.CompletedTask;
+        }
+
+        public IDisposable Subscribe<TEvent>(
+            Func<TEvent, CancellationToken, ValueTask> handler,
+            EventSubscriptionOptions? options = null)
+            where TEvent : IApplicationEvent => throw new NotSupportedException();
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
 }

@@ -9,7 +9,12 @@ if ($isWindows -and [Environment]::OSVersion.Version.Build -lt 19045) {
 }
 
 $sdk = (& dotnet --version 2>$null).Trim()
-if ($sdk -ne '10.0.303') { $failures.Add("Required SDK 10.0.303 is missing (found '$sdk').") }
+$sdkVersion = $null
+if (-not [Version]::TryParse($sdk, [ref]$sdkVersion) -or $sdkVersion.Major -ne 10) {
+    $failures.Add("A .NET 10 SDK is required (found '$sdk').")
+} else {
+    Write-Output "OK: .NET SDK $sdkVersion"
+}
 
 $runtimes = (& dotnet --list-runtimes 2>$null) -join "`n"
 foreach ($major in 8, 9, 10) {

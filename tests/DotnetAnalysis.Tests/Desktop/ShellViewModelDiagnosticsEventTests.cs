@@ -34,6 +34,26 @@ public sealed class ShellViewModelDiagnosticsEventTests
     }
 
     [TestMethod]
+    public async Task ShellViewModel_WhenSessionEnds_ShowsEndedStatus()
+    {
+        await using var eventBus = new InProcessEventBus(NullLogger<InProcessEventBus>.Instance);
+        using var shell = new ShellViewModel(
+            eventBus,
+            new InlineUiDispatcher(),
+            NullLogger<ShellViewModel>.Instance);
+
+        await eventBus.PublishAsync(
+            new ProcessDiagnosticsSessionEnded(
+                ProcessDiagnosticsSessionId.New(),
+                DateTimeOffset.UtcNow,
+                "test"),
+            CancellationToken.None);
+
+        await WaitUntilAsync(() => shell.StatusText == "诊断会话已结束");
+        Assert.AreEqual("诊断会话已结束", shell.StatusText);
+    }
+
+    [TestMethod]
     public async Task ShellViewModel_WhenErrorArrives_DoesNotShowRawMessage()
     {
         await using var eventBus = new InProcessEventBus(NullLogger<InProcessEventBus>.Instance);

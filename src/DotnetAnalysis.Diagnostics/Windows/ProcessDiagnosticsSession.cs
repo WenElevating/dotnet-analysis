@@ -7,6 +7,7 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
 {
     private readonly ProcessMemorySampler _sampler;
     private readonly Func<CancellationToken, Task<MemorySnapshot>> _capture;
+    private readonly AllocationSampleCollector? _allocationCollector;
     private readonly CancellationTokenSource _lifetime = new();
     private readonly ProcessDiagnosticsSessionId _id = ProcessDiagnosticsSessionId.New();
     private int _disposed;
@@ -14,10 +15,12 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
     public ProcessDiagnosticsSession(
         TargetProcess process,
         ProcessMemorySampler sampler,
-        Func<CancellationToken, Task<MemorySnapshot>>? capture = null)
+        Func<CancellationToken, Task<MemorySnapshot>>? capture = null,
+        AllocationSampleCollector? allocationCollector = null)
     {
         Process = process ?? throw new ArgumentNullException(nameof(process));
         _sampler = sampler ?? throw new ArgumentNullException(nameof(sampler));
+        _allocationCollector = allocationCollector;
         _capture = capture ?? (_ => Task.FromException<MemorySnapshot>(new DiagnosticsException(
             DiagnosticsErrorCode.RuntimeNotSupported,
             "Live snapshot capture is not available on this adapter.")));
@@ -61,6 +64,16 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
             _lifetime.Dispose();
         }
 
+        if (_allocationCollector is not null)
+        {
+            return DisposeCollectorAsync(_allocationCollector);
+        }
+
         return ValueTask.CompletedTask;
+    }
+
+    private static async ValueTask DisposeCollectorAsync(AllocationSampleCollector collector)
+    {
+        await collector.DisposeAsync().ConfigureAwait(false);
     }
 }

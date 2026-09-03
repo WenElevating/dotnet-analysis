@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using DotnetAnalysis.Application.Contracts.Diagnostics;
 using DotnetAnalysis.Core.Diagnostics;
 
@@ -11,19 +10,25 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
     private readonly RuntimeCapabilitiesResolver _capabilitiesResolver;
     private readonly IProcessMemoryReader _processMemoryReader;
     private readonly ImportedSnapshotCatalog _importedSnapshots;
+    private readonly SnapshotStorageLayout _snapshotLayout;
+    private readonly MemorySnapshotStore _snapshotStore;
 
     public WindowsProcessDiagnostics(
         ProcessEnumerator? enumerator = null,
         ProcessIdentityValidator? identityValidator = null,
         RuntimeCapabilitiesResolver? capabilitiesResolver = null,
         IProcessMemoryReader? processMemoryReader = null,
-        ImportedSnapshotCatalog? importedSnapshots = null)
+        ImportedSnapshotCatalog? importedSnapshots = null,
+        SnapshotStorageLayout? snapshotLayout = null)
     {
         _enumerator = enumerator ?? new ProcessEnumerator();
         _identityValidator = identityValidator ?? new ProcessIdentityValidator();
         _capabilitiesResolver = capabilitiesResolver ?? new RuntimeCapabilitiesResolver();
         _processMemoryReader = processMemoryReader ?? new ProcessMemoryReader();
         _importedSnapshots = importedSnapshots ?? new ImportedSnapshotCatalog();
+        _snapshotLayout = snapshotLayout ?? new SnapshotStorageLayout(
+            Path.Combine(Path.GetTempPath(), "DotnetAnalysis", "Snapshots"));
+        _snapshotStore = new MemorySnapshotStore(_snapshotLayout, _importedSnapshots);
     }
 
     public Task<IReadOnlyList<TargetProcess>> GetProcessesAsync(CancellationToken cancellationToken)
@@ -46,7 +51,56 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
         await _identityValidator.ValidateAsync(process, cancellationToken).ConfigureAwait(false);
         await _capabilitiesResolver.ValidateAsync(process, cancellationToken).ConfigureAwait(false);
         var sampler = new ProcessMemorySampler(process, _processMemoryReader);
-        return new ProcessDiagnosticsSession(process, sampler);
+        var allocationCollector = new AllocationSampleCollector(
+            new AllocationProfileBuilder(DateTimeOffset.UtcNow));
+        try
+        {
+            await allocationCollector.StartAsync(process, cancellationToken).ConfigureAwait(false);
+        }
+        catch (DiagnosticsException)
+        {
+            // Allocation sampling is an independent timeline.  A runtime may
+            // expose memory counters while refusing the allocation provider;
+            // preserve the session and mark that interval as interrupted.
+            allocationCollector.MarkInterrupted(DateTimeOffset.UtcNow);
+        }
+
+        return new ProcessDiagnosticsSession(
+            process,
+            sampler,
+            capture: cancellationToken => CaptureSnapshotCoreAsync(process, allocationCollector, cancellationToken),
+            allocationCollector: allocationCollector);
+    }
+
+    private async Task<MemorySnapshot> CaptureSnapshotCoreAsync(
+        TargetProcess target,
+        AllocationSampleCollector allocationCollector,
+        CancellationToken cancellationToken)
+    {
+        await _identityValidator.ValidateAsync(target, cancellationToken).ConfigureAwait(false);
+        var snapshotId = MemorySnapshotId.New();
+        var requestedAtUtc = DateTimeOffset.UtcNow;
+        var captureStartedAtUtc = DateTimeOffset.UtcNow;
+        var (temporaryPath, capturedAtUtc) = await GCDumpSnapshotCollector.CaptureAsync(
+            target,
+            _snapshotLayout,
+            cancellationToken).ConfigureAwait(false);
+
+        var allocationProfile = allocationCollector.Seal(capturedAtUtc);
+        await _snapshotStore.PromoteAsync(
+            snapshotId,
+            temporaryPath,
+            allocationProfile,
+            cancellationToken).ConfigureAwait(false);
+        allocationCollector.BeginNextInterval(capturedAtUtc);
+
+        return new MemorySnapshot(
+            snapshotId,
+            MemorySnapshotOrigin.Captured,
+            requestedAtUtc,
+            captureStartedAtUtc,
+            capturedAtUtc,
+            MemorySnapshotState.Analyzing);
     }
 
     public Task<MemorySnapshot> OpenSnapshotAsync(
@@ -82,80 +136,4 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
         return Task.FromResult(snapshot);
     }
 
-    private static bool TryCreateTargetProcess(Process process, out TargetProcess targetProcess)
-    {
-        targetProcess = null!;
-        DateTimeOffset startedAtUtc;
-        try
-        {
-            startedAtUtc = process.StartTime.ToUniversalTime();
-        }
-        catch (Exception exception) when (exception is InvalidOperationException or NotSupportedException)
-        {
-            return false;
-        }
-
-        string? executablePath = null;
-        try
-        {
-            executablePath = process.MainModule?.FileName;
-        }
-        catch (Exception exception) when (
-            exception is InvalidOperationException
-                or NotSupportedException
-                or System.ComponentModel.Win32Exception)
-        {
-        }
-
-        try
-        {
-            targetProcess = new TargetProcess(
-                process.Id,
-                startedAtUtc,
-                process.ProcessName,
-                executablePath);
-            return true;
-        }
-        catch (ArgumentException)
-        {
-            return false;
-        }
-    }
-
-    private sealed class UnsupportedProcessDiagnosticsSession(TargetProcess process) : IProcessDiagnosticsSession
-    {
-        public ProcessDiagnosticsSessionId Id { get; } = ProcessDiagnosticsSessionId.New();
-
-        public TargetProcess Process { get; } = process;
-
-        public ProcessDiagnosticsSessionState State => ProcessDiagnosticsSessionState.Monitoring;
-
-        public Task EndAsync(CancellationToken cancellationToken)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            return Task.CompletedTask;
-        }
-
-        public async IAsyncEnumerable<MemoryUsageSample> GetMemoryUsageAsync(
-            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            yield return new MemoryUsageSample(
-                DateTimeOffset.UtcNow,
-                null,
-                null,
-                MemoryUsageSampleState.Unavailable);
-            await Task.CompletedTask.ConfigureAwait(false);
-        }
-
-        public Task<MemorySnapshot> CaptureSnapshotAsync(CancellationToken cancellationToken)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            throw new DiagnosticsException(
-                DiagnosticsErrorCode.RuntimeNotSupported,
-                "Live snapshot capture is not implemented in this adapter yet.");
-        }
-
-        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
-    }
 }

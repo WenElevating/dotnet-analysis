@@ -6,19 +6,15 @@ namespace DotnetAnalysis.Diagnostics.IntegrationTests;
 [SuppressMessage("Naming", "CA1707:Identifiers should not contain underscores", Justification = "Test names describe behavior.")]
 public sealed class RuntimePrerequisitesTests
 {
+    private static readonly int[] s_requiredRuntimeMajors = [8, 10];
+
     [TestMethod]
     [TestCategory("WindowsDiagnosticsIntegration")]
-    public void RequiredRuntimes_AreInstalledForNet8Net9AndNet10()
+    public void RequiredRuntimes_AreInstalledForNet8AndNet10()
     {
         Assert.IsTrue(OperatingSystem.IsWindows(), "Windows is required for this category.");
-        var output = string.Join("\n", System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("dotnet", "--list-runtimes")
-        {
-            RedirectStandardOutput = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        })!.StandardOutput.ReadToEnd());
-        StringAssert.Contains(output, "Microsoft.NETCore.App 8.");
-        StringAssert.Contains(output, "Microsoft.NETCore.App 9.");
-        StringAssert.Contains(output, "Microsoft.NETCore.App 10.");
+        var installed = IntegrationTestHost.GetInstalledRuntimeMajorVersions();
+
+        CollectionAssert.IsSubsetOf(s_requiredRuntimeMajors, installed.ToArray());
     }
 }

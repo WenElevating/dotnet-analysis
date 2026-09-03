@@ -321,6 +321,16 @@ ApplicationEventDeliveryMode
 - 结束附着和应用关闭使用协作取消；临时文件清理由 `MemorySnapshotStore` 保证幂等。
 - 每次快照采集前都复核目标身份；采集成功后先确保文件完整可读，再发布“已保存”状态。
 
+## Operational Quality Decision Record
+
+| 维度 | 决策 | 可观察的要求 / 理由 | 验证证据 |
+| --- | --- | --- | --- |
+| 性能与容量 | 是 | EventPipe 读取、快照写入和堆图分析必须运行在 UI 线程之外；`ProcessMemorySampler`、`AllocationSampleCollector` 和事件总线不得被慢订阅者反压；读取器优先流式处理、增量聚合和按需构建对象详情，UI 不持有完整堆图。 | Application 事件总线测试验证有界队列、`LatestOnly` 时间线合并和慢订阅者不阻塞采样；Windows 集成测试验证附着期间时间线与快照流程可持续运行；静态检查确认诊断工作不进入 WPF UI 调度器。 |
+| 并发、完整性与幂等性 | 是 | 单个附着会话同一时刻只允许一个 `Capturing` 快照；成功保存的 `CapturedAtUtc` 才能切分分配区间；临时文件清理、会话取消和快照保存必须幂等；每次附着和采集前复核 PID 与 `StartedAtUtc`。 | Core/Application 契约测试覆盖并发截取拒绝、失败或取消不切分区间、重试不重新采集、PID 复用防护和重复清理；Windows 集成测试验证原子保存、临时文件清理与成功快照保留。 |
+| 故障与生命周期 | 是 | 附着会话遵循 `Attaching -> Monitoring -> Ending -> Ended/Failed`；快照遵循 `Pending -> Capturing -> Analyzing -> Ready/Failed/Canceled`；目标退出、访问失败、运行时不支持、格式不支持、采集失败和取消映射为稳定错误码；结束附着或关闭应用时取消采集但保留已完整保存快照。 | 状态转换、错误码、目标退出、取消、分析失败可重试和快照保留的单元/契约测试；受控 .NET 8/9/10 x64 Windows 进程集成测试验证会话释放与生命周期收尾。 |
+| 可观测性 | 是 | 生命周期和快照阶段通过强类型事件发布；高频时间线事件声明 `LatestOnly` 投递策略；事件只携带轻量摘要和失败码；底层异常保留在日志与 `InnerException`；订阅处理器故障发布 `ModuleFaulted`，且不得递归发布自身故障。 | 事件契约测试验证 `Ordered` 生命周期投递、`LatestOnly` 合并、订阅释放、`ModuleFaulted` 隔离和有界关闭；Application 日志断言验证阶段、会话标识、事件类型与原始异常可追踪。 |
+| 其他相关约束 | 是 | 首版仅支持 Windows 10 22H2（含 2023-09 累积更新）或 Windows 11 22H2 及更高版本上的本机 Windows x64 .NET 8/9/10 CoreCLR；Core 不依赖 UI、文件系统或诊断 SDK；Desktop 不依赖 Diagnostics 实现；不启动 `dotnet-gcdump` 或 `dotnet-trace` 子进程；首版不引用 ClrMD。 | 解决方案项目引用、目标框架、NuGet 包和禁止依赖的静态检查；受控 .NET 8/9/10 x64 Windows 集成矩阵；构建、测试、格式化和 `git diff --check` 全量门禁。 |
+
 ## 13. 测试与验证
 
 ### 13.1 单元与契约测试

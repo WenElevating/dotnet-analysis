@@ -1,31 +1,61 @@
+using System.Collections.ObjectModel;
 using System.Diagnostics;
 
 namespace DotnetAnalysis.Diagnostics.IntegrationTests;
 
 public sealed class IntegrationTestHost : IAsyncDisposable
 {
+    private static readonly Lazy<ReadOnlyCollection<int>> s_installedRuntimeMajorVersions = new(LoadInstalledRuntimeMajorVersions);
     private readonly Process _process;
 
     private IntegrationTestHost(Process process) => _process = process;
 
     public int ProcessId => _process.Id;
 
-    public static async Task<IntegrationTestHost> StartTargetAsync(string targetFramework)
+    public static ReadOnlyCollection<int> GetInstalledRuntimeMajorVersions() => s_installedRuntimeMajorVersions.Value;
+
+    public static IEnumerable<string> GetSupportedTargetFrameworks()
     {
-        var project = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "DotnetAnalysis.Diagnostics.TestTarget", "DotnetAnalysis.Diagnostics.TestTarget.csproj"));
-        var targetAssembly = Path.Combine(
-            Path.GetDirectoryName(project)!,
-            "bin",
-            "x64",
-            "Debug",
-            targetFramework,
-            "DotnetAnalysis.Diagnostics.TestTarget.dll");
-        if (!File.Exists(targetAssembly))
+        yield return "net8.0";
+
+        if (GetInstalledRuntimeMajorVersions().Contains(9))
         {
-            throw new FileNotFoundException("Target assembly was not built.", targetAssembly);
+            yield return "net9.0";
         }
 
-        var psi = new ProcessStartInfo("dotnet", $"\"{targetAssembly}\"")
+        yield return "net10.0";
+    }
+
+    public static string ResolveTargetExecutablePath(string targetFramework)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(targetFramework);
+
+        var projectDirectory = GetTargetProjectDirectory();
+        var candidates = new[]
+        {
+            Path.Combine(projectDirectory, "bin", "x64", "Debug", targetFramework, "DotnetAnalysis.Diagnostics.TestTarget.exe"),
+            Path.Combine(projectDirectory, "bin", "Debug", targetFramework, "DotnetAnalysis.Diagnostics.TestTarget.exe"),
+            Path.Combine(projectDirectory, "bin", "x64", "Release", targetFramework, "DotnetAnalysis.Diagnostics.TestTarget.exe"),
+            Path.Combine(projectDirectory, "bin", "Release", targetFramework, "DotnetAnalysis.Diagnostics.TestTarget.exe")
+        };
+
+        foreach (var candidate in candidates)
+        {
+            if (File.Exists(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        throw new FileNotFoundException(
+            $"Could not find the built target executable for {targetFramework}.",
+            candidates[0]);
+    }
+
+    public static async Task<IntegrationTestHost> StartTargetAsync(string targetFramework)
+    {
+        var targetExecutable = ResolveTargetExecutablePath(targetFramework);
+        var psi = new ProcessStartInfo(targetExecutable)
         {
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
@@ -60,4 +90,39 @@ public sealed class IntegrationTestHost : IAsyncDisposable
             _process.Dispose();
         }
     }
+
+    private static ReadOnlyCollection<int> LoadInstalledRuntimeMajorVersions()
+    {
+        var psi = new ProcessStartInfo("dotnet", "--list-runtimes")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        using var process = Process.Start(psi) ?? throw new InvalidOperationException("Could not query installed dotnet runtimes.");
+        var output = process.StandardOutput.ReadToEnd();
+        process.WaitForExit();
+
+        var majors = new HashSet<int>();
+        foreach (var line in output.Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (!line.StartsWith("Microsoft.NETCore.App ", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var versionText = line["Microsoft.NETCore.App ".Length..].Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)[0];
+            if (Version.TryParse(versionText, out var version))
+            {
+                majors.Add(version.Major);
+            }
+        }
+
+        return new ReadOnlyCollection<int>(majors.OrderBy(major => major).ToArray());
+    }
+
+    private static string GetTargetProjectDirectory() =>
+        Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "DotnetAnalysis.Diagnostics.TestTarget"));
 }

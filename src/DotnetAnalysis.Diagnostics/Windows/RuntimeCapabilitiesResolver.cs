@@ -1,5 +1,6 @@
 using DotnetAnalysis.Application.Contracts.Diagnostics;
 using DotnetAnalysis.Core.Diagnostics;
+using System.Diagnostics;
 
 namespace DotnetAnalysis.Diagnostics.Windows;
 
@@ -15,8 +16,50 @@ public sealed class SystemProcessRuntimeInspector : IProcessRuntimeInspector
 {
     public bool IsWindows => OperatingSystem.IsWindows();
     public bool Is64BitOperatingSystem => Environment.Is64BitOperatingSystem;
-    public bool IsCoreClr(TargetProcess process) => true;
-    public int GetRuntimeMajorVersion(TargetProcess process) => 10;
+    public bool IsCoreClr(TargetProcess process)
+    {
+        ArgumentNullException.ThrowIfNull(process);
+        try
+        {
+            using var target = Process.GetProcessById(process.ProcessId);
+            return target.Modules.Cast<ProcessModule>().Any(module =>
+                string.Equals(module.ModuleName, "System.Private.CoreLib.dll", StringComparison.OrdinalIgnoreCase));
+        }
+        catch (Exception exception) when (
+            exception is ArgumentException
+                or InvalidOperationException
+                or System.ComponentModel.Win32Exception
+                or NotSupportedException)
+        {
+            return false;
+        }
+    }
+
+    public int GetRuntimeMajorVersion(TargetProcess process)
+    {
+        ArgumentNullException.ThrowIfNull(process);
+        try
+        {
+            using var target = Process.GetProcessById(process.ProcessId);
+            var coreLib = target.Modules.Cast<ProcessModule>().FirstOrDefault(module =>
+                string.Equals(module.ModuleName, "System.Private.CoreLib.dll", StringComparison.OrdinalIgnoreCase));
+            if (coreLib is null)
+            {
+                return 0;
+            }
+
+            var version = FileVersionInfo.GetVersionInfo(coreLib.FileName).FileVersion;
+            return Version.TryParse(version, out var parsed) ? parsed.Major : 0;
+        }
+        catch (Exception exception) when (
+            exception is ArgumentException
+                or InvalidOperationException
+                or System.ComponentModel.Win32Exception
+                or NotSupportedException)
+        {
+            return 0;
+        }
+    }
 }
 
 public sealed class RuntimeCapabilitiesResolver
