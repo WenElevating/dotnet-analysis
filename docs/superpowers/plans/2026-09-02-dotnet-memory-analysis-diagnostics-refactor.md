@@ -13,7 +13,7 @@
 - 任务 1–7：实现、聚焦测试和集成所需代码已完成。任务 1 已由 `8cd696c` 提交，任务 2–3 的基础实现已由 `dd0feb8` 提交；本轮完成后的任务 4–8 收尾变更将以 Lore 提交归档。
 - 任务 8：使用本机 .NET SDK 10.0.400 完成构建、全量测试、真实 net8/net9/net10 EventPipe/.gcdump 集成测试、格式检查、前置脚本、依赖与层级边界检查。当前机器已安装 .NET 8.0.30、9.0.19 与 10.0.11 runtime，三运行时受控矩阵均可执行。
 - 已完成：Windows 任务管理器人工内存交叉核对和全部自动化门禁；当前仅执行最终 Lore 提交归档。
-- 最近验证结果：`dotnet build` 0 警告/0 错误；`dotnet test DotnetAnalysis.sln --no-restore` 主测试 50 通过、集成测试 10 通过且 0 跳过；三运行时 net8/net9/net10 真实 EventPipe/.gcdump 集成测试全部通过；`dotnet format --verify-no-changes` 通过；三 runtime 前置脚本通过；`git diff --check` 无输出。
+- 最近验证结果：`dotnet build` 0 警告/0 错误；`dotnet test DotnetAnalysis.sln --no-restore` 主测试 51 通过、集成测试 11 通过且 0 跳过；三运行时 net8/net9/net10 真实 EventPipe/.gcdump 集成测试全部通过；`dotnet format --verify-no-changes` 通过；三 runtime 前置脚本通过；`git diff --check` 无输出。
 
 ## 全局约束
 
@@ -1109,7 +1109,7 @@ IntegrationTestHost 使用 dotnet 启动指定框架输出，最多等待 15 秒
 
 将命令输出、目标框架、PID、Windows 构建号、三个时间戳、双方 MB 值及通过结论存入该次测试运行的制品目录。任一比较失败即阻断交付。
 
-验证记录（2026-09-03）：Windows 11 build 26200、x64、net10.0 受控目标 PID 31424；三个时间点为 2026-09-03T11:04:59.5918671Z、2026-09-03T11:05:05.8278663Z、2026-09-03T11:05:12.1766771Z。诊断读取器与原生 `PROCESS_MEMORY_COUNTERS_EX2.PrivateWorkingSetSize`（任务管理器“内存”列等效私有工作集口径）分别为 5/5 MB、6/6 MB、8/8 MB，三次差值均为 0 MB。任务管理器 UI Automation 在本机仅暴露外壳 Pane，未暴露“详细信息”虚拟列表，因此制品同时记录了该 UI 限制和原生等效核对依据：`tests/TestResults/DiagnosticsTaskManagerCrossCheck-20260903/task-manager-cross-check.json`。
+验证记录（2026-09-03）：Windows 11 build 26200、x64、net10.0 受控目标 PID 11584；三个时间点为 2026-09-03T11:19:17.0250899+00:00、2026-09-03T11:19:23.2509274+00:00、2026-09-03T11:19:29.4976756+00:00。诊断读取器与原生 `PROCESS_MEMORY_COUNTERS_EX2.PrivateWorkingSetSize`（任务管理器“内存”列等效私有工作集口径）分别为 6/6 MB、6/6 MB、6/6 MB，三次差值均为 0 MB。任务管理器 UI Automation 在本机仅暴露外壳 Pane，未暴露“详细信息”虚拟列表，因此制品同时记录了该 UI 限制和原生等效核对依据：`tests/TestResults/DiagnosticsTaskManagerCrossCheck-20260903/task-manager-cross-check.json`。
 
 - [x] **步骤 6：运行全部自动化门禁（本机 .NET 10 SDK；net8/net9/net10 runtime 矩阵）**
 
