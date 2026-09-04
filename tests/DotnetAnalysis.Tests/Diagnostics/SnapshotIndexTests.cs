@@ -104,6 +104,42 @@ public sealed class SnapshotIndexTests
     }
 
     [TestMethod]
+    public async Task Cache_WhenSnapshotChanges_WaitsForTheExistingColdParseBeforeStartingAnother()
+    {
+        var cache = new SnapshotIndexCache();
+        var firstSnapshot = MemorySnapshotId.New();
+        var secondSnapshot = MemorySnapshotId.New();
+        var firstGate = new TaskCompletionSource<SnapshotIndex>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondCalls = 0;
+
+        var first = cache.GetAsync(
+            firstSnapshot,
+            () =>
+            {
+                firstStarted.TrySetResult();
+                return firstGate.Task;
+            },
+            CancellationToken.None);
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        var second = cache.GetAsync(
+            secondSnapshot,
+            () =>
+            {
+                secondCalls++;
+                return Task.FromResult(new SnapshotIndex([]));
+            },
+            CancellationToken.None);
+
+        await Task.Delay(50);
+        Assert.AreEqual(0, secondCalls);
+        firstGate.SetResult(new SnapshotIndex([]));
+        _ = await first;
+        _ = await second;
+        Assert.AreEqual(1, secondCalls);
+    }
+
+    [TestMethod]
     public async Task ReferencePath_ConcurrentQueriesBuildReverseIndexOnlyOnce()
     {
         var type = new TypeIdentity("Node", "Sample");
@@ -115,7 +151,7 @@ public sealed class SnapshotIndexTests
             new SnapshotIndex.ObjectRow(2, type, 16)
         ],
         new Dictionary<ulong, IReadOnlyList<ulong>> { [1] = [2] },
-        [],
+        [1],
         () =>
         {
             firstBuilderEntered.TrySetResult();
@@ -129,5 +165,21 @@ public sealed class SnapshotIndexTests
         await Task.WhenAll(first, second);
 
         Assert.AreEqual(1, index.ReverseIndexBuildCount);
+    }
+
+    [TestMethod]
+    public void ReferencePath_WhenObjectHasNoGcRoot_ReturnsNullInsteadOfAnUnrootedChain()
+    {
+        var type = new TypeIdentity("Node", "Sample");
+        var index = new SnapshotIndex(
+        [
+            new SnapshotIndex.ObjectRow(1, type, 16),
+            new SnapshotIndex.ObjectRow(2, type, 16)
+        ],
+        new Dictionary<ulong, IReadOnlyList<ulong>> { [1] = [2] });
+
+        var path = index.GetReferencePath(2);
+
+        Assert.IsNull(path);
     }
 }

@@ -29,7 +29,7 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
 
     private readonly object _syncRoot = new();
     private readonly ProcessMemorySampler _sampler;
-    private readonly AllocationSampleCollector _allocationCollector;
+    private readonly AllocationSamplingSession _allocationCollector;
     private readonly IMemorySnapshotCapture _capture;
     private readonly IEventBus _eventBus;
     private readonly TimeProvider _timeProvider;
@@ -52,7 +52,7 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
     internal ProcessDiagnosticsSession(
         TargetProcess process,
         ProcessMemorySampler sampler,
-        AllocationSampleCollector allocationCollector,
+        AllocationSamplingSession allocationCollector,
         IMemorySnapshotCapture capture,
         IEventBus eventBus,
         TimeProvider timeProvider,

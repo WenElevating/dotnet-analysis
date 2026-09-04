@@ -153,42 +153,19 @@ internal sealed class SnapshotIndex
             return null;
         }
 
-        var roots = _roots;
         var rootSet = _roots.ToHashSet();
-        var parent = new Dictionary<int, int>();
-        var queue = new Queue<int>(roots);
-        foreach (var root in roots)
+        if (rootSet.Count == 0)
         {
-            parent.TryAdd(root, -1);
-        }
-
-        while (queue.TryDequeue(out var current))
-        {
-            if (current == target)
-            {
-                return BuildPath(target, parent);
-            }
-
-            if (!_edges.TryGetValue(current, out var children))
-            {
-                continue;
-            }
-
-            foreach (var child in children)
-            {
-                if (parent.TryAdd(child, current))
-                {
-                    queue.Enqueue(child);
-                }
-            }
+            return null;
         }
 
         var reverseEdges = GetOrBuildReverseEdges();
         var next = new Dictionary<int, int> { [target] = -1 };
+        var queue = new Queue<int>();
         queue.Enqueue(target);
         while (queue.TryDequeue(out var current))
         {
-            if (rootSet.Contains(current) || !reverseEdges.TryGetValue(current, out var parents) || parents.Length == 0)
+            if (rootSet.Contains(current))
             {
                 var path = new List<MemoryObjectInfo>();
                 for (var cursor = current; cursor >= 0; cursor = next[cursor])
@@ -197,6 +174,11 @@ internal sealed class SnapshotIndex
                 }
 
                 return new MemoryReferencePath(objectAddress, path);
+            }
+
+            if (!reverseEdges.TryGetValue(current, out var parents))
+            {
+                continue;
             }
 
             foreach (var candidate in parents)

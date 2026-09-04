@@ -110,6 +110,18 @@ public sealed class DiagnosticsValueTests
         Assert.IsEmpty(profile.Hotspots);
     }
 
+    [TestMethod]
+    public void AllocationProfile_NotAvailable_ReportsUnavailableCallStackQuality()
+    {
+        var profile = AllocationProfile.NotAvailable(
+            Instant("2026-09-04T00:00:00Z"),
+            Instant("2026-09-04T00:01:00Z"));
+
+        var quality = typeof(AllocationProfile).GetProperty("CallStackQuality")?.GetValue(profile)?.ToString();
+
+        Assert.AreEqual("NotAvailable", quality);
+    }
+
     private static DateTimeOffset Instant(string value) =>
         DateTimeOffset.Parse(value, CultureInfo.InvariantCulture);
 }

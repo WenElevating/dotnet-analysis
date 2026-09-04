@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Security.Cryptography;
 using DotnetAnalysis.Application.Contracts.Diagnostics;
 using DotnetAnalysis.Core.Diagnostics;
 using Microsoft.Diagnostics.Tracing;
@@ -9,9 +10,15 @@ namespace DotnetAnalysis.Diagnostics.Windows;
 /// 描述已提升到持久化目录的快照文件及其分配概要。
 /// </summary>
 internal sealed record StoredSnapshot(
-    MemorySnapshotId SnapshotId,
+    MemorySnapshot Snapshot,
     string FilePath,
-    AllocationProfile AllocationProfile);
+    AllocationProfile AllocationProfile)
+{
+    /// <summary>
+    /// 持久化快照的稳定标识。
+    /// </summary>
+    public MemorySnapshotId SnapshotId => Snapshot.Id;
+}
 
 /// <summary>
 /// 抽象快照文件可读性校验，便于存储流程隔离文件格式检查。
@@ -110,14 +117,16 @@ internal sealed class MemorySnapshotStore
     /// 校验临时快照并原子提升为最终文件。
     /// </summary>
     public async Task<StoredSnapshot> PromoteAsync(
-        MemorySnapshotId snapshotId,
+        MemorySnapshot snapshot,
         string temporaryPath,
         AllocationProfile allocationProfile,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(snapshot);
         ArgumentException.ThrowIfNullOrWhiteSpace(temporaryPath);
         ArgumentNullException.ThrowIfNull(allocationProfile);
         cancellationToken.ThrowIfCancellationRequested();
+        var snapshotId = snapshot.Id;
         try
         {
             if (!File.Exists(temporaryPath))
@@ -133,8 +142,9 @@ internal sealed class MemorySnapshotStore
             var finalManifestPath = _layout.GetFinalManifestPath(snapshotId);
             var temporaryManifestPath = _layout.GetTemporaryManifestPath(snapshotId);
 
-            var stored = new StoredSnapshot(snapshotId, finalDumpPath, allocationProfile);
-            await WriteManifestAsync(temporaryManifestPath, stored, cancellationToken).ConfigureAwait(false);
+            var stored = new StoredSnapshot(snapshot, finalDumpPath, allocationProfile);
+            var integrity = await SnapshotIntegrity.CreateAsync(temporaryPath, cancellationToken).ConfigureAwait(false);
+            await WriteManifestAsync(temporaryManifestPath, stored, integrity, cancellationToken).ConfigureAwait(false);
             File.Move(temporaryPath, finalDumpPath, false);
             try
             {
@@ -183,29 +193,52 @@ internal sealed class MemorySnapshotStore
     public async Task<StoredSnapshot> ResolveAsync(MemorySnapshotId snapshotId, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        if (!_catalog.TryResolve(snapshotId, out var path))
+        var manifestFile = _layout.GetFinalManifestPath(snapshotId);
+        if (!File.Exists(manifestFile))
         {
-            var manifestPath = _layout.GetFinalManifestPath(snapshotId);
-            if (!File.Exists(manifestPath))
-            {
-                throw new DiagnosticsException(
-                    DiagnosticsErrorCode.CaptureFailed,
-                    "Snapshot is not available.");
-            }
-
-            await using var stream = File.OpenRead(manifestPath);
-            var manifest = await JsonSerializer.DeserializeAsync<StoredSnapshotManifest>(stream, s_jsonOptions, cancellationToken).ConfigureAwait(false)
-                ?? throw new DiagnosticsException(DiagnosticsErrorCode.CaptureFailed, "Snapshot manifest is empty.");
-
-            path = manifest.FilePath;
-            _catalog.Register(snapshotId, path);
+            throw new DiagnosticsException(
+                DiagnosticsErrorCode.CaptureFailed,
+                "Snapshot is not available.");
         }
 
-        var manifestFile = _layout.GetFinalManifestPath(snapshotId);
-        await using var manifestStream = File.OpenRead(manifestFile);
-        var loaded = await JsonSerializer.DeserializeAsync<StoredSnapshotManifest>(manifestStream, s_jsonOptions, cancellationToken).ConfigureAwait(false)
-            ?? throw new DiagnosticsException(DiagnosticsErrorCode.CaptureFailed, "Snapshot manifest is empty.");
-        return new StoredSnapshot(loaded.SnapshotId, loaded.FilePath, loaded.AllocationProfile.ToAllocationProfile());
+        var stored = await ReadManifestAsync(manifestFile, cancellationToken).ConfigureAwait(false);
+        if (stored.SnapshotId != snapshotId)
+        {
+            throw new DiagnosticsException(DiagnosticsErrorCode.CaptureFailed, "Snapshot manifest identity does not match its directory.");
+        }
+
+        _catalog.Register(snapshotId, stored.FilePath);
+        return stored;
+    }
+
+    /// <summary>
+    /// 尝试从受管快照同目录的版本化清单恢复捕获快照；外部文件返回空。
+    /// </summary>
+    public async Task<StoredSnapshot?> TryRestoreAsync(string filePath, CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
+        cancellationToken.ThrowIfCancellationRequested();
+        var normalizedPath = Path.GetFullPath(filePath);
+        var directory = Path.GetDirectoryName(normalizedPath);
+        if (string.IsNullOrWhiteSpace(directory))
+        {
+            return null;
+        }
+
+        var manifestPath = Path.Combine(directory, "snapshot.json");
+        if (!File.Exists(manifestPath))
+        {
+            return null;
+        }
+
+        var stored = await ReadManifestAsync(manifestPath, cancellationToken).ConfigureAwait(false);
+        if (!string.Equals(stored.FilePath, normalizedPath, StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        _catalog.Register(stored.SnapshotId, stored.FilePath);
+        return stored;
     }
 
     /// <summary>
@@ -234,11 +267,41 @@ internal sealed class MemorySnapshotStore
     private static async Task WriteManifestAsync(
         string manifestPath,
         StoredSnapshot snapshot,
+        SnapshotIntegrity integrity,
         CancellationToken cancellationToken)
     {
         await using var stream = File.Create(manifestPath);
-        var manifest = StoredSnapshotManifest.From(snapshot);
+        var manifest = StoredSnapshotManifest.From(snapshot, integrity);
         await JsonSerializer.SerializeAsync(stream, manifest, s_jsonOptions, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 读取、验证并还原版本化快照清单。
+    /// </summary>
+    private async Task<StoredSnapshot> ReadManifestAsync(string manifestPath, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var stream = File.OpenRead(manifestPath);
+            var manifest = await JsonSerializer.DeserializeAsync<StoredSnapshotManifest>(stream, s_jsonOptions, cancellationToken).ConfigureAwait(false)
+                ?? throw new InvalidDataException("Snapshot manifest is empty.");
+            var stored = manifest.ToStoredSnapshot(_layout);
+            await manifest.Integrity.ValidateAsync(stored.FilePath, cancellationToken).ConfigureAwait(false);
+            return stored;
+        }
+        catch (DiagnosticsException)
+        {
+            throw;
+        }
+        catch (Exception exception) when (
+            exception is IOException
+                or UnauthorizedAccessException
+                or InvalidDataException
+                or JsonException
+                or CryptographicException)
+        {
+            throw new DiagnosticsException(DiagnosticsErrorCode.CaptureFailed, "Snapshot manifest is invalid or the snapshot file is damaged.", exception);
+        }
     }
 
     /// <summary>
@@ -246,22 +309,69 @@ internal sealed class MemorySnapshotStore
     /// </summary>
     private sealed class StoredSnapshotManifest
     {
-        public MemorySnapshotId SnapshotId { get; init; }
+        public int ManifestVersion { get; init; }
 
-        public string FilePath { get; init; } = string.Empty;
+        public Guid SnapshotId { get; init; }
+
+        public MemorySnapshotOrigin Origin { get; init; }
+
+        public DateTimeOffset RequestedAtUtc { get; init; }
+
+        public DateTimeOffset? CaptureStartedAtUtc { get; init; }
+
+        public DateTimeOffset? CapturedAtUtc { get; init; }
+
+        public string RelativeFilePath { get; init; } = string.Empty;
+
+        public SnapshotIntegrity Integrity { get; init; } = new();
 
         public AllocationProfileManifest AllocationProfile { get; init; } = new();
 
         /// <summary>
         /// 从运行时快照模型创建可序列化清单。
         /// </summary>
-        public static StoredSnapshotManifest From(StoredSnapshot snapshot) =>
+        public static StoredSnapshotManifest From(StoredSnapshot snapshot, SnapshotIntegrity integrity) =>
             new()
             {
-                SnapshotId = snapshot.SnapshotId,
-                FilePath = snapshot.FilePath,
+                ManifestVersion = 1,
+                SnapshotId = snapshot.SnapshotId.Value,
+                Origin = snapshot.Snapshot.Origin,
+                RequestedAtUtc = snapshot.Snapshot.RequestedAtUtc,
+                CaptureStartedAtUtc = snapshot.Snapshot.CaptureStartedAtUtc,
+                CapturedAtUtc = snapshot.Snapshot.CapturedAtUtc,
+                RelativeFilePath = Path.Combine(
+                    snapshot.SnapshotId.ToString(),
+                    Path.GetFileName(snapshot.FilePath)),
+                Integrity = integrity,
                 AllocationProfile = AllocationProfileManifest.From(snapshot.AllocationProfile)
             };
+
+        public StoredSnapshot ToStoredSnapshot(SnapshotStorageLayout layout)
+        {
+            if (ManifestVersion != 1 || string.IsNullOrWhiteSpace(RelativeFilePath))
+            {
+                throw new InvalidDataException("Snapshot manifest version or relative path is invalid.");
+            }
+
+            var root = Path.GetFullPath(layout.RootDirectory);
+            var filePath = Path.GetFullPath(Path.Combine(root, RelativeFilePath));
+            var rootWithSeparator = root.EndsWith(Path.DirectorySeparatorChar)
+                ? root
+                : root + Path.DirectorySeparatorChar;
+            if (!filePath.StartsWith(rootWithSeparator, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidDataException("Snapshot manifest path escapes the managed storage directory.");
+            }
+
+            var snapshot = new MemorySnapshot(
+                new MemorySnapshotId(SnapshotId),
+                Origin,
+                RequestedAtUtc,
+                CaptureStartedAtUtc,
+                CapturedAtUtc,
+                MemorySnapshotState.Analyzing);
+            return new StoredSnapshot(snapshot, filePath, AllocationProfile.ToAllocationProfile());
+        }
     }
 
     /// <summary>
@@ -275,6 +385,8 @@ internal sealed class MemorySnapshotStore
 
         public AllocationProfileDataQuality DataQuality { get; init; }
 
+        public AllocationCallStackQuality CallStackQuality { get; init; }
+
         public List<HotspotManifest> Hotspots { get; init; } = [];
 
         /// <summary>
@@ -286,6 +398,7 @@ internal sealed class MemorySnapshotStore
                 StartedAtUtc = profile.StartedAtUtc,
                 EndedAtUtc = profile.EndedAtUtc,
                 DataQuality = profile.DataQuality,
+                CallStackQuality = profile.CallStackQuality,
                 Hotspots = profile.Hotspots.Select(HotspotManifest.From).ToList()
             };
 
@@ -297,7 +410,8 @@ internal sealed class MemorySnapshotStore
                 StartedAtUtc,
                 EndedAtUtc,
                 Hotspots.Select(hotspot => hotspot.ToAllocationHotspot()).ToArray(),
-                DataQuality);
+                DataQuality,
+                CallStackQuality);
     }
 
     /// <summary>
@@ -361,5 +475,47 @@ internal sealed class MemorySnapshotStore
         /// 把清单模型还原为核心调用栈帧。
         /// </summary>
         public CallStackFrame ToCallStackFrame() => new(Name, ModuleName, LineNumber);
+    }
+
+    /// <summary>
+    /// 描述快照文件长度和 SHA-256 校验值，用于打开前检测损坏或替换。
+    /// </summary>
+    private sealed class SnapshotIntegrity
+    {
+        public long LengthBytes { get; init; }
+
+        public string Sha256 { get; init; } = string.Empty;
+
+        public static async Task<SnapshotIntegrity> CreateAsync(string filePath, CancellationToken cancellationToken)
+        {
+            await using var stream = new FileStream(
+                filePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                bufferSize: 64 * 1024,
+                FileOptions.Asynchronous | FileOptions.SequentialScan);
+            var hash = await SHA256.HashDataAsync(stream, cancellationToken).ConfigureAwait(false);
+            return new SnapshotIntegrity
+            {
+                LengthBytes = stream.Length,
+                Sha256 = Convert.ToHexString(hash)
+            };
+        }
+
+        public async Task ValidateAsync(string filePath, CancellationToken cancellationToken)
+        {
+            if (LengthBytes < 0 || string.IsNullOrWhiteSpace(Sha256) || !File.Exists(filePath))
+            {
+                throw new InvalidDataException("Snapshot integrity metadata is invalid.");
+            }
+
+            var actual = await CreateAsync(filePath, cancellationToken).ConfigureAwait(false);
+            if (actual.LengthBytes != LengthBytes
+                || !string.Equals(actual.Sha256, Sha256, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidDataException("Snapshot file does not match its manifest integrity data.");
+            }
+        }
     }
 }

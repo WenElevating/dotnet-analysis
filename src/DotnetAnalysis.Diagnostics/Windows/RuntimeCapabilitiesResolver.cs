@@ -98,13 +98,22 @@ public sealed class SystemProcessRuntimeInspector : IProcessRuntimeInspector
 public sealed class RuntimeCapabilitiesResolver
 {
     private readonly IProcessRuntimeInspector _inspector;
+    private readonly IProcessArchitectureInspector _architectureInspector;
 
     /// <summary>
     /// 创建运行时能力验证器，可注入系统信息读取器以便测试。
     /// </summary>
-    public RuntimeCapabilitiesResolver(IProcessRuntimeInspector? inspector = null)
+    public RuntimeCapabilitiesResolver()
+        : this(null, null)
+    {
+    }
+
+    internal RuntimeCapabilitiesResolver(
+        IProcessRuntimeInspector? inspector = null,
+        IProcessArchitectureInspector? architectureInspector = null)
     {
         _inspector = inspector ?? new SystemProcessRuntimeInspector();
+        _architectureInspector = architectureInspector ?? new ProcessArchitectureInspector();
     }
 
     /// <summary>
@@ -117,7 +126,10 @@ public sealed class RuntimeCapabilitiesResolver
     {
         ArgumentNullException.ThrowIfNull(process);
         cancellationToken.ThrowIfCancellationRequested();
-        if (!_inspector.IsWindows || !_inspector.Is64BitOperatingSystem || !_inspector.IsCoreClr(process))
+        if (!_inspector.IsWindows
+            || !_inspector.Is64BitOperatingSystem
+            || !_architectureInspector.IsAmd64(process)
+            || !_inspector.IsCoreClr(process))
         {
             throw new DiagnosticsException(DiagnosticsErrorCode.RuntimeNotSupported, "The target runtime is not supported.");
         }

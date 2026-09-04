@@ -109,7 +109,201 @@ public sealed class GCDumpSnapshotReader : IMemorySnapshotReader
     /// 读取供同一快照查询复用的紧凑索引。
     /// </summary>
     internal static Task<SnapshotIndex> ReadIndexAsync(string filePath) =>
-        Task.Run(() => SnapshotIndex.FromHeap(ReadHeap(filePath, CancellationToken.None)), CancellationToken.None);
+        Task.Run(() => ReadIndex(filePath, CancellationToken.None), CancellationToken.None);
+
+    /// <summary>
+    /// 直接从快照流生成紧凑索引；不会先构造完整 <see cref="HeapData"/> 对象图。
+    /// </summary>
+    private static SnapshotIndex ReadIndex(string filePath, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (TryReadFastSerializationIndex(filePath, cancellationToken, out var serializedIndex))
+        {
+            return serializedIndex;
+        }
+
+        try
+        {
+            using var source = new EventPipeEventSource(filePath);
+            var builder = new EventPipeHeapBuilder();
+            builder.Attach(source);
+            source.Process();
+            return builder.BuildIndex();
+        }
+        catch (Exception exception) when (
+            exception is InvalidOperationException
+                or IOException
+                or EndOfStreamException
+                or ArgumentException)
+        {
+            throw new DiagnosticsException(
+                DiagnosticsErrorCode.CaptureFailed,
+                "The gcdump could not be parsed.",
+                exception);
+        }
+    }
+
+    /// <summary>
+    /// 直接将 FastSerialization 节点、边和根投影为 <see cref="SnapshotIndex"/>。
+    /// </summary>
+    private static bool TryReadFastSerializationIndex(
+        string filePath,
+        CancellationToken cancellationToken,
+        out SnapshotIndex index)
+    {
+        index = null!;
+        try
+        {
+            using var reader = new FastSerializationReader(filePath);
+            if (reader.ReadInt32() != 20
+                || !string.Equals(reader.ReadUtf8(20), "!FastSerialization.1", StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            var rootType = reader.ReadObjectHeader();
+            if (!string.Equals(rootType, "GCHeapDump", StringComparison.Ordinal)
+                && !rootType.EndsWith(".GCHeapDump", StringComparison.Ordinal)
+                && !rootType.EndsWith("+GCHeapDump", StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            if (!string.Equals(reader.ReadObjectHeader(), "Graphs.MemoryGraph", StringComparison.Ordinal))
+            {
+                throw new InvalidDataException("Unexpected gcdump graph type.");
+            }
+
+            _ = reader.ReadInt64();
+            var rootIndex = reader.ReadInt32();
+            var typeCount = reader.ReadInt32();
+            if (typeCount < 0 || typeCount > 10_000_000)
+            {
+                throw new InvalidDataException("Invalid gcdump type count.");
+            }
+
+            var types = new (TypeIdentity Type, int Size)[typeCount];
+            for (var typeIndex = 0; typeIndex < typeCount; typeIndex++)
+            {
+                var name = reader.ReadString() ?? $"Type(0x{typeIndex:x})";
+                var size = reader.ReadInt32();
+                types[typeIndex] = (new TypeIdentity(name, reader.ReadString()), size);
+            }
+
+            var nodeCount = reader.ReadInt32();
+            if (nodeCount < 0 || nodeCount > 100_000_000)
+            {
+                throw new InvalidDataException("Invalid gcdump node count.");
+            }
+
+            var nodeLabels = new int[nodeCount];
+            for (var nodeIndex = 0; nodeIndex < nodeCount; nodeIndex++)
+            {
+                nodeLabels[nodeIndex] = reader.ReadInt32();
+            }
+
+            var blobLength = reader.ReadInt32();
+            if (blobLength < 0 || blobLength > reader.Remaining)
+            {
+                throw new InvalidDataException("Invalid gcdump node blob length.");
+            }
+
+            var blob = reader.ReadBytes(blobLength);
+            var addressCount = reader.ReadInt32();
+            if (addressCount < 0 || addressCount > nodeCount)
+            {
+                throw new InvalidDataException("Invalid gcdump address count.");
+            }
+
+            var addresses = new ulong[addressCount];
+            for (var addressIndex = 0; addressIndex < addressCount; addressIndex++)
+            {
+                addresses[addressIndex] = unchecked((ulong)reader.ReadInt64());
+            }
+
+            if (!reader.TryReadTaggedByte(out _))
+            {
+                reader.ExpectTag(FastTag.EndObject);
+            }
+
+            var builder = new SnapshotIndexBuilder();
+            var childNodeIndexes = new Dictionary<int, int[]>();
+            for (var nodeIndex = 0; nodeIndex < addressCount; nodeIndex++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var offset = nodeLabels[nodeIndex];
+                if (offset < 0 || offset >= blob.Length)
+                {
+                    continue;
+                }
+
+                var nodeReader = new SpanReader(blob.AsSpan(offset));
+                var typeAndSize = nodeReader.ReadCompressedInt();
+                var typeIndex = typeAndSize >> 1;
+                if ((uint)typeIndex >= (uint)types.Length)
+                {
+                    continue;
+                }
+
+                var size = (typeAndSize & 1) != 0
+                    ? nodeReader.ReadCompressedInt()
+                    : types[typeIndex].Size;
+                var childCount = nodeReader.ReadCompressedInt();
+                var children = new int[Math.Max(0, childCount)];
+                for (var childIndex = 0; childIndex < children.Length; childIndex++)
+                {
+                    children[childIndex] = checked(nodeIndex + nodeReader.ReadCompressedInt());
+                }
+
+                childNodeIndexes[nodeIndex] = children;
+                if (size >= 0 && addresses[nodeIndex] != 0)
+                {
+                    builder.AddObject(addresses[nodeIndex], types[typeIndex].Type, size);
+                }
+            }
+
+            foreach (var (nodeIndex, children) in childNodeIndexes)
+            {
+                if ((uint)nodeIndex >= (uint)addresses.Length || addresses[nodeIndex] == 0)
+                {
+                    continue;
+                }
+
+                builder.AddEdges(
+                    addresses[nodeIndex],
+                    children
+                        .Where(child => (uint)child < (uint)addresses.Length)
+                        .Select(child => addresses[child])
+                        .ToArray());
+            }
+
+            if ((uint)rootIndex < (uint)addresses.Length)
+            {
+                if (childNodeIndexes.TryGetValue(rootIndex, out var rootChildren))
+                {
+                    foreach (var child in rootChildren.Where(child => (uint)child < (uint)addresses.Length))
+                    {
+                        builder.AddRoot(addresses[child]);
+                    }
+                }
+                else
+                {
+                    builder.AddRoot(addresses[rootIndex]);
+                }
+            }
+
+            index = builder.Build();
+            return true;
+        }
+        catch (InvalidDataException exception)
+        {
+            throw new DiagnosticsException(DiagnosticsErrorCode.CaptureFailed, "The gcdump could not be parsed.", exception);
+        }
+        catch (EndOfStreamException exception)
+        {
+            throw new DiagnosticsException(DiagnosticsErrorCode.CaptureFailed, "The gcdump is truncated.", exception);
+        }
+    }
 
     private static async Task<IReadOnlyList<MemoryTypeSummary>> ReadTypeSummariesCoreAsync(
         string filePath,

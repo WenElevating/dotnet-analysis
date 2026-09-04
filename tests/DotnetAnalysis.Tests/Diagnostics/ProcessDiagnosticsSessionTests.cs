@@ -64,7 +64,7 @@ public sealed class ProcessDiagnosticsSessionTests
     public async Task EndAsync_CancelsInFlightCaptureAndDisposesAllocationCollector()
     {
         var capture = new ControlledCapture { WaitForCancellation = true };
-        var allocationCollector = new AllocationSampleCollector(
+        var allocationCollector = new AllocationSamplingSession(
             new AllocationProfileBuilder(Utc("2026-09-02T08:00:00Z")));
         await using var session = CreateSession(capture, allocationCollector: allocationCollector);
 
@@ -93,7 +93,7 @@ public sealed class ProcessDiagnosticsSessionTests
             new UnavailableManagedHeapReader(),
             TimeProvider.System,
             TimeSpan.Zero);
-        var allocationCollector = new AllocationSampleCollector(
+        var allocationCollector = new AllocationSamplingSession(
             new AllocationProfileBuilder(Utc("2026-09-02T08:00:00Z")));
         await using var session = new ProcessDiagnosticsSession(
             endedProcess,
@@ -173,7 +173,7 @@ public sealed class ProcessDiagnosticsSessionTests
         ControlledCapture capture,
         IEventBus? eventBus = null,
         ILogger<ProcessDiagnosticsSession>? logger = null,
-        AllocationSampleCollector? allocationCollector = null)
+        AllocationSamplingSession? allocationCollector = null)
     {
         var sampler = new ProcessMemorySampler(
             _process,
@@ -181,7 +181,7 @@ public sealed class ProcessDiagnosticsSessionTests
             new UnavailableManagedHeapReader(),
             TimeProvider.System,
             TimeSpan.Zero);
-        allocationCollector ??= new AllocationSampleCollector(
+        allocationCollector ??= new AllocationSamplingSession(
             new AllocationProfileBuilder(Utc("2026-09-02T08:00:00Z")));
         return new ProcessDiagnosticsSession(
             _process,
@@ -219,7 +219,7 @@ public sealed class ProcessDiagnosticsSessionTests
 
         public async Task<MemorySnapshot> CaptureAsync(
             TargetProcess target,
-            AllocationSampleCollector allocationCollector,
+            AllocationSamplingSession allocationCollector,
             CancellationToken cancellationToken)
         {
             Calls++;

@@ -14,6 +14,6 @@ internal interface IMemorySnapshotCapture
     /// </summary>
     Task<MemorySnapshot> CaptureAsync(
         TargetProcess target,
-        AllocationSampleCollector allocationCollector,
+        AllocationSamplingSession allocationCollector,
         CancellationToken cancellationToken);
 }

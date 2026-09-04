@@ -187,6 +187,48 @@ internal sealed class EventPipeHeapBuilder
             _roots.Distinct().ToArray());
     }
 
+    /// <summary>
+    /// 直接构建查询索引，避免为导入 EventPipe 流额外投影全量对象 DTO。
+    /// </summary>
+    public SnapshotIndex BuildIndex()
+    {
+        if (!HasHeapData)
+        {
+            throw new DiagnosticsException(
+                DiagnosticsErrorCode.CaptureFailed,
+                "The gcdump did not contain heap object events.");
+        }
+
+        var builder = new SnapshotIndexBuilder();
+        foreach (var node in _nodes)
+        {
+            builder.AddObject(node.Address, node.Type, node.SizeBytes);
+        }
+
+        var edgeOffset = 0;
+        foreach (var node in _nodes)
+        {
+            var edgeCount = node.EdgeCount > 0
+                ? Math.Min(node.EdgeCount, _edgeTargets.Count - edgeOffset)
+                : 0;
+            if (edgeCount > 0)
+            {
+                builder.AddEdges(node.Address, _edgeTargets
+                    .Skip(edgeOffset)
+                    .Take((int)edgeCount)
+                    .ToArray());
+                edgeOffset += (int)edgeCount;
+            }
+        }
+
+        foreach (var root in _roots)
+        {
+            builder.AddRoot(root);
+        }
+
+        return builder.Build();
+    }
+
     private Dictionary<ulong, IReadOnlyList<ulong>> BuildEdges()
     {
         var edges = new Dictionary<ulong, IReadOnlyList<ulong>>();

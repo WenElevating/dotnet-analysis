@@ -11,6 +11,8 @@ public sealed class AllocationProfileBuilder
     private DateTimeOffset _startedAtUtc;
     private readonly Dictionary<(TypeIdentity Type, string Frames), (long Bytes, IReadOnlyList<CallStackFrame> Frames)> _entries = [];
     private bool _interrupted;
+    private bool _hasCallStacks;
+    private bool _hasMissingCallStacks;
 
     /// <summary>
     /// 以指定开始时间创建一个线程安全的分配采样区间聚合器。
@@ -45,6 +47,8 @@ public sealed class AllocationProfileBuilder
             {
                 _entries[key] = (observedAllocatedBytes, normalizedFrames);
             }
+
+            _hasCallStacks = true;
         }
     }
 
@@ -57,6 +61,17 @@ public sealed class AllocationProfileBuilder
         lock (_gate)
         {
             _interrupted = true;
+        }
+    }
+
+    /// <summary>
+    /// 标记至少一条分配样本没有可解析调用栈，且不伪造替代帧。
+    /// </summary>
+    public void MarkCallStackUnavailable()
+    {
+        lock (_gate)
+        {
+            _hasMissingCallStacks = true;
         }
     }
 
@@ -76,7 +91,12 @@ public sealed class AllocationProfileBuilder
                     .Select(entry => new AllocationHotspot(entry.Key.Type, entry.Value.Bytes, entry.Value.Frames))
                     .OrderByDescending(hotspot => hotspot.ObservedAllocatedBytes)
                     .ToArray(),
-                _interrupted ? AllocationProfileDataQuality.Interrupted : AllocationProfileDataQuality.Continuous);
+                _interrupted ? AllocationProfileDataQuality.Interrupted : AllocationProfileDataQuality.Continuous,
+                _hasCallStacks
+                    ? _hasMissingCallStacks
+                        ? AllocationCallStackQuality.Partial
+                        : AllocationCallStackQuality.Available
+                    : AllocationCallStackQuality.NotAvailable);
         }
     }
 
@@ -91,6 +111,8 @@ public sealed class AllocationProfileBuilder
             _startedAtUtc = startedAtUtc;
             _entries.Clear();
             _interrupted = false;
+            _hasCallStacks = false;
+            _hasMissingCallStacks = false;
         }
     }
 }
