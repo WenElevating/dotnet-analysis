@@ -9,7 +9,7 @@ public sealed class AllocationProfileBuilder
 {
     private readonly object _gate = new();
     private DateTimeOffset _startedAtUtc;
-    private readonly Dictionary<(TypeIdentity Type, string Frames), (long Bytes, IReadOnlyList<CallStackFrame> Frames)> _entries = [];
+    private readonly Dictionary<AllocationEntryKey, (long Bytes, IReadOnlyList<CallStackFrame> Frames)> _entries = new(AllocationEntryKeyComparer.Instance);
     private bool _interrupted;
     private bool _hasCallStacks;
     private bool _hasMissingCallStacks;
@@ -38,7 +38,7 @@ public sealed class AllocationProfileBuilder
         lock (_gate)
         {
             var normalizedFrames = frames.ToArray();
-            var key = (type, string.Join("|", normalizedFrames.Select(frame => frame.Name)));
+            var key = new AllocationEntryKey(type, normalizedFrames);
             if (_entries.TryGetValue(key, out var current))
             {
                 _entries[key] = (checked(current.Bytes + observedAllocatedBytes), current.Frames);
@@ -113,6 +113,43 @@ public sealed class AllocationProfileBuilder
             _interrupted = false;
             _hasCallStacks = false;
             _hasMissingCallStacks = false;
+        }
+    }
+
+    private readonly record struct AllocationEntryKey(TypeIdentity Type, IReadOnlyList<CallStackFrame> Frames);
+
+    private sealed class AllocationEntryKeyComparer : IEqualityComparer<AllocationEntryKey>
+    {
+        public static AllocationEntryKeyComparer Instance { get; } = new();
+
+        public bool Equals(AllocationEntryKey x, AllocationEntryKey y)
+        {
+            if (!Equals(x.Type, y.Type) || x.Frames.Count != y.Frames.Count)
+            {
+                return false;
+            }
+
+            for (var index = 0; index < x.Frames.Count; index++)
+            {
+                if (!Equals(x.Frames[index], y.Frames[index]))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        public int GetHashCode(AllocationEntryKey key)
+        {
+            var hash = new HashCode();
+            hash.Add(key.Type);
+            foreach (var frame in key.Frames)
+            {
+                hash.Add(frame);
+            }
+
+            return hash.ToHashCode();
         }
     }
 }

@@ -73,6 +73,7 @@ internal sealed class SnapshotIndex
             .Where(index => index >= 0)
             .Distinct()
             .ToArray();
+        Array.Sort(_roots);
         TypeSummaries = BuildTypeSummaries();
         ObjectAccessMode = MemorySnapshotAnalysis.DetermineObjectAccessMode(_objects.LongLength);
     }
@@ -153,8 +154,7 @@ internal sealed class SnapshotIndex
             return null;
         }
 
-        var rootSet = _roots.ToHashSet();
-        if (rootSet.Count == 0)
+        if (_roots.Length == 0)
         {
             return null;
         }
@@ -165,7 +165,7 @@ internal sealed class SnapshotIndex
         queue.Enqueue(target);
         while (queue.TryDequeue(out var current))
         {
-            if (rootSet.Contains(current))
+            if (Array.BinarySearch(_roots, current) >= 0)
             {
                 var path = new List<MemoryObjectInfo>();
                 for (var cursor = current; cursor >= 0; cursor = next[cursor])

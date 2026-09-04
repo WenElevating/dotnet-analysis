@@ -182,4 +182,24 @@ public sealed class SnapshotIndexTests
 
         Assert.IsNull(path);
     }
+
+    [TestMethod]
+    public void ReferencePath_WhenRootIndexIsLarge_DoesNotAllocateAHashSetForEachQuery()
+    {
+        const int rootCount = 100_000;
+        var type = new TypeIdentity("Node", "Sample");
+        var objects = Enumerable.Range(1, rootCount)
+            .Select(address => new SnapshotIndex.ObjectRow((ulong)address, type, 16))
+            .ToArray();
+        var index = new SnapshotIndex(objects, roots: objects.Select(row => row.Address).ToArray());
+
+        _ = index.GetReferencePath(1);
+        var before = GC.GetAllocatedBytesForCurrentThread();
+
+        var path = index.GetReferencePath(1);
+
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert.IsNotNull(path);
+        Assert.IsLessThan(1_048_576L, allocated);
+    }
 }
