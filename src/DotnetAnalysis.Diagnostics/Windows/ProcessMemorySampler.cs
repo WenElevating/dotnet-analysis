@@ -8,16 +8,32 @@ using System.Globalization;
 
 namespace DotnetAnalysis.Diagnostics.Windows;
 
+/// <summary>
+/// 抽象读取目标进程托管堆大小的来源。
+/// </summary>
 public interface IManagedHeapReader
 {
+    /// <summary>
+    /// 读取目标进程当前托管堆大小。
+    /// </summary>
+    /// <returns>运行时不可访问或无法取得一致值时返回 <see langword="null"/>。</returns>
     long? ReadManagedHeapBytes(int processId);
 }
 
+/// <summary>
+/// 明确表示托管堆计数不可用的读取器。
+/// </summary>
 public sealed class UnavailableManagedHeapReader : IManagedHeapReader
 {
+    /// <summary>
+    /// 始终报告不可用，适合不支持 EventPipe 的环境或测试场景。
+    /// </summary>
     public long? ReadManagedHeapBytes(int processId) => null;
 }
 
+/// <summary>
+/// 通过 System.Runtime EventCounters 读取托管堆大小。
+/// </summary>
 public sealed class EventPipeManagedHeapReader : IManagedHeapReader
 {
     private const string RuntimeProviderName = "System.Runtime";
@@ -25,6 +41,10 @@ public sealed class EventPipeManagedHeapReader : IManagedHeapReader
     private const string ManagedHeapCounterName = "gc-heap-size";
     private readonly TimeSpan _timeout;
 
+    /// <summary>
+    /// 创建通过 EventPipe EventCounter 读取托管堆大小的读取器。
+    /// </summary>
+    /// <param name="timeout">等待第一条堆大小计数器的最长时间。</param>
     public EventPipeManagedHeapReader(TimeSpan? timeout = null)
     {
         _timeout = timeout ?? TimeSpan.FromSeconds(5);
@@ -34,6 +54,11 @@ public sealed class EventPipeManagedHeapReader : IManagedHeapReader
         }
     }
 
+    /// <summary>
+    /// 尝试读取 gc-heap-size 计数器，不可用时不向调用方暴露传输异常。
+    /// </summary>
+    /// <param name="processId">目标进程 ID。</param>
+    /// <returns>以字节为单位的托管堆大小；读取失败时返回 <see langword="null"/>。</returns>
     public long? ReadManagedHeapBytes(int processId)
     {
         if (processId <= 0 || !OperatingSystem.IsWindows())
@@ -102,6 +127,9 @@ public sealed class EventPipeManagedHeapReader : IManagedHeapReader
         }
     }
 
+    /// <summary>
+    /// 从动态 EventCounters 负载提取 gc-heap-size 数值。
+    /// </summary>
     private static void TryReadCounter(
         TraceEvent traceEvent,
         TaskCompletionSource<long> result)
@@ -144,6 +172,9 @@ public sealed class EventPipeManagedHeapReader : IManagedHeapReader
     }
 }
 
+/// <summary>
+/// 按固定间隔组合原生工作集和托管堆样本。
+/// </summary>
 public sealed class ProcessMemorySampler
 {
     private readonly TargetProcess _target;
@@ -152,6 +183,14 @@ public sealed class ProcessMemorySampler
     private readonly TimeProvider _timeProvider;
     private readonly TimeSpan _interval;
 
+    /// <summary>
+    /// 创建周期性采集私有工作集和托管堆大小的采样器。
+    /// </summary>
+    /// <param name="target">采样目标进程身份。</param>
+    /// <param name="processMemoryReader">可选的私有工作集读取器。</param>
+    /// <param name="managedHeapReader">可选的托管堆读取器。</param>
+    /// <param name="timeProvider">可选的 UTC 时间来源。</param>
+    /// <param name="interval">相邻样本之间的等待间隔。</param>
     public ProcessMemorySampler(
         TargetProcess target,
         IProcessMemoryReader? processMemoryReader = null,
@@ -166,6 +205,10 @@ public sealed class ProcessMemorySampler
         _interval = interval ?? TimeSpan.FromSeconds(1);
     }
 
+    /// <summary>
+    /// 持续产生内存样本，直到取消或确认目标进程已退出。
+    /// </summary>
+    /// <param name="cancellationToken">停止采样循环的取消令牌。</param>
     public async IAsyncEnumerable<MemoryUsageSample> GetSamplesAsync(
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
     {

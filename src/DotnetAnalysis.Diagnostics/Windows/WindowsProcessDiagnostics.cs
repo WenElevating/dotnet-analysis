@@ -3,6 +3,9 @@ using DotnetAnalysis.Core.Diagnostics;
 
 namespace DotnetAnalysis.Diagnostics.Windows;
 
+/// <summary>
+/// 提供 Windows 进程枚举、附着、采样和快照导入门面。
+/// </summary>
 public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
 {
     private readonly ProcessEnumerator _enumerator;
@@ -13,6 +16,9 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
     private readonly SnapshotStorageLayout _snapshotLayout;
     private readonly MemorySnapshotStore _snapshotStore;
 
+    /// <summary>
+    /// 创建 Windows 进程诊断门面及其身份、运行时、采样和存储依赖。
+    /// </summary>
     public WindowsProcessDiagnostics(
         ProcessEnumerator? enumerator = null,
         ProcessIdentityValidator? identityValidator = null,
@@ -31,12 +37,21 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
         _snapshotStore = new MemorySnapshotStore(_snapshotLayout, _importedSnapshots);
     }
 
+    /// <summary>
+    /// 枚举当前可附着的进程。
+    /// </summary>
+    /// <param name="cancellationToken">枚举前检查的取消令牌。</param>
     public Task<IReadOnlyList<TargetProcess>> GetProcessesAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         return Task.FromResult(_enumerator.Enumerate());
     }
 
+    /// <summary>
+    /// 验证目标身份和运行时能力后附着到进程。
+    /// </summary>
+    /// <param name="process">要附着的目标进程。</param>
+    /// <param name="cancellationToken">附着过程的取消令牌。</param>
     public Task<IProcessDiagnosticsSession> AttachAsync(
         TargetProcess process,
         CancellationToken cancellationToken)
@@ -46,6 +61,9 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
         return AttachCoreAsync(process, cancellationToken);
     }
 
+    /// <summary>
+    /// 完成身份与能力验证后创建采样和捕获会话。
+    /// </summary>
     private async Task<IProcessDiagnosticsSession> AttachCoreAsync(TargetProcess process, CancellationToken cancellationToken)
     {
         await _identityValidator.ValidateAsync(process, cancellationToken).ConfigureAwait(false);
@@ -72,6 +90,9 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
             allocationCollector: allocationCollector);
     }
 
+    /// <summary>
+    /// 执行快照捕获、分配概要封存和持久化提升。
+    /// </summary>
     private async Task<MemorySnapshot> CaptureSnapshotCoreAsync(
         TargetProcess target,
         AllocationSampleCollector allocationCollector,
@@ -103,6 +124,12 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
             MemorySnapshotState.Analyzing);
     }
 
+    /// <summary>
+    /// 打开现有 .gcdump 文件并创建处于分析中的导入快照。
+    /// </summary>
+    /// <param name="filePath">现有 .gcdump 文件路径。</param>
+    /// <param name="cancellationToken">打开前检查的取消令牌。</param>
+    /// <returns>已登记到导入目录的快照描述。</returns>
     public Task<MemorySnapshot> OpenSnapshotAsync(
         string filePath,
         CancellationToken cancellationToken)

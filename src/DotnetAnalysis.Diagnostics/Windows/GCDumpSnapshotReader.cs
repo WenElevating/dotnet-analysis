@@ -7,16 +7,28 @@ using System.Text;
 
 namespace DotnetAnalysis.Diagnostics.Windows;
 
+/// <summary>
+/// 读取 FastSerialization 或 EventPipe .gcdump 并提供统一堆查询。
+/// </summary>
 public sealed class GCDumpSnapshotReader : IMemorySnapshotReader
 {
+    /// <summary>
+    /// 判断文件是否为 FastSerialization 或 EventPipe 形式的 .gcdump。
+    /// </summary>
     public bool CanRead(string filePath) => string.Equals(Path.GetExtension(filePath), ".gcdump", StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// 异步读取快照的按类型对象统计。
+    /// </summary>
     public Task<IReadOnlyList<MemoryTypeSummary>> ReadTypeSummariesAsync(string filePath, CancellationToken cancellationToken)
     {
         Validate(filePath, cancellationToken);
         return Task.Run(() => ReadHeap(filePath, cancellationToken).TypeSummaries, cancellationToken);
     }
 
+    /// <summary>
+    /// 异步读取指定类型的对象列表。
+    /// </summary>
     public Task<IReadOnlyList<MemoryObjectInfo>> ReadObjectsAsync(string filePath, TypeIdentity type, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(type);
@@ -28,6 +40,9 @@ public sealed class GCDumpSnapshotReader : IMemorySnapshotReader
             cancellationToken);
     }
 
+    /// <summary>
+    /// 异步计算到指定对象地址的引用路径。
+    /// </summary>
     public Task<MemoryReferencePath?> ReadReferencePathAsync(string filePath, ulong objectAddress, CancellationToken cancellationToken)
     {
         Validate(filePath, cancellationToken);
@@ -40,6 +55,9 @@ public sealed class GCDumpSnapshotReader : IMemorySnapshotReader
             cancellationToken);
     }
 
+    /// <summary>
+    /// 验证路径存在、非空且调用未被取消。
+    /// </summary>
     private static void Validate(string filePath, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -55,6 +73,9 @@ public sealed class GCDumpSnapshotReader : IMemorySnapshotReader
         }
     }
 
+    /// <summary>
+    /// 解析 FastSerialization 或原始 EventPipe 流为统一堆模型。
+    /// </summary>
     private static HeapData ReadHeap(string filePath, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -157,11 +178,17 @@ public sealed class GCDumpSnapshotReader : IMemorySnapshotReader
             roots.Distinct().ToArray());
     }
 
+    /// <summary>
+    /// 供捕获写入器读取统一堆模型的内部入口。
+    /// </summary>
     internal static HeapData ReadHeapForSerialization(
         string filePath,
         CancellationToken cancellationToken) =>
         ReadHeap(filePath, cancellationToken);
 
+    /// <summary>
+    /// 尝试读取本项目写出的 FastSerialization .gcdump 格式。
+    /// </summary>
     private static bool TryReadFastSerializationGcdump(
         string filePath,
         CancellationToken cancellationToken,
@@ -346,6 +373,9 @@ public sealed class GCDumpSnapshotReader : IMemorySnapshotReader
         }
     }
 
+    /// <summary>
+    /// FastSerialization 流中使用的标记字节。
+    /// </summary>
     private enum FastTag : byte
     {
         BeginObject = 4,
@@ -354,25 +384,48 @@ public sealed class GCDumpSnapshotReader : IMemorySnapshotReader
         Byte = 8
     }
 
+    /// <summary>
+    /// 对 FastSerialization 文件提供带截断检查的基础读取操作。
+    /// </summary>
     private sealed class FastSerializationReader : IDisposable
     {
         private readonly FileStream _stream;
         private readonly BinaryReader _binaryReader;
 
+        /// <summary>
+        /// 打开指定快照文件并初始化 UTF-8 二进制读取器。
+        /// </summary>
+        /// <param name="filePath">待读取的快照路径。</param>
         public FastSerializationReader(string filePath)
         {
             _stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
             _binaryReader = new BinaryReader(_stream, Encoding.UTF8, leaveOpen: true);
         }
 
+        /// <summary>
+        /// 获取当前读取位置之后剩余的字节数。
+        /// </summary>
         public long Remaining => _stream.Length - _stream.Position;
 
+        /// <summary>
+        /// 读取一个 32 位有符号整数。
+        /// </summary>
         public int ReadInt32() => _binaryReader.ReadInt32();
 
+        /// <summary>
+        /// 读取一个 64 位有符号整数。
+        /// </summary>
         public long ReadInt64() => _binaryReader.ReadInt64();
 
+        /// <summary>
+        /// 读取一个字节。
+        /// </summary>
         public byte ReadByte() => _binaryReader.ReadByte();
 
+        /// <summary>
+        /// 读取指定数量的字节；不足时报告截断。
+        /// </summary>
+        /// <param name="count">期望读取的字节数。</param>
         public byte[] ReadBytes(int count)
         {
             var bytes = _binaryReader.ReadBytes(count);
@@ -384,14 +437,24 @@ public sealed class GCDumpSnapshotReader : IMemorySnapshotReader
             return bytes;
         }
 
+        /// <summary>
+        /// 按 UTF-8 解码指定长度的字符串。
+        /// </summary>
+        /// <param name="byteCount">字符串占用的字节数。</param>
         public string ReadUtf8(int byteCount) => Encoding.UTF8.GetString(ReadBytes(byteCount));
 
+        /// <summary>
+        /// 读取带长度前缀的可空字符串。
+        /// </summary>
         public string? ReadString()
         {
             var byteCount = ReadInt32();
             return byteCount < 0 ? null : ReadUtf8(byteCount);
         }
 
+        /// <summary>
+        /// 读取对象头并返回其序列化类型全名。
+        /// </summary>
         public string ReadObjectHeader()
         {
             var tag = (FastTag)ReadByte();
@@ -416,6 +479,9 @@ public sealed class GCDumpSnapshotReader : IMemorySnapshotReader
             return fullName;
         }
 
+        /// <summary>
+        /// 尝试读取可选的带标签字节，不匹配时回退一个字节。
+        /// </summary>
         public bool TryReadTaggedByte(out byte value)
         {
             var tag = (FastTag)ReadByte();
@@ -430,6 +496,10 @@ public sealed class GCDumpSnapshotReader : IMemorySnapshotReader
             return false;
         }
 
+        /// <summary>
+        /// 读取并校验下一个流标记。
+        /// </summary>
+        /// <param name="expected">期望出现的标记。</param>
         public void ExpectTag(FastTag expected)
         {
             var actual = (FastTag)ReadByte();
@@ -439,6 +509,9 @@ public sealed class GCDumpSnapshotReader : IMemorySnapshotReader
             }
         }
 
+        /// <summary>
+        /// 释放底层文件流和二进制读取器。
+        /// </summary>
         public void Dispose()
         {
             _binaryReader.Dispose();
@@ -446,17 +519,26 @@ public sealed class GCDumpSnapshotReader : IMemorySnapshotReader
         }
     }
 
+    /// <summary>
+    /// 在节点二进制缓冲区上读取压缩整数的轻量读取器。
+    /// </summary>
     private ref struct SpanReader
     {
         private readonly ReadOnlySpan<byte> _buffer;
         private int _position;
 
+        /// <summary>
+        /// 从指定缓冲区的起始位置开始读取。
+        /// </summary>
         public SpanReader(ReadOnlySpan<byte> buffer)
         {
             _buffer = buffer;
             _position = 0;
         }
 
+        /// <summary>
+        /// 按 FastSerialization 编码读取一个压缩有符号整数。
+        /// </summary>
         public int ReadCompressedInt()
         {
             var first = ReadByte();
@@ -488,6 +570,9 @@ public sealed class GCDumpSnapshotReader : IMemorySnapshotReader
             return result;
         }
 
+        /// <summary>
+        /// 读取下一个缓冲区字节，越界时报告截断。
+        /// </summary>
         private byte ReadByte()
         {
             if ((uint)_position >= (uint)_buffer.Length)
@@ -498,6 +583,9 @@ public sealed class GCDumpSnapshotReader : IMemorySnapshotReader
             return _buffer[_position++];
         }
 
+        /// <summary>
+        /// 查看下一个缓冲区字节但不推进位置。
+        /// </summary>
         private byte PeekByte()
         {
             if ((uint)_position >= (uint)_buffer.Length)
@@ -509,14 +597,23 @@ public sealed class GCDumpSnapshotReader : IMemorySnapshotReader
         }
     }
 
+    /// <summary>
+    /// 读取器内部统一使用的堆对象、类型、边和根集合。
+    /// </summary>
     internal sealed record HeapData(
         IReadOnlyList<MemoryTypeSummary> TypeSummaries,
         IReadOnlyList<MemoryObjectInfo> Objects,
         IReadOnlyDictionary<ulong, IReadOnlyList<ulong>> Edges,
         IReadOnlyList<ulong> Roots);
 
+    /// <summary>
+    /// 暂存 EventPipe 节点及其后续边数量。
+    /// </summary>
     private sealed record NodeData(MemoryObjectInfo Object, long EdgeCount);
 
+    /// <summary>
+    /// 按节点声明的边数量把扁平目标地址切分为邻接表。
+    /// </summary>
     private static Dictionary<ulong, IReadOnlyList<ulong>> BuildEdges(
         IReadOnlyList<NodeData> nodes,
         List<ulong> edgeTargets)
@@ -546,6 +643,9 @@ public sealed class GCDumpSnapshotReader : IMemorySnapshotReader
         return edges;
     }
 
+    /// <summary>
+    /// 优先从根节点正向搜索，必要时通过反向边构造引用路径。
+    /// </summary>
     private static MemoryReferencePath? BuildReferencePath(HeapData heap, ulong objectAddress)
     {
         var objectsByAddress = heap.Objects

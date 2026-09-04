@@ -4,6 +4,9 @@ using Microsoft.Extensions.Logging;
 
 namespace DotnetAnalysis.Application.Events;
 
+/// <summary>
+/// 基于有界 Channel 的进程内异步事件总线。
+/// </summary>
 public sealed class InProcessEventBus : IEventBus
 {
     private readonly object _gate = new();
@@ -14,6 +17,11 @@ public sealed class InProcessEventBus : IEventBus
     private readonly Action<ILogger, string, Exception?> _shutdownTimedOut;
     private bool _disposed;
 
+    /// <summary>
+    /// 创建基于有界队列的进程内事件总线。
+    /// </summary>
+    /// <param name="logger">记录处理器失败及关闭超时的日志记录器。</param>
+    /// <param name="shutdownTimeout">关闭时等待订阅完成的最长时间。</param>
     public InProcessEventBus(ILogger<InProcessEventBus> logger, TimeSpan? shutdownTimeout = null)
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -29,6 +37,12 @@ public sealed class InProcessEventBus : IEventBus
             "Event subscription {SubscriptionIdentity} did not complete before the shutdown timeout.");
     }
 
+    /// <summary>
+    /// 将事件提交到所有匹配订阅；队列满时返回投递异常。
+    /// </summary>
+    /// <typeparam name="TEvent">要发布的事件类型。</typeparam>
+    /// <param name="applicationEvent">不可为空的事件实例。</param>
+    /// <param name="cancellationToken">发布前检查的取消令牌。</param>
     public ValueTask PublishAsync<TEvent>(TEvent applicationEvent, CancellationToken cancellationToken)
         where TEvent : IApplicationEvent
     {
@@ -56,6 +70,13 @@ public sealed class InProcessEventBus : IEventBus
             : ValueTask.FromException(firstDeliveryFailure);
     }
 
+    /// <summary>
+    /// 注册异步处理器并返回可释放订阅句柄。
+    /// </summary>
+    /// <typeparam name="TEvent">要处理的事件类型。</typeparam>
+    /// <param name="handler">接收事件和处理取消令牌的处理器。</param>
+    /// <param name="options">队列容量配置；省略时使用默认值。</param>
+    /// <returns>释放后停止接收新事件的订阅。</returns>
     public IDisposable Subscribe<TEvent>(
         Func<TEvent, CancellationToken, ValueTask> handler,
         EventSubscriptionOptions? options = null)
@@ -86,6 +107,9 @@ public sealed class InProcessEventBus : IEventBus
         }
     }
 
+    /// <summary>
+    /// 停止接纳事件、取消处理器并等待订阅在限定时间内退出。
+    /// </summary>
     public async ValueTask DisposeAsync()
     {
         IEventSubscription[] subscriptions;
@@ -120,11 +144,17 @@ public sealed class InProcessEventBus : IEventBus
         }
     }
 
+    /// <summary>
+    /// 把处理器故障事件重新交给总线投递。
+    /// </summary>
     private ValueTask PublishFaultAsync(ModuleFaulted fault)
     {
         return PublishAsync(fault, CancellationToken.None);
     }
 
+    /// <summary>
+    /// 从活跃订阅集合移除已释放但仍在消费的订阅。
+    /// </summary>
     private void RetireSubscription(IEventSubscription subscription)
     {
         lock (_gate)
@@ -137,6 +167,9 @@ public sealed class InProcessEventBus : IEventBus
         }
     }
 
+    /// <summary>
+    /// 在订阅消费循环结束后移除其退休记录。
+    /// </summary>
     private void ReleaseRetiredSubscription(IEventSubscription subscription)
     {
         lock (_gate)
@@ -145,19 +178,40 @@ public sealed class InProcessEventBus : IEventBus
         }
     }
 
+    /// <summary>
+    /// 描述事件总线用于管理单个订阅生命周期的内部契约。
+    /// </summary>
     private interface IEventSubscription : IDisposable
     {
+        /// <summary>
+        /// 订阅消费循环的完成任务。
+        /// </summary>
         Task Completion { get; }
 
+        /// <summary>
+        /// 订阅匹配的事件运行时类型。
+        /// </summary>
         Type EventType { get; }
 
+        /// <summary>
+        /// 用于日志和故障事件的订阅唯一标识。
+        /// </summary>
         string Identity { get; }
 
+        /// <summary>
+        /// 尝试把事件加入订阅队列。
+        /// </summary>
         EventDeliveryException? TryEnqueue(IApplicationEvent applicationEvent);
 
+        /// <summary>
+        /// 请求当前处理器尽快取消。
+        /// </summary>
         void RequestHandlerCancellation();
     }
 
+    /// <summary>
+    /// 为单一事件类型维护有界队列和串行消费循环的订阅实现。
+    /// </summary>
     private sealed class EventSubscription<TEvent> : IEventSubscription
         where TEvent : IApplicationEvent
     {
@@ -176,6 +230,15 @@ public sealed class InProcessEventBus : IEventBus
         private readonly string _identity;
         private bool _accepting = true;
 
+        /// <summary>
+        /// 创建订阅并立即启动其后台消费循环。
+        /// </summary>
+        /// <param name="handler">事件处理器。</param>
+        /// <param name="options">队列容量和投递配置。</param>
+        /// <param name="logger">处理失败日志记录器。</param>
+        /// <param name="retire">将订阅从活跃集合移出的回调。</param>
+        /// <param name="release">消费循环结束后的清理回调。</param>
+        /// <param name="publishFault">发布处理器故障事件的回调。</param>
         public EventSubscription(
             Func<TEvent, CancellationToken, ValueTask> handler,
             EventSubscriptionOptions options,
@@ -208,12 +271,24 @@ public sealed class InProcessEventBus : IEventBus
             Completion = ConsumeAsync();
         }
 
+        /// <summary>
+        /// 获取订阅消费循环的完成任务。
+        /// </summary>
         public Task Completion { get; }
 
+        /// <summary>
+        /// 获取订阅处理的事件类型。
+        /// </summary>
         public Type EventType => typeof(TEvent);
 
+        /// <summary>
+        /// 获取订阅的稳定日志标识。
+        /// </summary>
         public string Identity => _identity;
 
+        /// <summary>
+        /// 按投递策略尝试接纳一个事件。
+        /// </summary>
         public EventDeliveryException? TryEnqueue(IApplicationEvent applicationEvent)
         {
             lock (_admissionGate)
@@ -244,6 +319,9 @@ public sealed class InProcessEventBus : IEventBus
             }
         }
 
+        /// <summary>
+        /// 按顺序把事件写入有界队列。
+        /// </summary>
         private EventDeliveryException? TryEnqueueOrdered(TEvent applicationEvent)
         {
             return _queue.Writer.TryWrite(new EventWorkItem(applicationEvent))
@@ -251,6 +329,9 @@ public sealed class InProcessEventBus : IEventBus
                 : new EventDeliveryException(applicationEvent.GetType(), Identity);
         }
 
+        /// <summary>
+        /// 合并同一键的待处理事件，只保留最新值。
+        /// </summary>
         private EventDeliveryException? TryEnqueueLatestOnly(TEvent applicationEvent, string deliveryKey)
         {
             if (string.IsNullOrWhiteSpace(deliveryKey))
@@ -277,6 +358,9 @@ public sealed class InProcessEventBus : IEventBus
             return null;
         }
 
+        /// <summary>
+        /// 从工作项取出事件，并安排合并队列中的后续事件。
+        /// </summary>
         private bool TryGetEvent(SubscriptionWorkItem workItem, out TEvent applicationEvent)
         {
             if (workItem is EventWorkItem eventWorkItem)
@@ -307,6 +391,9 @@ public sealed class InProcessEventBus : IEventBus
             }
         }
 
+        /// <summary>
+        /// 在队列有空间时安排尚未投递的最新事件。
+        /// </summary>
         private void TrySchedulePendingLatestOnly()
         {
             foreach (var (deliveryKey, latestEvent) in _pendingLatestOnly)
@@ -325,6 +412,9 @@ public sealed class InProcessEventBus : IEventBus
             }
         }
 
+        /// <summary>
+        /// 停止接纳新事件并完成队列写入端。
+        /// </summary>
         public void Dispose()
         {
             lock (_admissionGate)
@@ -341,6 +431,9 @@ public sealed class InProcessEventBus : IEventBus
             _queue.Writer.TryComplete();
         }
 
+        /// <summary>
+        /// 取消处理器令牌，促使长时间运行的处理器退出。
+        /// </summary>
         public void RequestHandlerCancellation()
         {
             try
@@ -352,6 +445,9 @@ public sealed class InProcessEventBus : IEventBus
             }
         }
 
+        /// <summary>
+        /// 串行消费队列并隔离处理器异常。
+        /// </summary>
         private async Task ConsumeAsync()
         {
             try
@@ -387,6 +483,9 @@ public sealed class InProcessEventBus : IEventBus
             }
         }
 
+        /// <summary>
+        /// 把处理器异常转换为模块故障事件并尽力发布。
+        /// </summary>
         private async ValueTask PublishHandlerFaultAsync(TEvent applicationEvent, Exception exception)
         {
             try
@@ -407,10 +506,19 @@ public sealed class InProcessEventBus : IEventBus
             }
         }
 
+        /// <summary>
+        /// 订阅消费循环处理的工作项基类。
+        /// </summary>
         private abstract record SubscriptionWorkItem;
 
+        /// <summary>
+        /// 表示必须按顺序处理的普通事件工作项。
+        /// </summary>
         private sealed record EventWorkItem(TEvent Event) : SubscriptionWorkItem;
 
+        /// <summary>
+        /// 表示按投递键合并的最新值工作项。
+        /// </summary>
         private sealed record LatestOnlyWorkItem(string DeliveryKey, TEvent InitialEvent) : SubscriptionWorkItem;
     }
 }

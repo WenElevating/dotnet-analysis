@@ -5,8 +5,16 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace DotnetAnalysis.Diagnostics.DependencyInjection;
 
+/// <summary>
+/// 集中注册 Windows 诊断适配器及其应用层契约实现。
+/// </summary>
 public static class DiagnosticsServiceCollectionExtensions
 {
+    /// <summary>
+    /// 注册 Windows 进程诊断实现及其快照分析依赖。
+    /// </summary>
+    /// <param name="services">要写入服务注册的集合。</param>
+    /// <returns>传入的服务集合，便于继续配置。</returns>
     public static IServiceCollection AddWindowsProcessDiagnostics(this IServiceCollection services)
     {
         ArgumentNullException.ThrowIfNull(services);

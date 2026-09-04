@@ -5,18 +5,33 @@ using Microsoft.Diagnostics.Tracing;
 
 namespace DotnetAnalysis.Diagnostics.Windows;
 
+/// <summary>
+/// 描述已提升到持久化目录的快照文件及其分配概要。
+/// </summary>
 internal sealed record StoredSnapshot(
     MemorySnapshotId SnapshotId,
     string FilePath,
     AllocationProfile AllocationProfile);
 
+/// <summary>
+/// 抽象快照文件可读性校验，便于存储流程隔离文件格式检查。
+/// </summary>
 internal interface ISnapshotReadabilityValidator
 {
+    /// <summary>
+    /// 验证指定文件可以被诊断读取器解析。
+    /// </summary>
     Task ValidateAsync(string filePath, CancellationToken cancellationToken);
 }
 
+/// <summary>
+/// 使用文件头和 EventPipe 事件验证快照可读性的实现。
+/// </summary>
 internal sealed class FileSnapshotReadabilityValidator : ISnapshotReadabilityValidator
 {
+    /// <summary>
+    /// 验证文件包含 FastSerialization 头或至少一条 EventPipe 事件。
+    /// </summary>
     public async Task ValidateAsync(string filePath, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -64,6 +79,9 @@ internal sealed class FileSnapshotReadabilityValidator : ISnapshotReadabilityVal
     }
 }
 
+/// <summary>
+/// 负责临时快照提升、清单持久化和路径恢复的内部存储。
+/// </summary>
 internal sealed class MemorySnapshotStore
 {
     private static readonly JsonSerializerOptions s_jsonOptions = new()
@@ -75,6 +93,9 @@ internal sealed class MemorySnapshotStore
     private readonly ImportedSnapshotCatalog _catalog;
     private readonly ISnapshotReadabilityValidator _readabilityValidator;
 
+    /// <summary>
+    /// 创建快照提升、清单持久化和路径解析所需的存储。
+    /// </summary>
     public MemorySnapshotStore(
         SnapshotStorageLayout layout,
         ImportedSnapshotCatalog catalog,
@@ -85,6 +106,9 @@ internal sealed class MemorySnapshotStore
         _readabilityValidator = readabilityValidator ?? new FileSnapshotReadabilityValidator();
     }
 
+    /// <summary>
+    /// 校验临时快照并原子提升为最终文件。
+    /// </summary>
     public async Task<StoredSnapshot> PromoteAsync(
         MemorySnapshotId snapshotId,
         string temporaryPath,
@@ -139,6 +163,9 @@ internal sealed class MemorySnapshotStore
         }
     }
 
+    /// <summary>
+    /// 清理临时堆文件及其同名清单。
+    /// </summary>
     public static Task DeleteTemporaryAsync(string temporaryPath)
     {
         if (!string.IsNullOrWhiteSpace(temporaryPath))
@@ -150,6 +177,9 @@ internal sealed class MemorySnapshotStore
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// 从内存目录或持久化清单恢复快照存储信息。
+    /// </summary>
     public async Task<StoredSnapshot> ResolveAsync(MemorySnapshotId snapshotId, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -178,6 +208,9 @@ internal sealed class MemorySnapshotStore
         return new StoredSnapshot(loaded.SnapshotId, loaded.FilePath, loaded.AllocationProfile.ToAllocationProfile());
     }
 
+    /// <summary>
+    /// 尽力删除文件；清理阶段忽略文件不存在和权限错误。
+    /// </summary>
     private static void TryDelete(string path)
     {
         try
@@ -195,6 +228,9 @@ internal sealed class MemorySnapshotStore
         }
     }
 
+    /// <summary>
+    /// 把快照元数据序列化到指定清单路径。
+    /// </summary>
     private static async Task WriteManifestAsync(
         string manifestPath,
         StoredSnapshot snapshot,
@@ -205,6 +241,9 @@ internal sealed class MemorySnapshotStore
         await JsonSerializer.SerializeAsync(stream, manifest, s_jsonOptions, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// 快照清单的 JSON 传输模型。
+    /// </summary>
     private sealed class StoredSnapshotManifest
     {
         public MemorySnapshotId SnapshotId { get; init; }
@@ -213,6 +252,9 @@ internal sealed class MemorySnapshotStore
 
         public AllocationProfileManifest AllocationProfile { get; init; } = new();
 
+        /// <summary>
+        /// 从运行时快照模型创建可序列化清单。
+        /// </summary>
         public static StoredSnapshotManifest From(StoredSnapshot snapshot) =>
             new()
             {
@@ -222,6 +264,9 @@ internal sealed class MemorySnapshotStore
             };
     }
 
+    /// <summary>
+    /// 分配概要清单的 JSON 传输模型。
+    /// </summary>
     private sealed class AllocationProfileManifest
     {
         public DateTimeOffset StartedAtUtc { get; init; }
@@ -232,6 +277,9 @@ internal sealed class MemorySnapshotStore
 
         public List<HotspotManifest> Hotspots { get; init; } = [];
 
+        /// <summary>
+        /// 从分配概要创建清单模型。
+        /// </summary>
         public static AllocationProfileManifest From(AllocationProfile profile) =>
             new()
             {
@@ -241,6 +289,9 @@ internal sealed class MemorySnapshotStore
                 Hotspots = profile.Hotspots.Select(HotspotManifest.From).ToList()
             };
 
+        /// <summary>
+        /// 把清单模型还原为核心分配概要。
+        /// </summary>
         public AllocationProfile ToAllocationProfile() =>
             new(
                 StartedAtUtc,
@@ -249,6 +300,9 @@ internal sealed class MemorySnapshotStore
                 DataQuality);
     }
 
+    /// <summary>
+    /// 分配热点清单的 JSON 传输模型。
+    /// </summary>
     private sealed class HotspotManifest
     {
         public string TypeName { get; init; } = string.Empty;
@@ -259,6 +313,9 @@ internal sealed class MemorySnapshotStore
 
         public List<CallStackFrameManifest> Frames { get; init; } = [];
 
+        /// <summary>
+        /// 从分配热点创建清单模型。
+        /// </summary>
         public static HotspotManifest From(AllocationHotspot hotspot) =>
             new()
             {
@@ -268,6 +325,9 @@ internal sealed class MemorySnapshotStore
                 Frames = hotspot.Frames.Select(CallStackFrameManifest.From).ToList()
             };
 
+        /// <summary>
+        /// 把清单模型还原为核心分配热点。
+        /// </summary>
         public AllocationHotspot ToAllocationHotspot() =>
             new(
                 new TypeIdentity(TypeName, AssemblyName),
@@ -275,6 +335,9 @@ internal sealed class MemorySnapshotStore
                 Frames.Select(frame => frame.ToCallStackFrame()).ToArray());
     }
 
+    /// <summary>
+    /// 调用栈帧清单的 JSON 传输模型。
+    /// </summary>
     private sealed class CallStackFrameManifest
     {
         public string Name { get; init; } = string.Empty;
@@ -283,6 +346,9 @@ internal sealed class MemorySnapshotStore
 
         public int? LineNumber { get; init; }
 
+        /// <summary>
+        /// 从调用栈帧创建清单模型。
+        /// </summary>
         public static CallStackFrameManifest From(CallStackFrame frame) =>
             new()
             {
@@ -291,6 +357,9 @@ internal sealed class MemorySnapshotStore
                 LineNumber = frame.LineNumber
             };
 
+        /// <summary>
+        /// 把清单模型还原为核心调用栈帧。
+        /// </summary>
         public CallStackFrame ToCallStackFrame() => new(Name, ModuleName, LineNumber);
     }
 }

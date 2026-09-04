@@ -3,13 +3,26 @@ using System.Runtime.InteropServices;
 
 namespace DotnetAnalysis.Diagnostics.Windows;
 
+/// <summary>
+/// 抽象读取 Windows 进程内存计数器的来源。
+/// </summary>
 public interface IProcessMemoryReader
 {
+    /// <summary>
+    /// 读取进程的原生 Private Working Set 字节数。
+    /// </summary>
+    /// <returns>读取失败、无权限或进程不存在时返回 <see langword="null"/>。</returns>
     long? ReadPrivateWorkingSetBytes(int processId);
 }
 
+/// <summary>
+/// 通过 psapi.dll 读取进程 Private Working Set。
+/// </summary>
 public sealed class ProcessMemoryReader : IProcessMemoryReader
 {
+    /// <summary>
+    /// 检查进程是否仍在运行。
+    /// </summary>
     internal static bool IsProcessAlive(int processId)
     {
         try
@@ -26,6 +39,11 @@ public sealed class ProcessMemoryReader : IProcessMemoryReader
         }
     }
 
+    /// <summary>
+    /// 读取与任务管理器私有工作集口径一致的进程内存值。
+    /// </summary>
+    /// <param name="processId">目标进程 ID。</param>
+    /// <returns>读取失败、无权限或进程不存在时返回 <see langword="null"/>。</returns>
     public long? ReadPrivateWorkingSetBytes(int processId)
     {
         try
@@ -49,6 +67,9 @@ public sealed class ProcessMemoryReader : IProcessMemoryReader
         }
     }
 
+    /// <summary>
+    /// 调用 Windows psapi 获取进程内存计数器。
+    /// </summary>
     [DllImport("psapi.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetProcessMemoryInfo(
@@ -56,6 +77,9 @@ public sealed class ProcessMemoryReader : IProcessMemoryReader
         ref ProcessMemoryCountersEx2 counters,
         uint size);
 
+    /// <summary>
+    /// 与 Windows PROCESS_MEMORY_COUNTERS_EX2 对齐的托管结构。
+    /// </summary>
     [StructLayout(LayoutKind.Sequential)]
     private struct ProcessMemoryCountersEx2
     {

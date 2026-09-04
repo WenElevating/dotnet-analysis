@@ -7,6 +7,9 @@ using System.Diagnostics.Tracing;
 
 namespace DotnetAnalysis.Diagnostics.Windows;
 
+/// <summary>
+/// 通过 EventPipe 接收低开销分配采样并维护当前采样区间。
+/// </summary>
 public sealed class AllocationSampleCollector : IAsyncDisposable
 {
     private readonly AllocationProfileBuilder _builder;
@@ -16,15 +19,31 @@ public sealed class AllocationSampleCollector : IAsyncDisposable
     private Task? _processing;
     private int _disposed;
 
+    /// <summary>
+    /// 创建用于接收 EventPipe 分配采样的收集器。
+    /// </summary>
+    /// <param name="builder">聚合采样结果的构建器。</param>
     public AllocationSampleCollector(AllocationProfileBuilder builder)
     {
         _builder = builder ?? throw new ArgumentNullException(nameof(builder));
     }
 
+    /// <summary>
+    /// 向当前区间手工追加一条分配采样记录。
+    /// </summary>
     public void Add(TypeIdentity type, IReadOnlyList<CallStackFrame> frames, long bytes) => _builder.Add(type, frames, bytes);
 
+    /// <summary>
+    /// 标记当前区间包含中断或不完整的采样流。
+    /// </summary>
     public void MarkInterrupted(DateTimeOffset observedAtUtc) => _builder.MarkInterrupted(observedAtUtc);
 
+    /// <summary>
+    /// 启动目标进程的 EventPipe 分配采样；重复启动会复用已有会话。
+    /// </summary>
+    /// <param name="target">要采样的目标进程身份。</param>
+    /// <param name="cancellationToken">启动前检查的取消令牌。</param>
+    /// <returns>会话已启动或已处于运行状态时完成的任务。</returns>
     public Task StartAsync(TargetProcess target, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(target);
@@ -67,10 +86,19 @@ public sealed class AllocationSampleCollector : IAsyncDisposable
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// 冻结当前采样区间的分配概要。
+    /// </summary>
     public AllocationProfile Seal(DateTimeOffset capturedAtUtc) => _builder.Seal(capturedAtUtc);
 
+    /// <summary>
+    /// 清空已聚合的样本并开始新的采样区间。
+    /// </summary>
     public void BeginNextInterval(DateTimeOffset startedAtUtc) => _builder.BeginNextInterval(startedAtUtc);
 
+    /// <summary>
+    /// 停止 EventPipe 会话并在有限等待后释放资源；停止异常会降低数据完整性标记。
+    /// </summary>
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -118,6 +146,9 @@ public sealed class AllocationSampleCollector : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 把单条 EventPipe 分配事件转换为核心采样记录。
+    /// </summary>
     private void OnAllocationSampled(AllocationSampledTraceData data)
     {
         if (data.ObjectSize <= 0 || string.IsNullOrWhiteSpace(data.TypeName))
@@ -138,6 +169,9 @@ public sealed class AllocationSampleCollector : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 驱动 TraceEvent 读取循环，并吞掉目标退出时的流结束异常。
+    /// </summary>
     private static void ProcessEvents(EventPipeEventSource source)
     {
         try
@@ -154,6 +188,9 @@ public sealed class AllocationSampleCollector : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 释放 EventPipe 读取器和会话并清空运行状态。
+    /// </summary>
     private void CleanupSession()
     {
         _source?.Dispose();

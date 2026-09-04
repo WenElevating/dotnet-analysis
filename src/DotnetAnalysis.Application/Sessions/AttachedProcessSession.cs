@@ -7,6 +7,9 @@ using Microsoft.Extensions.Logging;
 
 namespace DotnetAnalysis.Application.Sessions;
 
+/// <summary>
+/// 应用层会话包装器，负责状态、取消、事件和底层会话生命周期。
+/// </summary>
 public sealed class AttachedProcessSession : IProcessDiagnosticsSession
 {
     private const string CaptureSnapshotStage = "CaptureSnapshot";
@@ -34,6 +37,13 @@ public sealed class AttachedProcessSession : IProcessDiagnosticsSession
     private Task? _endTask;
     private bool _disposedInnerSession;
 
+    /// <summary>
+    /// 创建不发布事件的附着会话。
+    /// </summary>
+    /// <param name="id">会话标识。</param>
+    /// <param name="diagnosticSession">底层诊断会话。</param>
+    /// <param name="timeProvider">事件时间来源。</param>
+    /// <param name="logger">记录阶段失败的日志记录器。</param>
     public AttachedProcessSession(
         ProcessDiagnosticsSessionId id,
         IProcessDiagnosticsSession diagnosticSession,
@@ -43,6 +53,14 @@ public sealed class AttachedProcessSession : IProcessDiagnosticsSession
     {
     }
 
+    /// <summary>
+    /// 创建可选发布生命周期事件的附着会话。
+    /// </summary>
+    /// <param name="id">会话标识。</param>
+    /// <param name="diagnosticSession">底层诊断会话。</param>
+    /// <param name="eventBus">可选事件总线。</param>
+    /// <param name="timeProvider">事件时间来源。</param>
+    /// <param name="logger">记录阶段失败的日志记录器。</param>
     public AttachedProcessSession(
         ProcessDiagnosticsSessionId id,
         IProcessDiagnosticsSession diagnosticSession,
@@ -63,12 +81,24 @@ public sealed class AttachedProcessSession : IProcessDiagnosticsSession
             nameof(AttachedProcessSession))).AsTask();
     }
 
+    /// <summary>
+    /// 应用层会话标识。
+    /// </summary>
     public ProcessDiagnosticsSessionId Id { get; }
 
+    /// <summary>
+    /// 底层会话绑定的目标进程。
+    /// </summary>
     public TargetProcess Process => _diagnosticSession.Process;
 
+    /// <summary>
+    /// 当前会话生命周期状态。
+    /// </summary>
     public ProcessDiagnosticsSessionState State { get; private set; } = ProcessDiagnosticsSessionState.Attaching;
 
+    /// <summary>
+    /// 幂等结束会话，并取消进行中的捕获。
+    /// </summary>
     public Task EndAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -85,6 +115,9 @@ public sealed class AttachedProcessSession : IProcessDiagnosticsSession
         }
     }
 
+    /// <summary>
+    /// 启动一次快照捕获；并发捕获或结束后的调用会被拒绝。
+    /// </summary>
     public Task<MemorySnapshot> CaptureSnapshotAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -115,6 +148,9 @@ public sealed class AttachedProcessSession : IProcessDiagnosticsSession
         }
     }
 
+    /// <summary>
+    /// 转发底层内存样本，并同步会话结束状态。
+    /// </summary>
     public async IAsyncEnumerable<MemoryUsageSample> GetMemoryUsageAsync(
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
@@ -129,12 +165,18 @@ public sealed class AttachedProcessSession : IProcessDiagnosticsSession
         }
     }
 
+    /// <summary>
+    /// 结束会话并释放底层诊断资源。
+    /// </summary>
     public async ValueTask DisposeAsync()
     {
         await EndAsync(CancellationToken.None).ConfigureAwait(false);
         _endCancellation.Dispose();
     }
 
+    /// <summary>
+    /// 执行底层捕获并发布成功、取消或失败事件。
+    /// </summary>
     private async Task<MemorySnapshot> CaptureCoreAsync(CancellationTokenSource captureCancellation)
     {
         await Task.Yield();
@@ -204,6 +246,9 @@ public sealed class AttachedProcessSession : IProcessDiagnosticsSession
         }
     }
 
+    /// <summary>
+    /// 协调取消、等待活动捕获并释放底层会话。
+    /// </summary>
     private async Task EndCoreAsync()
     {
         Task<MemorySnapshot>? activeCapture;
@@ -256,6 +301,9 @@ public sealed class AttachedProcessSession : IProcessDiagnosticsSession
             nameof(AttachedProcessSession))).AsTask();
     }
 
+    /// <summary>
+    /// 确保底层诊断会话只被异步释放一次。
+    /// </summary>
     private async ValueTask DisposeInnerSessionOnceAsync()
     {
         lock (_syncRoot)
@@ -271,6 +319,9 @@ public sealed class AttachedProcessSession : IProcessDiagnosticsSession
         await _diagnosticSession.DisposeAsync().ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// 按稳定错误码记录失败并推进应用层会话状态。
+    /// </summary>
     private void HandleDiagnosticsException(DiagnosticsException exception)
     {
         s_stageFailed(_logger, Id, CaptureSnapshotStage, exception);
@@ -300,6 +351,9 @@ public sealed class AttachedProcessSession : IProcessDiagnosticsSession
         }
     }
 
+    /// <summary>
+    /// 在底层报告结束时完成 Ending 到 Ended 的状态转移。
+    /// </summary>
     private void MoveToEnded()
     {
         lock (_syncRoot)
@@ -312,6 +366,9 @@ public sealed class AttachedProcessSession : IProcessDiagnosticsSession
         }
     }
 
+    /// <summary>
+    /// 校验并执行一次会话状态转移，同时发布状态事件。
+    /// </summary>
     private void MoveTo(ProcessDiagnosticsSessionState nextState)
     {
         if (!ProcessDiagnosticsSessionTransitionRules.CanMove(State, nextState))
@@ -327,6 +384,9 @@ public sealed class AttachedProcessSession : IProcessDiagnosticsSession
             nameof(AttachedProcessSession))).AsTask();
     }
 
+    /// <summary>
+    /// 尽力发布生命周期事件，发布失败只记录日志。
+    /// </summary>
     private async ValueTask PublishEventAsync(IApplicationEvent applicationEvent)
     {
         if (_eventBus is null)

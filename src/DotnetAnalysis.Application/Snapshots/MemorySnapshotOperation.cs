@@ -6,6 +6,9 @@ using Microsoft.Extensions.Logging;
 
 namespace DotnetAnalysis.Application.Snapshots;
 
+/// <summary>
+/// 协调快照分析、重试、状态转移及生命周期事件的应用服务。
+/// </summary>
 public sealed class MemorySnapshotOperation
 {
     private const string AnalyzeStage = "Analyze";
@@ -30,6 +33,13 @@ public sealed class MemorySnapshotOperation
     private readonly IEventBus? _eventBus;
     private readonly ProcessDiagnosticsSessionId? _sessionId;
 
+    /// <summary>
+    /// 创建不发布事件的快照操作。
+    /// </summary>
+    /// <param name="snapshot">待分析快照。</param>
+    /// <param name="analysisService">执行快照读取和分析的服务。</param>
+    /// <param name="timeProvider">事件时间来源。</param>
+    /// <param name="logger">记录分析阶段失败的日志记录器。</param>
     public MemorySnapshotOperation(
         MemorySnapshot snapshot,
         IMemorySnapshotAnalysisService analysisService,
@@ -39,6 +49,15 @@ public sealed class MemorySnapshotOperation
     {
     }
 
+    /// <summary>
+    /// 创建可选发布分析事件的快照操作。
+    /// </summary>
+    /// <param name="snapshot">待分析快照。</param>
+    /// <param name="analysisService">执行快照读取和分析的服务。</param>
+    /// <param name="eventBus">可选事件总线。</param>
+    /// <param name="sessionId">关联的诊断会话标识。</param>
+    /// <param name="timeProvider">事件时间来源。</param>
+    /// <param name="logger">记录分析阶段失败的日志记录器。</param>
     public MemorySnapshotOperation(
         MemorySnapshot snapshot,
         IMemorySnapshotAnalysisService analysisService,
@@ -56,10 +75,19 @@ public sealed class MemorySnapshotOperation
         State = snapshot.State;
     }
 
+    /// <summary>
+    /// 当前快照描述；状态变化时同步更新。
+    /// </summary>
     public MemorySnapshot Snapshot { get; private set; }
 
+    /// <summary>
+    /// 当前分析状态。
+    /// </summary>
     public MemorySnapshotState State { get; private set; }
 
+    /// <summary>
+    /// 执行一次分析；仅允许从 Analyzing 状态开始。
+    /// </summary>
     public Task<MemorySnapshotAnalysis> AnalyzeAsync(CancellationToken cancellationToken)
     {
         lock (_syncRoot)
@@ -73,6 +101,9 @@ public sealed class MemorySnapshotOperation
         return AnalyzeCoreAsync(AnalyzeStage, cancellationToken);
     }
 
+    /// <summary>
+    /// 重试失败的分析；仅允许从 Failed 状态开始。
+    /// </summary>
     public Task<MemorySnapshotAnalysis> RetryAnalysisAsync(CancellationToken cancellationToken)
     {
         lock (_syncRoot)
@@ -88,6 +119,9 @@ public sealed class MemorySnapshotOperation
         return AnalyzeCoreAsync(RetryAnalysisStage, cancellationToken);
     }
 
+    /// <summary>
+    /// 读取指定类型的对象列表。
+    /// </summary>
     public Task<IReadOnlyList<MemoryObjectInfo>> GetObjectsAsync(
         TypeIdentity type,
         CancellationToken cancellationToken)
@@ -96,6 +130,9 @@ public sealed class MemorySnapshotOperation
         return _analysisService.GetObjectsAsync(Snapshot, type, cancellationToken);
     }
 
+    /// <summary>
+    /// 读取到指定对象的引用路径。
+    /// </summary>
     public Task<MemoryReferencePath?> GetReferencePathAsync(
         ulong objectAddress,
         CancellationToken cancellationToken)
@@ -103,6 +140,9 @@ public sealed class MemorySnapshotOperation
         return _analysisService.GetReferencePathAsync(Snapshot, objectAddress, cancellationToken);
     }
 
+    /// <summary>
+    /// 执行一次分析并统一处理成功、取消和失败状态。
+    /// </summary>
     private async Task<MemorySnapshotAnalysis> AnalyzeCoreAsync(
         string stage,
         CancellationToken cancellationToken)
@@ -181,6 +221,9 @@ public sealed class MemorySnapshotOperation
         }
     }
 
+    /// <summary>
+    /// 记录分析阶段失败并把快照推进到指定失败状态。
+    /// </summary>
     private void MarkFailed(
         string stage,
         DiagnosticsException diagnosticsException,
@@ -194,12 +237,18 @@ public sealed class MemorySnapshotOperation
         }
     }
 
+    /// <summary>
+    /// 同步更新快照模型和操作对象中的状态。
+    /// </summary>
     private void SetSnapshotState(MemorySnapshotState state)
     {
         Snapshot = WithState(Snapshot, state);
         State = state;
     }
 
+    /// <summary>
+    /// 仅在目标状态不同于当前状态时创建新的快照值对象。
+    /// </summary>
     private static MemorySnapshot WithState(MemorySnapshot snapshot, MemorySnapshotState state)
     {
         return snapshot.State == state
@@ -207,6 +256,9 @@ public sealed class MemorySnapshotOperation
             : snapshot.MoveTo(state);
     }
 
+    /// <summary>
+    /// 尽力发布分析事件，事件投递失败只记录日志。
+    /// </summary>
     private async ValueTask PublishEventAsync(IApplicationEvent applicationEvent)
     {
         if (_eventBus is null || _sessionId is null)

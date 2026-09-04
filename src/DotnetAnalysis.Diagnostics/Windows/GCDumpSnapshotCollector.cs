@@ -8,14 +8,20 @@ using System.Diagnostics.Tracing;
 namespace DotnetAnalysis.Diagnostics.Windows;
 
 /// <summary>
-/// Captures the runtime GC heap EventPipe stream without spawning an external
-/// command-line collector. The resulting nettrace-compatible stream is stored under
-/// the .gcdump contract and parsed by <see cref="GCDumpSnapshotReader"/>.
+/// 直接捕获运行时 GC 堆的 EventPipe 流，不依赖外部命令行收集器；
+/// 结果先按 .gcdump 约定保存，再由 <see cref="GCDumpSnapshotReader"/> 解析。
 /// </summary>
 public sealed class GCDumpSnapshotCollector
 {
     private static readonly TimeSpan s_defaultTimeout = TimeSpan.FromSeconds(30);
 
+    /// <summary>
+    /// 通过目标进程 EventPipe 捕获 GC 堆快照，并转换为可分析的 .gcdump 文件。
+    /// </summary>
+    /// <param name="target">要捕获的目标进程。</param>
+    /// <param name="layout">临时文件和最终文件的存储布局。</param>
+    /// <param name="cancellationToken">取消捕获的令牌。</param>
+    /// <returns>临时快照路径及捕获完成时间；调用方负责后续提升或清理。</returns>
     public static async Task<(string TemporaryPath, DateTimeOffset CapturedAtUtc)> CaptureAsync(
         TargetProcess target,
         SnapshotStorageLayout layout,
@@ -156,6 +162,9 @@ public sealed class GCDumpSnapshotCollector
         }
     }
 
+    /// <summary>
+    /// 在后台驱动 TraceEvent 消费 EventPipe 数据流。
+    /// </summary>
     private static void ProcessSource(EventPipeEventSource source)
     {
         try
@@ -170,24 +179,61 @@ public sealed class GCDumpSnapshotCollector
         }
     }
 
+    /// <summary>
+    /// 读取 EventPipe 时把字节流同步复制到快照文件。
+    /// </summary>
     private sealed class TeeReadStream : Stream
     {
         private readonly Stream _source;
         private readonly Stream _copy;
 
+        /// <summary>
+        /// 创建一个将读取内容同时转发到副本流的只读流。
+        /// </summary>
         public TeeReadStream(Stream source, Stream copy)
         {
             _source = source;
             _copy = copy;
         }
 
+        /// <summary>
+        /// 报告源流是否可读。
+        /// </summary>
         public override bool CanRead => _source.CanRead;
+
+        /// <summary>
+        /// 该转发流不支持定位。
+        /// </summary>
         public override bool CanSeek => false;
+
+        /// <summary>
+        /// 该转发流不支持写入。
+        /// </summary>
         public override bool CanWrite => false;
+
+        /// <summary>
+        /// 返回源流长度。
+        /// </summary>
         public override long Length => _source.Length;
+
+        /// <summary>
+        /// 读取或拒绝设置源流当前位置。
+        /// </summary>
         public override long Position { get => _source.Position; set => throw new NotSupportedException(); }
+
+        /// <summary>
+        /// 刷新副本流。
+        /// </summary>
         public override void Flush() => _copy.Flush();
+
+        /// <summary>
+        /// 异步刷新副本流。
+        /// </summary>
         public override Task FlushAsync(CancellationToken cancellationToken) => _copy.FlushAsync(cancellationToken);
+
+        /// <summary>
+        /// 读取源流并把读取字节写入副本流。
+        /// </summary>
         public override int Read(byte[] buffer, int offset, int count)
         {
             var read = _source.Read(buffer, offset, count);
@@ -199,6 +245,9 @@ public sealed class GCDumpSnapshotCollector
             return read;
         }
 
+        /// <summary>
+        /// 异步读取源流并把读取字节写入副本流。
+        /// </summary>
         public override async ValueTask<int> ReadAsync(
             Memory<byte> buffer,
             CancellationToken cancellationToken = default)
@@ -212,8 +261,19 @@ public sealed class GCDumpSnapshotCollector
             return read;
         }
 
+        /// <summary>
+        /// 拒绝对只读转发流执行定位。
+        /// </summary>
         public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+        /// <summary>
+        /// 拒绝修改只读转发流长度。
+        /// </summary>
         public override void SetLength(long value) => throw new NotSupportedException();
+
+        /// <summary>
+        /// 拒绝向只读转发流写入数据。
+        /// </summary>
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 }
