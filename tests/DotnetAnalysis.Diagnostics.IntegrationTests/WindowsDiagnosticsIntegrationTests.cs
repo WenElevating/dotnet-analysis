@@ -10,6 +10,10 @@ using DotnetAnalysis.Diagnostics.DependencyInjection;
 using DotnetAnalysis.Diagnostics.Windows;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Diagnostics.NETCore.Client;
+using Microsoft.Diagnostics.Tracing;
+using Microsoft.Diagnostics.Tracing.Parsers;
+using System.Diagnostics.Tracing;
 
 namespace DotnetAnalysis.Diagnostics.IntegrationTests;
 
@@ -18,6 +22,170 @@ namespace DotnetAnalysis.Diagnostics.IntegrationTests;
 public sealed class WindowsDiagnosticsIntegrationTests
 {
     private static readonly JsonSerializerOptions s_indentedJson = new() { WriteIndented = true };
+
+    [TestMethod]
+    [TestCategory("MemorySnapshotPerformance")]
+    [DoNotParallelize]
+    public async Task LargeSnapshotTransportProbe_SeparatesEventPipeTransportFromLiveGraphConstruction()
+    {
+        if (!string.Equals(
+                Environment.GetEnvironmentVariable("DOTNET_ANALYSIS_RUN_LARGE_SNAPSHOT_TRANSPORT_PROBE"),
+                "true",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            Assert.Inconclusive("Set DOTNET_ANALYSIS_RUN_LARGE_SNAPSHOT_TRANSPORT_PROBE=true to run the large snapshot transport probe.");
+        }
+
+        const int objectCount = 1_000_000;
+        const int measurementRuns = 5;
+        var rawCaptures = new List<HeapSnapshotTransportResult>();
+        var liveGraphCaptures = new List<HeapSnapshotTransportResult>();
+        var edgeCompleteCaptures = new List<HeapSnapshotTransportResult>();
+
+        await using (var target = await IntegrationTestHost.StartTargetAsync("net10.0", objectCount))
+        {
+            for (var run = 0; run < measurementRuns; run++)
+            {
+                rawCaptures.Add(await CaptureHeapSnapshotTransportAsync(target.ProcessId, buildLiveGraph: false));
+            }
+        }
+
+        await using (var target = await IntegrationTestHost.StartTargetAsync("net10.0", objectCount))
+        {
+            for (var run = 0; run < measurementRuns; run++)
+            {
+                liveGraphCaptures.Add(await CaptureHeapSnapshotTransportAsync(target.ProcessId, buildLiveGraph: true));
+            }
+        }
+
+        await using (var target = await IntegrationTestHost.StartTargetAsync("net10.0", objectCount))
+        {
+            for (var run = 0; run < measurementRuns; run++)
+            {
+                edgeCompleteCaptures.Add(await CaptureHeapSnapshotTransportAsync(
+                    target.ProcessId,
+                    buildLiveGraph: true,
+                    stopWhenAllDeclaredEdgesArrive: true));
+            }
+        }
+
+        await WriteHeapSnapshotTransportProbeArtifactAsync(rawCaptures, liveGraphCaptures, edgeCompleteCaptures);
+        Assert.IsTrue(edgeCompleteCaptures.All(result => result.Completed), FormatTransportProbeFailure("edge-complete stop", edgeCompleteCaptures));
+        Assert.IsTrue(edgeCompleteCaptures.All(result => result.StoppedWhenAllDeclaredEdgesArrived), FormatTransportProbeFailure("edge-complete stop trigger", edgeCompleteCaptures));
+        Assert.IsTrue(edgeCompleteCaptures.All(result => result.EventsLost == 0), FormatTransportProbeFailure("edge-complete event loss", edgeCompleteCaptures));
+        Assert.IsTrue(edgeCompleteCaptures.All(result => result.RootCount > 0), FormatTransportProbeFailure("edge-complete root preservation", edgeCompleteCaptures));
+    }
+
+    [TestMethod]
+    [TestCategory("MemorySnapshotPerformance")]
+    public async Task LargeSnapshotBenchmark_RecordsCaptureAndCachedQueryMeasurements()
+    {
+        if (!string.Equals(
+                Environment.GetEnvironmentVariable("DOTNET_ANALYSIS_RUN_LARGE_SNAPSHOT_BENCHMARK"),
+                "true",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            Assert.Inconclusive("Set DOTNET_ANALYSIS_RUN_LARGE_SNAPSHOT_BENCHMARK=true to run the large snapshot benchmark.");
+        }
+
+        const int objectCount = 1_000_000;
+        const int measurementRuns = 5;
+        const double captureBaselineP50Milliseconds = 1600.4381;
+        await using var target = await IntegrationTestHost.StartTargetAsync("net10.0", objectCount);
+        var snapshotRoot = Path.Combine(Path.GetTempPath(), "DotnetAnalysis.LargeSnapshotBenchmark", Guid.NewGuid().ToString("N"));
+        var layout = new DotnetAnalysis.Diagnostics.Windows.SnapshotStorageLayout(snapshotRoot);
+        var services = new ServiceCollection();
+        services.AddSingleton<IEventBus>(_ => new InProcessEventBus(NullLogger<InProcessEventBus>.Instance));
+        services.AddSingleton(layout);
+        services.AddWindowsProcessDiagnostics();
+        await using var provider = services.BuildServiceProvider(validateScopes: true);
+        var diagnostics = provider.GetRequiredService<IProcessDiagnostics>();
+        var process = (await diagnostics.GetProcessesAsync(CancellationToken.None))
+            .Single(candidate => candidate.ProcessId == target.ProcessId);
+        await using var session = await diagnostics.AttachAsync(process, CancellationToken.None);
+        var analysisService = provider.GetRequiredService<IMemorySnapshotAnalysisService>();
+        var captures = new List<double>();
+        var analyses = new List<double>();
+        var runnerPrivateMemoryBytes = new List<long>();
+        long pageAllocatedBytes = 0;
+        long referencePathAllocatedBytes = 0;
+
+        try
+        {
+            for (var run = 0; run < measurementRuns; run++)
+            {
+                MemorySnapshot snapshot;
+                try
+                {
+                    var captureStopwatch = Stopwatch.StartNew();
+                    snapshot = await session.CaptureSnapshotAsync(CancellationToken.None);
+                    captureStopwatch.Stop();
+                    captures.Add(captureStopwatch.Elapsed.TotalMilliseconds);
+                }
+                catch (DiagnosticsException exception)
+                {
+                    throw new AssertFailedException(
+                        $"Large snapshot capture {run + 1} of {measurementRuns} failed. Completed capture times: {string.Join(", ", captures)}. Runner private memory: {string.Join(", ", runnerPrivateMemoryBytes)}. Capture diagnostics: {exception}",
+                        exception);
+                }
+
+                var analysisStopwatch = Stopwatch.StartNew();
+                var analysis = await analysisService.AnalyzeAsync(snapshot, CancellationToken.None);
+                analysisStopwatch.Stop();
+                analyses.Add(analysisStopwatch.Elapsed.TotalMilliseconds);
+                Assert.AreEqual(MemorySnapshotObjectAccessMode.Paged, analysis.ObjectAccessMode);
+
+                var largestType = analysis.Types.OrderByDescending(summary => summary.ObjectCount).First().Type;
+                var fullEnumerationException = await Assert.ThrowsAsync<DiagnosticsException>(
+                    async () => await analysisService.GetObjectsAsync(snapshot, largestType, CancellationToken.None));
+                Assert.AreEqual(DiagnosticsErrorCode.SnapshotTooLargeForFullEnumeration, fullEnumerationException.ErrorCode);
+
+                _ = await analysisService.GetObjectsPageAsync(snapshot, largestType, 0, 1, CancellationToken.None);
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+                var beforePage = GC.GetTotalAllocatedBytes(precise: true);
+                var page = await analysisService.GetObjectsPageAsync(snapshot, largestType, 0, 1000, CancellationToken.None);
+                pageAllocatedBytes = Math.Max(
+                    pageAllocatedBytes,
+                    GC.GetTotalAllocatedBytes(precise: true) - beforePage);
+                Assert.HasCount(1000, page.Objects);
+
+                _ = await analysisService.GetReferencePathAsync(snapshot, page.Objects[0].Address, CancellationToken.None);
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+                var beforeReferencePath = GC.GetTotalAllocatedBytes(precise: true);
+                _ = await analysisService.GetReferencePathAsync(snapshot, page.Objects[0].Address, CancellationToken.None);
+                referencePathAllocatedBytes = Math.Max(
+                    referencePathAllocatedBytes,
+                    GC.GetTotalAllocatedBytes(precise: true) - beforeReferencePath);
+                runnerPrivateMemoryBytes.Add(Process.GetCurrentProcess().PrivateMemorySize64);
+            }
+
+            Assert.IsLessThan(1024L * 1024, pageAllocatedBytes);
+            Assert.IsLessThan(16L * 1024 * 1024, referencePathAllocatedBytes);
+            await WriteLargeSnapshotBenchmarkArtifactAsync(
+                objectCount,
+                captures,
+                analyses,
+                runnerPrivateMemoryBytes,
+                pageAllocatedBytes,
+                referencePathAllocatedBytes);
+            Assert.IsLessThan(
+                captureBaselineP50Milliseconds,
+                GetP50(captures),
+                "The direct EventPipe heap capture P50 must improve on the pre-change 1600.4381 ms baseline.");
+        }
+        finally
+        {
+            await session.EndAsync(CancellationToken.None);
+            if (Directory.Exists(snapshotRoot))
+            {
+                Directory.Delete(snapshotRoot, recursive: true);
+            }
+        }
+    }
     [TestMethod]
     [TestCategory("WindowsDiagnosticsIntegration")]
     [DataRow("net8.0")]
@@ -284,6 +452,214 @@ public sealed class WindowsDiagnosticsIntegrationTests
 
         Assert.Fail("No measured memory sample was observed.");
         return null!;
+    }
+
+    private static Task WriteLargeSnapshotBenchmarkArtifactAsync(
+        int objectCount,
+        List<double> captures,
+        List<double> analyses,
+        List<long> runnerPrivateMemoryBytes,
+        long pageAllocatedBytes,
+        long referencePathAllocatedBytes)
+    {
+        var artifactDirectory = Path.Combine(
+            Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..")),
+            "TestResults",
+            "LargeSnapshotBenchmark-20260904");
+        Directory.CreateDirectory(artifactDirectory);
+        var artifact = new
+        {
+            capturedAtUtc = DateTimeOffset.UtcNow,
+            objectCount,
+            objectPayloadBytes = 256,
+            measurementRuns = captures.Count,
+            captureMilliseconds = captures,
+            captureP50Milliseconds = GetP50(captures),
+            analysisMilliseconds = analyses,
+            analysisP50Milliseconds = GetP50(analyses),
+            runnerPrivateMemoryBytes,
+            cachedPageAllocatedBytes = pageAllocatedBytes,
+            cachedReferencePathAllocatedBytes = referencePathAllocatedBytes
+        };
+        return File.WriteAllTextAsync(
+            Path.Combine(artifactDirectory, "large-snapshot-benchmark.json"),
+            JsonSerializer.Serialize(artifact, s_indentedJson));
+    }
+
+    private static async Task<HeapSnapshotTransportResult> CaptureHeapSnapshotTransportAsync(
+        int processId,
+        bool buildLiveGraph,
+        bool stopWhenAllDeclaredEdgesArrive = false)
+    {
+        using var session = new DiagnosticsClient(processId).StartEventPipeSession(
+            new EventPipeProvider(
+                "Microsoft-Windows-DotNETRuntime",
+                EventLevel.Verbose,
+                (long)ClrTraceEventParser.Keywords.GCHeapSnapshot),
+            requestRundown: true,
+            circularBufferMB: 128);
+        using var source = new EventPipeEventSource(session.EventStream);
+        var completed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var allDeclaredEdgesReceived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sawHeapNode = 0;
+        EventPipeHeapBuilder? heapBuilder = null;
+        if (buildLiveGraph)
+        {
+            heapBuilder = new EventPipeHeapBuilder();
+            heapBuilder.Attach(source);
+        }
+        else
+        {
+            source.Clr.GCBulkNode += data =>
+            {
+                if (data.Count > 0)
+                {
+                    Volatile.Write(ref sawHeapNode, 1);
+                }
+            };
+        }
+
+        source.Clr.GCStop += _ =>
+        {
+            if (buildLiveGraph ? heapBuilder!.HasHeapData : Volatile.Read(ref sawHeapNode) != 0)
+            {
+                completed.TrySetResult();
+            }
+        };
+        if (stopWhenAllDeclaredEdgesArrive)
+        {
+            source.Clr.GCBulkEdge += _ =>
+            {
+                if (heapBuilder!.HasReceivedAllDeclaredEdges)
+                {
+                    allDeclaredEdgesReceived.TrySetResult();
+                }
+            };
+        }
+
+        var stopwatch = Stopwatch.StartNew();
+        var processing = Task.Run(() => ProcessHeapSnapshotTransport(source), CancellationToken.None);
+        var winner = await Task.WhenAny(
+            completed.Task,
+            allDeclaredEdgesReceived.Task,
+            processing,
+            Task.Delay(TimeSpan.FromSeconds(30)));
+        var stoppedWhenAllDeclaredEdgesArrived = winner == allDeclaredEdgesReceived.Task;
+        if (stoppedWhenAllDeclaredEdgesArrived)
+        {
+            StopHeapSnapshotTransportSession(session);
+            await processing.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        stopwatch.Stop();
+        if (completed.Task.IsCompletedSuccessfully)
+        {
+            StopHeapSnapshotTransportSession(session);
+
+            await processing.WaitAsync(TimeSpan.FromSeconds(5));
+            long? rootCount = heapBuilder is null ? null : heapBuilder.Build().Roots.Count;
+            return HeapSnapshotTransportResult.Success(
+                stopwatch.Elapsed.TotalMilliseconds,
+                source.EventsLost,
+                rootCount,
+                stoppedWhenAllDeclaredEdgesArrived);
+        }
+
+        var diagnostics = heapBuilder?.GetDiagnostics();
+        return HeapSnapshotTransportResult.Failure(
+            stopwatch.Elapsed.TotalMilliseconds,
+            source.EventsLost,
+            diagnostics?.GcStopCount,
+            diagnostics?.NodeCount,
+            diagnostics?.EdgeCount,
+            diagnostics?.RootEdgeCount,
+            diagnostics?.LastEdgeObservedMilliseconds,
+            stoppedWhenAllDeclaredEdgesArrived);
+    }
+
+    private static void ProcessHeapSnapshotTransport(EventPipeEventSource source)
+    {
+        try
+        {
+            source.Process();
+        }
+        catch (Exception exception) when (
+            exception is InvalidOperationException
+                or IOException
+                or EndOfStreamException)
+        {
+        }
+    }
+
+    private static void StopHeapSnapshotTransportSession(EventPipeSession session)
+    {
+        try
+        {
+            session.Stop();
+        }
+        catch (Exception exception) when (
+            exception is IOException
+                or InvalidOperationException
+                or DiagnosticsClientException)
+        {
+        }
+    }
+
+    private static Task WriteHeapSnapshotTransportProbeArtifactAsync(
+        List<HeapSnapshotTransportResult> rawCaptures,
+        List<HeapSnapshotTransportResult> liveGraphCaptures,
+        List<HeapSnapshotTransportResult> edgeCompleteCaptures)
+    {
+        var artifactDirectory = Path.Combine(
+            Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..")),
+            "TestResults",
+            "LargeSnapshotBenchmark-20260904");
+        Directory.CreateDirectory(artifactDirectory);
+        return File.WriteAllTextAsync(
+            Path.Combine(artifactDirectory, "heap-snapshot-transport-probe.json"),
+            JsonSerializer.Serialize(new
+            {
+                capturedAtUtc = DateTimeOffset.UtcNow,
+                rawCaptures,
+                liveGraphCaptures,
+                edgeCompleteCaptures
+            }, s_indentedJson));
+    }
+
+    private static string FormatTransportProbeFailure(string mode, List<HeapSnapshotTransportResult> results) =>
+        $"{mode} transport results: {JsonSerializer.Serialize(results, s_indentedJson)}";
+
+    private static double GetP50(List<double> values) =>
+        values.OrderBy(value => value).ElementAt(values.Count / 2);
+
+    private sealed record HeapSnapshotTransportResult(
+        bool Completed,
+        double ElapsedMilliseconds,
+        long EventsLost,
+        long? GcStopCount,
+        long? NodeCount,
+        long? EdgeCount,
+        long? RootEdgeCount,
+        double? LastEdgeObservedMilliseconds,
+        long? RootCount,
+        bool StoppedWhenAllDeclaredEdgesArrived)
+    {
+        public static HeapSnapshotTransportResult Success(
+            double elapsedMilliseconds,
+            long eventsLost,
+            long? rootCount,
+            bool stoppedWhenAllDeclaredEdgesArrived) =>
+            new(true, elapsedMilliseconds, eventsLost, null, null, null, null, null, rootCount, stoppedWhenAllDeclaredEdgesArrived);
+
+        public static HeapSnapshotTransportResult Failure(
+            double elapsedMilliseconds,
+            long eventsLost,
+            long? gcStopCount,
+            long? nodeCount,
+            long? edgeCount,
+            long? rootEdgeCount,
+            double? lastEdgeObservedMilliseconds,
+            bool stoppedWhenAllDeclaredEdgesArrived) =>
+            new(false, elapsedMilliseconds, eventsLost, gcStopCount, nodeCount, edgeCount, rootEdgeCount, lastEdgeObservedMilliseconds, null, stoppedWhenAllDeclaredEdgesArrived);
     }
 
     private static long ReadNativePrivateWorkingSetBytes(int processId)

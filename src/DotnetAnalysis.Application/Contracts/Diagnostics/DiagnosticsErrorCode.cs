@@ -32,5 +32,9 @@ public enum DiagnosticsErrorCode
     /// <summary>
     /// 操作被调用方取消。
     /// </summary>
-    CaptureCancelled
+    CaptureCancelled,
+    /// <summary>
+    /// 快照对象数量过大，不能执行完整对象枚举，应改用分页查询。
+    /// </summary>
+    SnapshotTooLargeForFullEnumeration
 }

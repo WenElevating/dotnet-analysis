@@ -32,6 +32,34 @@ internal static class GCDumpFastSerializationWriter
         var dump = new GCHeapDump(graph, target, capturedAtUtc);
         var serializer = new Serializer(outputPath, dump, FileShare.Read);
         serializer.Close();
+        cancellationToken.ThrowIfCancellationRequested();
+    }
+
+    /// <summary>
+    /// 将 EventPipe 消费期间已构建的紧凑堆图直接编码为 .gcdump，避免重新创建全量对象和边集合。
+    /// </summary>
+    /// <param name="outputPath">输出文件路径。</param>
+    /// <param name="heapBuilder">已完成 EventPipe 消费的堆图构建器。</param>
+    /// <param name="target">产生该堆快照的目标进程。</param>
+    /// <param name="capturedAtUtc">快照捕获完成时间。</param>
+    /// <param name="cancellationToken">构建过程中用于停止工作的取消令牌。</param>
+    public static void Write(
+        string outputPath,
+        EventPipeHeapBuilder heapBuilder,
+        TargetProcess target,
+        DateTimeOffset capturedAtUtc,
+        CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(outputPath);
+        ArgumentNullException.ThrowIfNull(heapBuilder);
+        ArgumentNullException.ThrowIfNull(target);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var graph = BuildGraph(heapBuilder, cancellationToken);
+        var dump = new GCHeapDump(graph, target, capturedAtUtc);
+        var serializer = new Serializer(outputPath, dump, FileShare.Read);
+        serializer.Close();
+        cancellationToken.ThrowIfCancellationRequested();
     }
 
     /// <summary>
@@ -41,10 +69,7 @@ internal static class GCDumpFastSerializationWriter
         GCDumpSnapshotReader.HeapData heap,
         CancellationToken cancellationToken)
     {
-        var objects = heap.Objects
-            .GroupBy(candidate => candidate.Address)
-            .Select(group => group.First())
-            .ToArray();
+        var objects = heap.Objects.ToArray();
         var addressToIndex = objects
             .Select((candidate, index) => (candidate.Address, Index: index + 1))
             .ToDictionary(item => item.Address, item => item.Index);
@@ -94,7 +119,80 @@ internal static class GCDumpFastSerializationWriter
             typeEntries,
             labels,
             blob.ToArray(),
-            objects);
+            objects,
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// 直接将 EventPipe 的节点行和顺序边槽位编码为 FastSerialization 图。
+    /// </summary>
+    private static Graphs.MemoryGraph BuildGraph(
+        EventPipeHeapBuilder heapBuilder,
+        CancellationToken cancellationToken)
+    {
+        var nodes = heapBuilder.Nodes;
+        var edgeTargets = heapBuilder.EdgeTargets;
+        var addressToIndex = new Dictionary<ulong, int>(nodes.Count);
+        for (var index = 0; index < nodes.Count; index++)
+        {
+            addressToIndex.TryAdd(nodes[index].Address, index + 1);
+        }
+
+        var typeEntries = new List<(string Name, int Size, string? Module)>
+        {
+            ("UNDEFINED", 0, null),
+            ("[.NET Roots]", 0, null)
+        };
+        var typeIndexes = new Dictionary<TypeIdentity, int>();
+        foreach (var node in nodes)
+        {
+            if (typeIndexes.TryGetValue(node.Type, out _))
+            {
+                continue;
+            }
+
+            var index = typeEntries.Count;
+            typeIndexes.Add(node.Type, index);
+            typeEntries.Add((
+                node.Type.TypeName,
+                checked((int)Math.Min(node.SizeBytes, int.MaxValue)),
+                node.Type.AssemblyName));
+        }
+
+        var estimatedBlobBytes = checked(nodes.Count * 4L + edgeTargets.Count * 2L);
+        using var blob = new MemoryStream(checked((int)Math.Min(estimatedBlobBytes, 64L * 1024 * 1024)));
+        using var writer = new BinaryWriter(blob, System.Text.Encoding.UTF8, leaveOpen: true);
+        var labels = new int[nodes.Count + 1];
+        Array.Fill(labels, -1);
+        WriteNode(writer, labels, 0, 1, 0, GetRootChildren(heapBuilder.Roots, addressToIndex));
+
+        var edgeOffset = 0;
+        for (var objectOffset = 0; objectOffset < nodes.Count; objectOffset++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var node = nodes[objectOffset];
+            var availableEdges = edgeTargets.Count - edgeOffset;
+            var edgeCount = availableEdges > 0
+                ? checked((int)Math.Min(Math.Max(node.EdgeCount, 0), availableEdges))
+                : 0;
+            var typeIndex = typeIndexes[node.Type];
+            var canonicalSize = typeEntries[typeIndex].Size;
+            var sizeOverride = node.SizeBytes != canonicalSize;
+            WriteNode(
+                writer,
+                labels,
+                objectOffset + 1,
+                typeIndex,
+                sizeOverride ? checked((int)Math.Min(node.SizeBytes, int.MaxValue)) : null,
+                edgeTargets,
+                edgeOffset,
+                edgeCount,
+                addressToIndex);
+            edgeOffset += edgeCount;
+        }
+
+        writer.Flush();
+        return new Graphs.MemoryGraph(typeEntries, labels, blob.ToArray(), nodes, cancellationToken);
     }
 
     /// <summary>
@@ -104,6 +202,18 @@ internal static class GCDumpFastSerializationWriter
         GCDumpSnapshotReader.HeapData heap,
         Dictionary<ulong, int> addressToIndex) =>
         heap.Roots
+            .Where(addressToIndex.ContainsKey)
+            .Select(address => addressToIndex[address])
+            .Distinct()
+            .ToArray();
+
+    /// <summary>
+    /// 将 EventPipe 根地址映射为图节点索引并去除重复项。
+    /// </summary>
+    private static int[] GetRootChildren(
+        IReadOnlyList<ulong> roots,
+        Dictionary<ulong, int> addressToIndex) =>
+        roots
             .Where(addressToIndex.ContainsKey)
             .Select(address => addressToIndex[address])
             .Distinct()
@@ -131,6 +241,46 @@ internal static class GCDumpFastSerializationWriter
         foreach (var child in children)
         {
             WriteCompressedInt(writer, checked(child - nodeIndex));
+        }
+    }
+
+    /// <summary>
+    /// 从连续 EventPipe 边槽位直接写入节点，避免为每个对象创建中间子节点数组。
+    /// </summary>
+    private static void WriteNode(
+        BinaryWriter writer,
+        int[] labels,
+        int nodeIndex,
+        int typeIndex,
+        int? sizeOverride,
+        IReadOnlyList<ulong> edgeTargets,
+        int edgeOffset,
+        int edgeCount,
+        Dictionary<ulong, int> addressToIndex)
+    {
+        labels[nodeIndex] = checked((int)writer.BaseStream.Position);
+        WriteCompressedInt(writer, checked((typeIndex << 1) | (sizeOverride.HasValue ? 1 : 0)));
+        if (sizeOverride.HasValue)
+        {
+            WriteCompressedInt(writer, sizeOverride.Value);
+        }
+
+        var childCount = 0;
+        for (var index = 0; index < edgeCount; index++)
+        {
+            if (addressToIndex.ContainsKey(edgeTargets[edgeOffset + index]))
+            {
+                childCount++;
+            }
+        }
+
+        WriteCompressedInt(writer, childCount);
+        for (var index = 0; index < edgeCount; index++)
+        {
+            if (addressToIndex.TryGetValue(edgeTargets[edgeOffset + index], out var child))
+            {
+                WriteCompressedInt(writer, checked(child - nodeIndex));
+            }
         }
     }
 

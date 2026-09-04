@@ -34,7 +34,6 @@ internal static class GCDumpSnapshotCollector
         cancellationToken.ThrowIfCancellationRequested();
 
         var temporaryPath = layout.TemporaryPath(Guid.NewGuid());
-        string? serializedPath = null;
         Directory.CreateDirectory(Path.GetDirectoryName(temporaryPath)!);
 
         try
@@ -46,91 +45,75 @@ internal static class GCDumpSnapshotCollector
                     (long)ClrTraceEventParser.Keywords.GCHeapSnapshot),
                 requestRundown: true,
                 circularBufferMB: 128);
-            await using var output = new FileStream(
-                temporaryPath,
-                FileMode.CreateNew,
-                FileAccess.Write,
-                FileShare.Read,
-                bufferSize: 64 * 1024,
-                options: FileOptions.Asynchronous | FileOptions.SequentialScan);
-            using var source = new EventPipeEventSource(new TeeReadStream(session.EventStream, output));
+            using var source = new EventPipeEventSource(session.EventStream);
+            var heapBuilder = new EventPipeHeapBuilder();
+            heapBuilder.Attach(source);
             var dumpCompleted = new TaskCompletionSource<DateTimeOffset>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
-            var sawHeapData = 0;
-
-            source.Clr.GCStart += data =>
-            {
-                if (data.ProcessID == target.ProcessId && data.Depth == 2)
-                {
-                    Volatile.Write(ref sawHeapData, 1);
-                }
-            };
-            source.Clr.GCBulkNode += data =>
-            {
-                if (data.ProcessID == target.ProcessId && data.Count > 0)
-                {
-                    Volatile.Write(ref sawHeapData, 1);
-                }
-            };
+            var heapPayloadComplete = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
             source.Clr.GCStop += data =>
             {
-                if (data.ProcessID == target.ProcessId && Volatile.Read(ref sawHeapData) != 0)
+                if (data.ProcessID == target.ProcessId && heapBuilder.HasHeapData)
                 {
                     dumpCompleted.TrySetResult(DateTimeOffset.UtcNow);
-                    source.StopProcessing();
+                    if (heapBuilder.HasReceivedAllDeclaredEdges)
+                    {
+                        heapPayloadComplete.TrySetResult();
+                    }
+                }
+            };
+            source.Clr.GCBulkEdge += _ =>
+            {
+                if (heapBuilder.HasReceivedAllDeclaredEdges)
+                {
+                    heapPayloadComplete.TrySetResult();
                 }
             };
 
             var processing = Task.Run(() => ProcessSource(source), CancellationToken.None);
             var completed = await Task.WhenAny(
-                dumpCompleted.Task,
+                heapPayloadComplete.Task,
                 processing,
                 Task.Delay(s_defaultTimeout, cancellationToken)).ConfigureAwait(false);
-            if (completed != dumpCompleted.Task)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                throw new TimeoutException("The target did not produce a complete GC heap snapshot before the timeout.");
-            }
+            cancellationToken.ThrowIfCancellationRequested();
 
-            try
-            {
-                session.Stop();
-            }
-            catch (Exception exception) when (
-                exception is IOException
-                    or InvalidOperationException
-                    or DiagnosticsClientException)
-            {
-            }
+            StopSession(session);
 
             await processing.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
-            await output.FlushAsync(cancellationToken).ConfigureAwait(false);
-            source.Dispose();
-            await output.DisposeAsync().ConfigureAwait(false);
-
-            // EventPipe emits a nettrace stream.  Convert the completed heap
-            // graph into the official FastSerialization .gcdump envelope
-            // before exposing the temporary file to the promotion layer.
-            var heap = GCDumpSnapshotReader.ReadHeapForSerialization(temporaryPath, cancellationToken);
-            serializedPath = layout.TemporaryPath(Guid.NewGuid());
+            if (completed != heapPayloadComplete.Task
+                || !heapPayloadComplete.Task.IsCompletedSuccessfully
+                || !dumpCompleted.Task.IsCompletedSuccessfully
+                || source.EventsLost != 0)
+            {
+                var diagnostics = heapBuilder.GetDiagnostics();
+                throw new TimeoutException(
+                    $"The EventPipe heap snapshot did not deliver all declared edges and the matching GC completion event before the timeout or while draining the stopped session. " +
+                    $"GCStart={diagnostics.GcStartCount}, GCStop={diagnostics.GcStopCount}, " +
+                    $"NodeBatches={diagnostics.NodeBatchCount}, Nodes={diagnostics.NodeCount}, " +
+                    $"EdgeBatches={diagnostics.EdgeBatchCount}, Edges={diagnostics.EdgeCount}, " +
+                    $"RootEdgeBatches={diagnostics.RootEdgeBatchCount}, RootEdges={diagnostics.RootEdgeCount}, " +
+                    $"FirstNodeUtc={diagnostics.FirstNodeUtc:O}, LastNodeUtc={diagnostics.LastNodeUtc:O}, " +
+                    $"GcStartObservedMilliseconds={diagnostics.GcStartObservedMilliseconds}, " +
+                    $"GcStopObservedMilliseconds={diagnostics.GcStopObservedMilliseconds}, " +
+                    $"FirstNodeObservedMilliseconds={diagnostics.FirstNodeObservedMilliseconds}, " +
+                    $"LastNodeObservedMilliseconds={diagnostics.LastNodeObservedMilliseconds}, " +
+                    $"LastEdgeObservedMilliseconds={diagnostics.LastEdgeObservedMilliseconds}, " +
+                    $"LastRootEdgeObservedMilliseconds={diagnostics.LastRootEdgeObservedMilliseconds}, " +
+                    $"EventPipeEventsLost={source.EventsLost}.");
+            }
+            var capturedAtUtc = await dumpCompleted.Task.ConfigureAwait(false);
             GCDumpFastSerializationWriter.Write(
-                serializedPath,
-                heap,
+                temporaryPath,
+                heapBuilder,
                 target,
-                await dumpCompleted.Task.ConfigureAwait(false),
+                capturedAtUtc,
                 cancellationToken);
-            await MemorySnapshotStore.DeleteTemporaryAsync(temporaryPath).ConfigureAwait(false);
-            File.Move(serializedPath, temporaryPath, false);
-            serializedPath = null;
-            return (temporaryPath, await dumpCompleted.Task.ConfigureAwait(false));
+            return (temporaryPath, capturedAtUtc);
         }
         catch (OperationCanceledException exception) when (cancellationToken.IsCancellationRequested)
         {
             await MemorySnapshotStore.DeleteTemporaryAsync(temporaryPath).ConfigureAwait(false);
-            if (serializedPath is not null)
-            {
-                await MemorySnapshotStore.DeleteTemporaryAsync(serializedPath).ConfigureAwait(false);
-            }
             throw new DiagnosticsException(
                 DiagnosticsErrorCode.CaptureCancelled,
                 "Snapshot capture was cancelled.",
@@ -139,10 +122,6 @@ internal static class GCDumpSnapshotCollector
         catch (DiagnosticsException)
         {
             await MemorySnapshotStore.DeleteTemporaryAsync(temporaryPath).ConfigureAwait(false);
-            if (serializedPath is not null)
-            {
-                await MemorySnapshotStore.DeleteTemporaryAsync(serializedPath).ConfigureAwait(false);
-            }
             throw;
         }
         catch (Exception exception) when (
@@ -153,10 +132,6 @@ internal static class GCDumpSnapshotCollector
                 or TimeoutException)
         {
             await MemorySnapshotStore.DeleteTemporaryAsync(temporaryPath).ConfigureAwait(false);
-            if (serializedPath is not null)
-            {
-                await MemorySnapshotStore.DeleteTemporaryAsync(serializedPath).ConfigureAwait(false);
-            }
             throw new DiagnosticsException(
                 DiagnosticsErrorCode.CaptureFailed,
                 "The runtime GC heap snapshot could not be captured.",
@@ -182,100 +157,20 @@ internal static class GCDumpSnapshotCollector
     }
 
     /// <summary>
-    /// 读取 EventPipe 时把字节流同步复制到快照文件。
+    /// 请求运行时停止 EventPipe 会话，同时允许已发送的末尾堆事件继续被读取。
     /// </summary>
-    private sealed class TeeReadStream : Stream
+    private static void StopSession(EventPipeSession session)
     {
-        private readonly Stream _source;
-        private readonly Stream _copy;
-
-        /// <summary>
-        /// 创建一个将读取内容同时转发到副本流的只读流。
-        /// </summary>
-        public TeeReadStream(Stream source, Stream copy)
+        try
         {
-            _source = source;
-            _copy = copy;
+            session.Stop();
         }
-
-        /// <summary>
-        /// 报告源流是否可读。
-        /// </summary>
-        public override bool CanRead => _source.CanRead;
-
-        /// <summary>
-        /// 该转发流不支持定位。
-        /// </summary>
-        public override bool CanSeek => false;
-
-        /// <summary>
-        /// 该转发流不支持写入。
-        /// </summary>
-        public override bool CanWrite => false;
-
-        /// <summary>
-        /// 返回源流长度。
-        /// </summary>
-        public override long Length => _source.Length;
-
-        /// <summary>
-        /// 读取或拒绝设置源流当前位置。
-        /// </summary>
-        public override long Position { get => _source.Position; set => throw new NotSupportedException(); }
-
-        /// <summary>
-        /// 刷新副本流。
-        /// </summary>
-        public override void Flush() => _copy.Flush();
-
-        /// <summary>
-        /// 异步刷新副本流。
-        /// </summary>
-        public override Task FlushAsync(CancellationToken cancellationToken) => _copy.FlushAsync(cancellationToken);
-
-        /// <summary>
-        /// 读取源流并把读取字节写入副本流。
-        /// </summary>
-        public override int Read(byte[] buffer, int offset, int count)
+        catch (Exception exception) when (
+            exception is IOException
+                or InvalidOperationException
+                or DiagnosticsClientException)
         {
-            var read = _source.Read(buffer, offset, count);
-            if (read > 0)
-            {
-                _copy.Write(buffer, offset, read);
-            }
-
-            return read;
         }
-
-        /// <summary>
-        /// 异步读取源流并把读取字节写入副本流。
-        /// </summary>
-        public override async ValueTask<int> ReadAsync(
-            Memory<byte> buffer,
-            CancellationToken cancellationToken = default)
-        {
-            var read = await _source.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
-            if (read > 0)
-            {
-                await _copy.WriteAsync(buffer[..read], cancellationToken).ConfigureAwait(false);
-            }
-
-            return read;
-        }
-
-        /// <summary>
-        /// 拒绝对只读转发流执行定位。
-        /// </summary>
-        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
-
-        /// <summary>
-        /// 拒绝修改只读转发流长度。
-        /// </summary>
-        public override void SetLength(long value) => throw new NotSupportedException();
-
-        /// <summary>
-        /// 拒绝向只读转发流写入数据。
-        /// </summary>
-        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
+
 }

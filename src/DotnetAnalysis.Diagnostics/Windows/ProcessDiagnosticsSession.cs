@@ -281,6 +281,7 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
         }
 
         await DisposeAllocationCollectorAsync().ConfigureAwait(false);
+        await _sampler.DisposeAsync().ConfigureAwait(false);
 
         lock (_syncRoot)
         {

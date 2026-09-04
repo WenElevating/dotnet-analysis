@@ -102,6 +102,20 @@ public sealed class MemorySnapshotOperationTests
     }
 
     [TestMethod]
+    public async Task GetObjectsPageAsync_ReadsRequestedPageThroughAnalysisService()
+    {
+        var type = new TypeIdentity("Sample.Type", "Sample");
+        var expected = new MemoryObjectPage([new MemoryObjectInfo(42, type, 64)], 3, 1, 1);
+        var analysisService = new ControlledSnapshotAnalysisService { ObjectPage = expected };
+        var operation = CreateOperation(Snapshot(MemorySnapshotState.Ready), analysisService);
+
+        var page = await operation.GetObjectsPageAsync(type, 1, 1, CancellationToken.None);
+
+        Assert.AreEqual(expected, page);
+        Assert.AreEqual(1, analysisService.GetObjectsPageCalls);
+    }
+
+    [TestMethod]
     public async Task AnalyzeAsync_PublishesSnapshotLifecycleEvents()
     {
         var eventBus = new RecordingEventBus();
@@ -172,9 +186,13 @@ public sealed class MemorySnapshotOperationTests
 
         public int GetReferencePathCalls { get; private set; }
 
+        public int GetObjectsPageCalls { get; private set; }
+
         public IReadOnlyList<MemoryObjectInfo> Objects { get; init; } = [];
 
         public MemoryReferencePath? ReferencePath { get; init; }
+
+        public MemoryObjectPage ObjectPage { get; init; } = new([], 0, 0, 1);
 
         public Task<MemorySnapshotAnalysis> AnalyzeAsync(MemorySnapshot snapshot, CancellationToken cancellationToken)
         {
@@ -224,6 +242,18 @@ public sealed class MemorySnapshotOperationTests
             cancellationToken.ThrowIfCancellationRequested();
             GetReferencePathCalls++;
             return Task.FromResult(ReferencePath);
+        }
+
+        public Task<MemoryObjectPage> GetObjectsPageAsync(
+            MemorySnapshot snapshot,
+            TypeIdentity type,
+            int offset,
+            int pageSize,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            GetObjectsPageCalls++;
+            return Task.FromResult(ObjectPage);
         }
     }
 

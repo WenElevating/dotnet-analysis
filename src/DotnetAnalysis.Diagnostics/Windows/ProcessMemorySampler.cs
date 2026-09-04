@@ -34,28 +34,35 @@ public sealed class UnavailableManagedHeapReader : IManagedHeapReader
 /// <summary>
 /// 通过 System.Runtime EventCounters 读取托管堆大小。
 /// </summary>
-public sealed class EventPipeManagedHeapReader : IManagedHeapReader
+public sealed class EventPipeManagedHeapReader : IManagedHeapReader, IDisposable
 {
     private const string RuntimeProviderName = "System.Runtime";
     private const string EventCountersName = "EventCounters";
     private const string ManagedHeapCounterName = "gc-heap-size";
-    private readonly TimeSpan _timeout;
+    private readonly object _syncRoot = new();
+    private readonly TimeSpan _shutdownWait;
+    private EventPipeSession? _session;
+    private EventPipeEventSource? _source;
+    private Task? _processing;
+    private long _latestBytes = -1;
+    private bool _started;
+    private bool _disposed;
 
     /// <summary>
     /// 创建通过 EventPipe EventCounter 读取托管堆大小的读取器。
     /// </summary>
-    /// <param name="timeout">等待第一条堆大小计数器的最长时间。</param>
+    /// <param name="timeout">停止后台 EventPipe 消费时最多等待的时间。</param>
     public EventPipeManagedHeapReader(TimeSpan? timeout = null)
     {
-        _timeout = timeout ?? TimeSpan.FromSeconds(5);
-        if (_timeout <= TimeSpan.Zero)
+        _shutdownWait = timeout ?? TimeSpan.FromSeconds(5);
+        if (_shutdownWait <= TimeSpan.Zero)
         {
             throw new ArgumentOutOfRangeException(nameof(timeout));
         }
     }
 
     /// <summary>
-    /// 尝试读取 gc-heap-size 计数器，不可用时不向调用方暴露传输异常。
+    /// 返回附着会话内常驻 EventPipe 监听器最近读取到的 gc-heap-size 计数器。
     /// </summary>
     /// <param name="processId">目标进程 ID。</param>
     /// <returns>以字节为单位的托管堆大小；读取失败时返回 <see langword="null"/>。</returns>
@@ -66,9 +73,71 @@ public sealed class EventPipeManagedHeapReader : IManagedHeapReader
             return null;
         }
 
+        EnsureStarted(processId);
+        var value = Volatile.Read(ref _latestBytes);
+        return value >= 0 ? value : null;
+    }
+
+    /// <summary>
+    /// 释放常驻的 EventPipe 会话和后台消费任务。
+    /// </summary>
+    public void Dispose()
+    {
+        EventPipeSession? session;
+        EventPipeEventSource? source;
+        Task? processing;
+        lock (_syncRoot)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            session = _session;
+            source = _source;
+            processing = _processing;
+            _session = null;
+            _source = null;
+            _processing = null;
+        }
+
         try
         {
-            using var session = new DiagnosticsClient(processId).StartEventPipeSession(
+            source?.StopProcessing();
+            session?.Stop();
+            processing?.Wait(_shutdownWait);
+        }
+        catch (Exception exception) when (
+            exception is AggregateException
+                or IOException
+                or InvalidOperationException
+                or DiagnosticsClientException)
+        {
+        }
+        finally
+        {
+            source?.Dispose();
+            session?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// 启动一次后台 EventCounters 监听，后续采样只读取缓存值。
+    /// </summary>
+    private void EnsureStarted(int processId)
+    {
+        lock (_syncRoot)
+        {
+            if (_started || _disposed)
+            {
+                return;
+            }
+
+            _started = true;
+            try
+            {
+                _session = new DiagnosticsClient(processId).StartEventPipeSession(
                 new EventPipeProvider(
                     RuntimeProviderName,
                     EventLevel.Informational,
@@ -79,51 +148,32 @@ public sealed class EventPipeManagedHeapReader : IManagedHeapReader
                     }),
                 requestRundown: false,
                 circularBufferMB: 16);
-            using var source = new EventPipeEventSource(session.EventStream);
-            var result = new TaskCompletionSource<long>(TaskCreationOptions.RunContinuationsAsynchronously);
-            // EventCounters is emitted as a dynamic event.  Registering through
-            // Dynamic.All is intentionally used here instead of relying on the
-            // provider/event lookup table: the EventPipe payload is generated at
-            // runtime and the lookup table is not populated consistently across
-            // .NET 8, .NET 9 and .NET 10.
-            source.Dynamic.All += traceEvent =>
+                _source = new EventPipeEventSource(_session.EventStream);
+                // EventCounters is emitted as a dynamic event.  Registering through
+                // Dynamic.All is intentionally used here instead of relying on the
+                // provider/event lookup table: the EventPipe payload is generated at
+                // runtime and the lookup table is not populated consistently across
+                // .NET 8, .NET 9 and .NET 10.
+                _source.Dynamic.All += traceEvent =>
             {
                 if (string.Equals(traceEvent.EventName, EventCountersName, StringComparison.Ordinal))
                 {
-                    TryReadCounter(traceEvent, result);
+                    TryReadCounter(traceEvent, value => Volatile.Write(ref _latestBytes, value));
                 }
             };
-
-            var processing = Task.Run(() => source.Process());
-            try
-            {
-                return result.Task.WaitAsync(_timeout).GetAwaiter().GetResult();
+                _processing = Task.Run(() => ProcessSource(_source));
             }
-            catch (TimeoutException)
+            catch (Exception exception) when (
+                exception is DiagnosticsClientException
+                    or IOException
+                    or InvalidOperationException
+                    or UnauthorizedAccessException)
             {
-                return null;
+                _source?.Dispose();
+                _session?.Dispose();
+                _source = null;
+                _session = null;
             }
-            finally
-            {
-                source.StopProcessing();
-                session.Stop();
-                try
-                {
-                    processing.Wait(TimeSpan.FromSeconds(1));
-                }
-                catch (AggregateException)
-                {
-                }
-            }
-        }
-        catch (Exception exception) when (
-            exception is DiagnosticsClientException
-                or IOException
-                or InvalidOperationException
-                or UnauthorizedAccessException
-                or TimeoutException)
-        {
-            return null;
         }
     }
 
@@ -132,7 +182,7 @@ public sealed class EventPipeManagedHeapReader : IManagedHeapReader
     /// </summary>
     private static void TryReadCounter(
         TraceEvent traceEvent,
-        TaskCompletionSource<long> result)
+        Action<long> setResult)
     {
         try
         {
@@ -152,13 +202,13 @@ public sealed class EventPipeManagedHeapReader : IManagedHeapReader
                 return;
             }
 
-            var rawValue = counter["Mean"] ?? counter["Increment"];
+            var rawValue = counter["Mean"];
             if (rawValue is not null
                 && double.TryParse(rawValue.ToString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var value)
-                && value >= 0
-                && value <= long.MaxValue)
+                && counter.TryGetValue("DisplayUnits", out var displayUnits)
+                && ConvertCounterValueToBytes(value, displayUnits?.ToString()) is { } bytes)
             {
-                result.TrySetResult((long)value);
+                setResult(bytes);
             }
         }
         catch (Exception exception) when (
@@ -170,12 +220,48 @@ public sealed class EventPipeManagedHeapReader : IManagedHeapReader
         {
         }
     }
+
+    /// <summary>
+    /// 把 EventCounter 指定单位的数值转换为字节；未知单位明确返回空。
+    /// </summary>
+    internal static long? ConvertCounterValueToBytes(double value, string? unit)
+    {
+        if (value < 0 || value > long.MaxValue || string.IsNullOrWhiteSpace(unit))
+        {
+            return null;
+        }
+
+        var multiplier = unit.Trim().ToUpperInvariant() switch
+        {
+            "B" or "BYTE" or "BYTES" => 1d,
+            "KB" or "KIB" or "KBYTES" => 1024d,
+            "MB" or "MIB" or "MBYTES" => 1024d * 1024d,
+            "GB" or "GIB" or "GBYTES" => 1024d * 1024d * 1024d,
+            _ => 0d
+        };
+        var bytes = value * multiplier;
+        return multiplier == 0d || bytes > long.MaxValue ? null : (long)bytes;
+    }
+
+    private static void ProcessSource(EventPipeEventSource source)
+    {
+        try
+        {
+            source.Process();
+        }
+        catch (Exception exception) when (
+            exception is InvalidOperationException
+                or IOException
+                or EndOfStreamException)
+        {
+        }
+    }
 }
 
 /// <summary>
 /// 按固定间隔组合原生工作集和托管堆样本。
 /// </summary>
-public sealed class ProcessMemorySampler
+public sealed class ProcessMemorySampler : IAsyncDisposable
 {
     private readonly TargetProcess _target;
     private readonly IProcessMemoryReader _processMemoryReader;
@@ -253,5 +339,18 @@ public sealed class ProcessMemorySampler
 
             await Task.Delay(_interval, cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// 释放采样器拥有的可释放托管堆读取器。
+    /// </summary>
+    public ValueTask DisposeAsync()
+    {
+        if (_managedHeapReader is IDisposable disposable)
+        {
+            disposable.Dispose();
+        }
+
+        return ValueTask.CompletedTask;
     }
 }

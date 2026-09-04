@@ -1,0 +1,50 @@
+using DotnetAnalysis.Core.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
+
+namespace DotnetAnalysis.Tests.Core.Diagnostics;
+
+[TestClass]
+[SuppressMessage("Naming", "CA1707:Identifiers should not contain underscores", Justification = "Test names describe behavior.")]
+public sealed class MemorySnapshotObjectPagingTests
+{
+    [TestMethod]
+    public void DetermineObjectAccessMode_UsesOneHundredThousandObjectBoundary()
+    {
+        Assert.AreEqual(
+            MemorySnapshotObjectAccessMode.Full,
+            MemorySnapshotAnalysis.DetermineObjectAccessMode(99_999));
+        Assert.AreEqual(
+            MemorySnapshotObjectAccessMode.Paged,
+            MemorySnapshotAnalysis.DetermineObjectAccessMode(100_000));
+    }
+
+    [TestMethod]
+    public void ObjectPage_ReportsRangeAndFollowingPage()
+    {
+        var type = new TypeIdentity("Sample.Type", "Sample");
+        var page = new MemoryObjectPage(
+            [new MemoryObjectInfo(1, type, 16), new MemoryObjectInfo(2, type, 16)],
+            totalObjectCount: 5,
+            offset: 2,
+            pageSize: 2);
+
+        Assert.AreEqual(5L, page.TotalObjectCount);
+        Assert.AreEqual(2, page.Offset);
+        Assert.AreEqual(2, page.PageSize);
+        Assert.IsTrue(page.HasNextPage);
+        Assert.HasCount(2, page.Objects);
+    }
+
+    [TestMethod]
+    public void ObjectPage_RejectsInvalidRange()
+    {
+        var type = new TypeIdentity("Sample.Type", "Sample");
+
+        _ = Assert.ThrowsExactly<ArgumentOutOfRangeException>(
+            () => new MemoryObjectPage([], 0, -1, 1));
+        _ = Assert.ThrowsExactly<ArgumentOutOfRangeException>(
+            () => new MemoryObjectPage([], 0, 0, 0));
+        _ = Assert.ThrowsExactly<ArgumentOutOfRangeException>(
+            () => new MemoryObjectPage([], 0, 0, 1001));
+    }
+}

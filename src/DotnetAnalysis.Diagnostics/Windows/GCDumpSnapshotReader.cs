@@ -23,21 +23,18 @@ public sealed class GCDumpSnapshotReader : IMemorySnapshotReader
     public Task<IReadOnlyList<MemoryTypeSummary>> ReadTypeSummariesAsync(string filePath, CancellationToken cancellationToken)
     {
         Validate(filePath, cancellationToken);
-        return Task.Run(() => ReadHeap(filePath, cancellationToken).TypeSummaries, cancellationToken);
+        return ReadTypeSummariesCoreAsync(filePath, cancellationToken);
     }
 
     /// <summary>
-    /// 异步读取指定类型的对象列表。
+    /// 异步读取指定类型的全部对象；大型快照应改用分页分析服务。
     /// </summary>
+    /// <exception cref="DiagnosticsException">对象数达到 100,000 时，以 <see cref="DiagnosticsErrorCode.SnapshotTooLargeForFullEnumeration"/> 引发。</exception>
     public Task<IReadOnlyList<MemoryObjectInfo>> ReadObjectsAsync(string filePath, TypeIdentity type, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(type);
         Validate(filePath, cancellationToken);
-        return Task.Run<IReadOnlyList<MemoryObjectInfo>>(
-            () => ReadHeap(filePath, cancellationToken).Objects
-                .Where(candidate => candidate.Type == type)
-                .ToArray(),
-            cancellationToken);
+        return ReadObjectsCoreAsync(filePath, type, cancellationToken);
     }
 
     /// <summary>
@@ -46,13 +43,7 @@ public sealed class GCDumpSnapshotReader : IMemorySnapshotReader
     public Task<MemoryReferencePath?> ReadReferencePathAsync(string filePath, ulong objectAddress, CancellationToken cancellationToken)
     {
         Validate(filePath, cancellationToken);
-        return Task.Run(
-            () =>
-            {
-                var heap = ReadHeap(filePath, cancellationToken);
-                return BuildReferencePath(heap, objectAddress);
-            },
-            cancellationToken);
+        return ReadReferencePathCoreAsync(filePath, objectAddress, cancellationToken);
     }
 
     /// <summary>
@@ -84,68 +75,13 @@ public sealed class GCDumpSnapshotReader : IMemorySnapshotReader
             return serializedHeap;
         }
 
-        var typeNames = new Dictionary<ulong, TypeIdentity>();
-        var nodes = new List<NodeData>();
-        var edgeTargets = new List<ulong>();
-        var roots = new List<ulong>();
-        var objects = new List<MemoryObjectInfo>();
-        var aggregate = new Dictionary<TypeIdentity, (long Count, long Size)>();
-        var sawHeapEvent = false;
-
         try
         {
             using var source = new EventPipeEventSource(filePath);
-            source.Clr.TypeBulkType += data =>
-            {
-                for (var index = 0; index < data.Count; index++)
-                {
-                    var value = data.Values(index);
-                    var name = string.IsNullOrWhiteSpace(value.TypeName)
-                        ? $"Type(0x{value.TypeNameID:x})"
-                        : value.TypeName;
-                    typeNames[value.TypeID] = new TypeIdentity(name, null);
-                }
-            };
-            source.Clr.GCBulkNode += data =>
-            {
-                for (var index = 0; index < data.Count; index++)
-                {
-                    var value = data.Values(index);
-                    if (value.Size > long.MaxValue)
-                    {
-                        continue;
-                    }
-
-                    sawHeapEvent = true;
-                    var type = typeNames.TryGetValue(value.TypeID, out var knownType)
-                        ? knownType
-                        : new TypeIdentity($"Type(0x{value.TypeID:x})", null);
-                    var objectInfo = new MemoryObjectInfo(value.Address, type, (long)value.Size);
-                    nodes.Add(new NodeData(objectInfo, value.EdgeCount));
-                    objects.Add(objectInfo);
-                    aggregate.TryGetValue(type, out var current);
-                    aggregate[type] = (current.Count + 1, checked(current.Size + objectInfo.SizeBytes));
-                }
-            };
-            source.Clr.GCBulkEdge += data =>
-            {
-                for (var index = 0; index < data.Count; index++)
-                {
-                    edgeTargets.Add(data.Values(index).Target);
-                }
-            };
-            source.Clr.GCBulkRootEdge += data =>
-            {
-                for (var index = 0; index < data.Count; index++)
-                {
-                    var address = data.Values(index).RootedNodeAddress;
-                    if (address != 0)
-                    {
-                        roots.Add(address);
-                    }
-                }
-            };
+            var builder = new EventPipeHeapBuilder();
+            builder.Attach(source);
             source.Process();
+            return builder.Build();
         }
         catch (Exception exception) when (
             exception is InvalidOperationException
@@ -159,23 +95,6 @@ public sealed class GCDumpSnapshotReader : IMemorySnapshotReader
                 exception);
         }
 
-        if (!sawHeapEvent)
-        {
-            throw new DiagnosticsException(
-                DiagnosticsErrorCode.CaptureFailed,
-                "The gcdump did not contain heap object events.");
-        }
-
-        var summaries = aggregate
-            .Select(entry => new MemoryTypeSummary(entry.Key, entry.Value.Count, entry.Value.Size))
-            .OrderByDescending(summary => summary.TotalSizeBytes)
-            .ThenBy(summary => summary.Type.TypeName, StringComparer.Ordinal)
-            .ToArray();
-        return new HeapData(
-            new ReadOnlyCollection<MemoryTypeSummary>(summaries),
-            new ReadOnlyCollection<MemoryObjectInfo>(objects),
-            BuildEdges(nodes, edgeTargets),
-            roots.Distinct().ToArray());
     }
 
     /// <summary>
@@ -185,6 +104,38 @@ public sealed class GCDumpSnapshotReader : IMemorySnapshotReader
         string filePath,
         CancellationToken cancellationToken) =>
         ReadHeap(filePath, cancellationToken);
+
+    /// <summary>
+    /// 读取供同一快照查询复用的紧凑索引。
+    /// </summary>
+    internal static Task<SnapshotIndex> ReadIndexAsync(string filePath) =>
+        Task.Run(() => SnapshotIndex.FromHeap(ReadHeap(filePath, CancellationToken.None)), CancellationToken.None);
+
+    private static async Task<IReadOnlyList<MemoryTypeSummary>> ReadTypeSummariesCoreAsync(
+        string filePath,
+        CancellationToken cancellationToken)
+    {
+        var index = await ReadIndexAsync(filePath).WaitAsync(cancellationToken).ConfigureAwait(false);
+        return index.TypeSummaries;
+    }
+
+    private static async Task<IReadOnlyList<MemoryObjectInfo>> ReadObjectsCoreAsync(
+        string filePath,
+        TypeIdentity type,
+        CancellationToken cancellationToken)
+    {
+        var index = await ReadIndexAsync(filePath).WaitAsync(cancellationToken).ConfigureAwait(false);
+        return index.GetObjects(type);
+    }
+
+    private static async Task<MemoryReferencePath?> ReadReferencePathCoreAsync(
+        string filePath,
+        ulong objectAddress,
+        CancellationToken cancellationToken)
+    {
+        var index = await ReadIndexAsync(filePath).WaitAsync(cancellationToken).ConfigureAwait(false);
+        return index.GetReferencePath(objectAddress);
+    }
 
     /// <summary>
     /// 尝试读取本项目写出的 FastSerialization .gcdump 格式。

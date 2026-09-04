@@ -54,6 +54,17 @@ public sealed class IntegrationTestHost : IAsyncDisposable
 
     public static async Task<IntegrationTestHost> StartTargetAsync(string targetFramework)
     {
+        return await StartTargetAsync(targetFramework, null).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 启动指定运行时版本的受控目标进程，并可在启动前保留指定数量的对象。
+    /// </summary>
+    /// <param name="targetFramework">目标进程要使用的目标框架。</param>
+    /// <param name="initialObjectCount">启动时要保留的字节数组数量；空值表示默认小堆。</param>
+    /// <returns>已输出 READY 的受控目标宿主。</returns>
+    public static async Task<IntegrationTestHost> StartTargetAsync(string targetFramework, int? initialObjectCount)
+    {
         var targetExecutable = ResolveTargetExecutablePath(targetFramework);
         var psi = new ProcessStartInfo(targetExecutable)
         {
@@ -63,6 +74,12 @@ public sealed class IntegrationTestHost : IAsyncDisposable
             UseShellExecute = false,
             CreateNoWindow = true
         };
+        if (initialObjectCount is { } count)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(count);
+            psi.Environment["DOTNET_ANALYSIS_TEST_OBJECT_COUNT"] = count.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+
         var process = Process.Start(psi) ?? throw new InvalidOperationException("Could not start target process.");
         var ready = await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(15));
         if (!string.Equals(ready, "READY", StringComparison.Ordinal))

@@ -120,14 +120,37 @@ public sealed class MemorySnapshotOperation
     }
 
     /// <summary>
-    /// 读取指定类型的对象列表。
+    /// 读取指定类型的全部对象；大型快照应改用 <see cref="GetObjectsPageAsync"/>。
     /// </summary>
+    /// <param name="type">要读取的对象类型。</param>
+    /// <param name="cancellationToken">取消当前等待或投影操作的令牌。</param>
+    /// <returns>指定类型的全部对象实例。</returns>
+    /// <exception cref="DiagnosticsException">快照对象数达到 100,000 时，以 <see cref="DiagnosticsErrorCode.SnapshotTooLargeForFullEnumeration"/> 引发。</exception>
     public Task<IReadOnlyList<MemoryObjectInfo>> GetObjectsAsync(
         TypeIdentity type,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(type);
         return _analysisService.GetObjectsAsync(Snapshot, type, cancellationToken);
+    }
+
+    /// <summary>
+    /// 按页读取指定类型的对象实例。
+    /// </summary>
+    /// <param name="type">要读取的对象类型。</param>
+    /// <param name="offset">相对于该类型对象列表的零基偏移量。</param>
+    /// <param name="pageSize">每页对象数，范围为 1 至 1000。</param>
+    /// <param name="cancellationToken">取消当前等待或投影操作的令牌。</param>
+    /// <returns>包含对象、总数和后续页信息的分页结果。</returns>
+    /// <exception cref="ArgumentOutOfRangeException">偏移量或页大小不在有效范围时引发。</exception>
+    public Task<MemoryObjectPage> GetObjectsPageAsync(
+        TypeIdentity type,
+        int offset,
+        int pageSize,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(type);
+        return _analysisService.GetObjectsPageAsync(Snapshot, type, offset, pageSize, cancellationToken);
     }
 
     /// <summary>

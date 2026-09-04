@@ -11,6 +11,7 @@ internal sealed class DiagnosticsMemorySnapshotAnalysisService : IMemorySnapshot
     private readonly ImportedSnapshotCatalog _catalog;
     private readonly MemorySnapshotStore _store;
     private readonly MemorySnapshotReaderRegistry _registry;
+    private readonly SnapshotIndexCache _indexCache = new();
 
     /// <summary>
     /// 创建连接快照目录、持久化存储和格式读取器的分析服务。
@@ -33,8 +34,7 @@ internal sealed class DiagnosticsMemorySnapshotAnalysisService : IMemorySnapshot
         ArgumentNullException.ThrowIfNull(snapshot);
         var path = await ResolvePathAsync(snapshot.Id, cancellationToken).ConfigureAwait(false);
 
-        var reader = _registry.Resolve(path);
-        var types = await reader.ReadTypeSummariesAsync(path, cancellationToken).ConfigureAwait(false);
+        var index = await GetIndexAsync(snapshot, path, cancellationToken).ConfigureAwait(false);
         var endedAtUtc = snapshot.CapturedAtUtc ?? snapshot.RequestedAtUtc;
         if (endedAtUtc < snapshot.RequestedAtUtc)
         {
@@ -55,8 +55,9 @@ internal sealed class DiagnosticsMemorySnapshotAnalysisService : IMemorySnapshot
             snapshot.State == MemorySnapshotState.Analyzing
                 ? snapshot.MoveTo(MemorySnapshotState.Ready)
                 : snapshot,
-            types,
-            allocationProfile);
+            index.TypeSummaries,
+            allocationProfile,
+            index.ObjectAccessMode);
     }
 
     /// <summary>
@@ -65,6 +66,27 @@ internal sealed class DiagnosticsMemorySnapshotAnalysisService : IMemorySnapshot
     public Task<IReadOnlyList<MemoryObjectInfo>> GetObjectsAsync(MemorySnapshot snapshot, TypeIdentity type, CancellationToken cancellationToken)
     {
         return ReadObjectsCoreAsync(snapshot, type, cancellationToken);
+    }
+
+    /// <summary>
+    /// 按页读取指定类型的对象列表。
+    /// </summary>
+    public async Task<MemoryObjectPage> GetObjectsPageAsync(
+        MemorySnapshot snapshot,
+        TypeIdentity type,
+        int offset,
+        int pageSize,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        ArgumentNullException.ThrowIfNull(type);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        ArgumentOutOfRangeException.ThrowIfLessThan(pageSize, 1);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(pageSize, 1000);
+
+        var path = await ResolvePathAsync(snapshot.Id, cancellationToken).ConfigureAwait(false);
+        var index = await GetIndexAsync(snapshot, path, cancellationToken).ConfigureAwait(false);
+        return index.GetPage(type, offset, pageSize);
     }
 
     /// <summary>
@@ -98,8 +120,11 @@ internal sealed class DiagnosticsMemorySnapshotAnalysisService : IMemorySnapshot
         TypeIdentity type,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        ArgumentNullException.ThrowIfNull(type);
         var path = await ResolvePathAsync(snapshot.Id, cancellationToken).ConfigureAwait(false);
-        return await _registry.Resolve(path).ReadObjectsAsync(path, type, cancellationToken).ConfigureAwait(false);
+        var index = await GetIndexAsync(snapshot, path, cancellationToken).ConfigureAwait(false);
+        return index.GetObjects(type);
     }
 
     /// <summary>
@@ -110,7 +135,31 @@ internal sealed class DiagnosticsMemorySnapshotAnalysisService : IMemorySnapshot
         ulong objectAddress,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(snapshot);
         var path = await ResolvePathAsync(snapshot.Id, cancellationToken).ConfigureAwait(false);
-        return await _registry.Resolve(path).ReadReferencePathAsync(path, objectAddress, cancellationToken).ConfigureAwait(false);
+        var index = await GetIndexAsync(snapshot, path, cancellationToken).ConfigureAwait(false);
+        return index.GetReferencePath(objectAddress);
+    }
+
+    /// <summary>
+    /// 使用当前快照的单飞缓存读取紧凑对象索引。
+    /// </summary>
+    private Task<SnapshotIndex> GetIndexAsync(
+        MemorySnapshot snapshot,
+        string path,
+        CancellationToken cancellationToken)
+    {
+        var reader = _registry.Resolve(path);
+        if (reader is not GCDumpSnapshotReader)
+        {
+            throw new DiagnosticsException(
+                DiagnosticsErrorCode.SnapshotFormatNotSupported,
+                "The snapshot reader does not support indexed object analysis.");
+        }
+
+        return _indexCache.GetAsync(
+            snapshot.Id,
+            () => GCDumpSnapshotReader.ReadIndexAsync(path),
+            cancellationToken);
     }
 }
