@@ -53,6 +53,17 @@ public sealed class CompositionTests
     }
 
     [TestMethod]
+    public async Task DiagnosticsRegistration_RequiresExplicitEventBusRegistration()
+    {
+        var services = new ServiceCollection();
+        services.AddWindowsProcessDiagnostics();
+        await using var provider = services.BuildServiceProvider(validateScopes: true);
+
+        Assert.Throws<InvalidOperationException>(
+            () => provider.GetRequiredService<IProcessDiagnostics>());
+    }
+
+    [TestMethod]
     public async Task ShellViewModel_WhenUiDispatchFails_IsolatesHandlerFailure()
     {
         await using var eventBus = new InProcessEventBus(NullLogger<InProcessEventBus>.Instance);

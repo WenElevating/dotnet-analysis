@@ -3,7 +3,6 @@ using DotnetAnalysis.Application.Events;
 using DotnetAnalysis.Diagnostics.Windows;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
-using Microsoft.Extensions.Logging.Abstractions;
 
 namespace DotnetAnalysis.Diagnostics.DependencyInjection;
 
@@ -21,8 +20,6 @@ public static class DiagnosticsServiceCollectionExtensions
     {
         ArgumentNullException.ThrowIfNull(services);
         services.TryAddSingleton<TimeProvider>(TimeProvider.System);
-        services.TryAddSingleton<IEventBus>(_ =>
-            new InProcessEventBus(NullLogger<InProcessEventBus>.Instance));
         services.AddSingleton<ProcessEnumerator>();
         services.AddSingleton<ProcessIdentityValidator>();
         services.AddSingleton<RuntimeCapabilitiesResolver>();

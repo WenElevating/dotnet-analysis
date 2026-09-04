@@ -4,10 +4,12 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using DotnetAnalysis.Application.Contracts.Diagnostics;
+using DotnetAnalysis.Application.Events;
 using DotnetAnalysis.Core.Diagnostics;
 using DotnetAnalysis.Diagnostics.DependencyInjection;
 using DotnetAnalysis.Diagnostics.Windows;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace DotnetAnalysis.Diagnostics.IntegrationTests;
 
@@ -34,6 +36,8 @@ public sealed class WindowsDiagnosticsIntegrationTests
     {
         await using var target = await IntegrationTestHost.StartTargetAsync(targetFramework);
         var services = new ServiceCollection();
+        services.AddSingleton<IEventBus>(_ =>
+            new InProcessEventBus(NullLogger<InProcessEventBus>.Instance));
         services.AddWindowsProcessDiagnostics();
         await using var provider = services.BuildServiceProvider(validateScopes: true);
         var diagnostics = provider.GetRequiredService<IProcessDiagnostics>();
@@ -101,6 +105,8 @@ public sealed class WindowsDiagnosticsIntegrationTests
             Guid.NewGuid().ToString("N"));
         var layout = new DotnetAnalysis.Diagnostics.Windows.SnapshotStorageLayout(snapshotRoot);
         var services = new ServiceCollection();
+        services.AddSingleton<IEventBus>(_ =>
+            new InProcessEventBus(NullLogger<InProcessEventBus>.Instance));
         services.AddSingleton(layout);
         services.AddWindowsProcessDiagnostics();
         await using var provider = services.BuildServiceProvider(validateScopes: true);
@@ -196,6 +202,8 @@ public sealed class WindowsDiagnosticsIntegrationTests
     {
         await using var target = await IntegrationTestHost.StartTargetAsync("net10.0");
         var services = new ServiceCollection();
+        services.AddSingleton<IEventBus>(_ =>
+            new InProcessEventBus(NullLogger<InProcessEventBus>.Instance));
         services.AddWindowsProcessDiagnostics();
         await using var provider = services.BuildServiceProvider(validateScopes: true);
         var diagnostics = provider.GetRequiredService<IProcessDiagnostics>();
