@@ -1,5 +1,8 @@
 using DotnetAnalysis.Application.Contracts.Diagnostics;
+using DotnetAnalysis.Application.Events;
 using DotnetAnalysis.Core.Diagnostics;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace DotnetAnalysis.Diagnostics.Windows;
 
@@ -15,11 +18,19 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
     private readonly ImportedSnapshotCatalog _importedSnapshots;
     private readonly SnapshotStorageLayout _snapshotLayout;
     private readonly MemorySnapshotStore _snapshotStore;
+    private readonly IEventBus _eventBus;
+    private readonly TimeProvider _timeProvider;
+    private readonly ILogger<ProcessDiagnosticsSession> _sessionLogger;
+
+    internal IEventBus EventBus => _eventBus;
 
     /// <summary>
     /// 创建 Windows 进程诊断门面及其身份、运行时、采样和存储依赖。
     /// </summary>
     public WindowsProcessDiagnostics(
+        IEventBus eventBus,
+        TimeProvider timeProvider,
+        ILogger<ProcessDiagnosticsSession>? sessionLogger = null,
         ProcessEnumerator? enumerator = null,
         ProcessIdentityValidator? identityValidator = null,
         RuntimeCapabilitiesResolver? capabilitiesResolver = null,
@@ -27,6 +38,9 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
         ImportedSnapshotCatalog? importedSnapshots = null,
         SnapshotStorageLayout? snapshotLayout = null)
     {
+        _eventBus = eventBus ?? throw new ArgumentNullException(nameof(eventBus));
+        _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
+        _sessionLogger = sessionLogger ?? NullLogger<ProcessDiagnosticsSession>.Instance;
         _enumerator = enumerator ?? new ProcessEnumerator();
         _identityValidator = identityValidator ?? new ProcessIdentityValidator();
         _capabilitiesResolver = capabilitiesResolver ?? new RuntimeCapabilitiesResolver();
@@ -86,8 +100,11 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
         return new ProcessDiagnosticsSession(
             process,
             sampler,
+            _eventBus,
+            _timeProvider,
+            _sessionLogger,
             capture: cancellationToken => CaptureSnapshotCoreAsync(process, allocationCollector, cancellationToken),
-            allocationCollector: allocationCollector);
+            ownedResource: allocationCollector);
     }
 
     /// <summary>

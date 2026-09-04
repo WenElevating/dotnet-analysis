@@ -2,6 +2,7 @@ using System.Diagnostics.CodeAnalysis;
 using DotnetAnalysis.Application.Contracts.Diagnostics;
 using DotnetAnalysis.Application.Events;
 using DotnetAnalysis.Diagnostics.DependencyInjection;
+using DotnetAnalysis.Diagnostics.Windows;
 using DotnetAnalysis.Desktop.Composition;
 using DotnetAnalysis.Desktop.Infrastructure;
 using DotnetAnalysis.Desktop.ViewModels;
@@ -41,7 +42,13 @@ public sealed class CompositionTests
         services.AddWindowsProcessDiagnostics();
         await using var provider = services.BuildServiceProvider(validateScopes: true);
 
-        Assert.IsNotNull(provider.GetRequiredService<IProcessDiagnostics>());
+        var eventBus = provider.GetRequiredService<IEventBus>();
+        var diagnostics = provider.GetRequiredService<IProcessDiagnostics>();
+
+        Assert.IsNotNull(diagnostics);
+        Assert.IsInstanceOfType<WindowsProcessDiagnostics>(diagnostics);
+        Assert.AreSame(eventBus, ((WindowsProcessDiagnostics)diagnostics).EventBus);
+        Assert.IsNotNull(provider.GetRequiredService<IMemorySnapshotAnalysisService>());
         Assert.IsNotNull(provider.GetRequiredService<ShellViewModel>());
     }
 

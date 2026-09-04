@@ -4,10 +4,10 @@ using DotnetAnalysis.Core.Diagnostics;
 using DotnetAnalysis.Core.Events;
 using Microsoft.Extensions.Logging;
 
-namespace DotnetAnalysis.Application.Snapshots;
+namespace DotnetAnalysis.Diagnostics.Windows;
 
 /// <summary>
-/// 协调快照分析、重试、状态转移及生命周期事件的应用服务。
+/// 协调 Windows 快照分析、重试、状态转移及生命周期事件的诊断操作。
 /// </summary>
 public sealed class MemorySnapshotOperation
 {

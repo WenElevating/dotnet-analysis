@@ -1,51 +1,50 @@
 using System.Collections;
-using System.Globalization;
 using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
 using DotnetAnalysis.Application.Contracts.Diagnostics;
 using DotnetAnalysis.Application.Events;
-using DotnetAnalysis.Application.Sessions;
 using DotnetAnalysis.Core.Diagnostics;
 using DotnetAnalysis.Core.Events;
+using DotnetAnalysis.Diagnostics.Windows;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
-namespace DotnetAnalysis.Tests.Application;
+namespace DotnetAnalysis.Tests.Diagnostics;
 
 [TestClass]
 [SuppressMessage("Naming", "CA1707:Identifiers should not contain underscores", Justification = "Test names describe behavior.")]
-public sealed class AttachedProcessSessionTests
+public sealed class ProcessDiagnosticsSessionTests
 {
     private readonly TargetProcess _process = new(4567, Utc("2026-09-02T08:00:00Z"), "target", null);
 
     [TestMethod]
     public async Task CaptureSnapshotAsync_RejectsConcurrentCapture()
     {
-        var captureGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var diagnosticSession = new ControlledDiagnosticsSession(_process) { CaptureGate = captureGate };
-        await using var session = CreateSession(diagnosticSession);
+        var capture = new ControlledCapture { CaptureGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously) };
+        await using var session = CreateSession(capture);
 
         var firstCapture = session.CaptureSnapshotAsync(CancellationToken.None);
-        await diagnosticSession.CaptureStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        await capture.Started.Task.WaitAsync(TimeSpan.FromSeconds(1));
 
         await Assert.ThrowsAsync<InvalidOperationException>(
             async () => await session.CaptureSnapshotAsync(CancellationToken.None));
 
-        captureGate.TrySetResult();
+        capture.CaptureGate.TrySetResult();
         var snapshot = await firstCapture.WaitAsync(TimeSpan.FromSeconds(1));
 
         Assert.AreEqual(MemorySnapshotState.Analyzing, snapshot.State);
         Assert.AreEqual(ProcessDiagnosticsSessionState.Monitoring, session.State);
-        Assert.AreEqual(1, diagnosticSession.CaptureCalls);
+        Assert.AreEqual(1, capture.Calls);
     }
 
     [TestMethod]
     public async Task CaptureSnapshotAsync_WhenCaptureIsCancelled_ClearsCaptureGateForRetry()
     {
-        var diagnosticSession = new ControlledDiagnosticsSession(_process)
+        var capture = new ControlledCapture
         {
-            CaptureException = new DiagnosticsException(DiagnosticsErrorCode.CaptureCancelled, "Capture cancelled.")
+            Failure = new DiagnosticsException(DiagnosticsErrorCode.CaptureCancelled, "Capture cancelled.")
         };
-        await using var session = CreateSession(diagnosticSession);
+        await using var session = CreateSession(capture);
 
         var exception = await Assert.ThrowsAsync<DiagnosticsException>(
             async () => await session.CaptureSnapshotAsync(CancellationToken.None));
@@ -53,47 +52,50 @@ public sealed class AttachedProcessSessionTests
         Assert.AreEqual(DiagnosticsErrorCode.CaptureCancelled, exception.ErrorCode);
         Assert.AreEqual(ProcessDiagnosticsSessionState.Monitoring, session.State);
 
-        diagnosticSession.CaptureException = null;
+        capture.Failure = null;
         var snapshot = await session.CaptureSnapshotAsync(CancellationToken.None);
 
         Assert.AreEqual(MemorySnapshotState.Analyzing, snapshot.State);
-        Assert.AreEqual(2, diagnosticSession.CaptureCalls);
+        Assert.AreEqual(2, capture.Calls);
     }
 
     [TestMethod]
-    public async Task EndAsync_CancelsInFlightCaptureAndDisposesInnerSessionOnce()
+    public async Task EndAsync_CancelsInFlightCaptureAndReleasesOwnedResourceOnce()
     {
-        var diagnosticSession = new ControlledDiagnosticsSession(_process)
-        {
-            WaitForCaptureCancellation = true
-        };
-        await using var session = CreateSession(diagnosticSession);
+        var capture = new ControlledCapture { WaitForCancellation = true };
+        var resource = new TrackingAsyncDisposable();
+        await using var session = CreateSession(capture, ownedResource: resource);
 
-        var capture = session.CaptureSnapshotAsync(CancellationToken.None);
-        await diagnosticSession.CaptureStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        var activeCapture = session.CaptureSnapshotAsync(CancellationToken.None);
+        await capture.Started.Task.WaitAsync(TimeSpan.FromSeconds(1));
 
         await session.EndAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(1));
         await session.DisposeAsync();
 
         var exception = await Assert.ThrowsAsync<DiagnosticsException>(
-            async () => await capture.WaitAsync(TimeSpan.FromSeconds(1)));
+            async () => await activeCapture.WaitAsync(TimeSpan.FromSeconds(1)));
 
         Assert.AreEqual(DiagnosticsErrorCode.CaptureCancelled, exception.ErrorCode);
         Assert.AreEqual(ProcessDiagnosticsSessionState.Ended, session.State);
-        Assert.AreEqual(1, diagnosticSession.DisposeCalls);
+        Assert.AreEqual(1, resource.DisposeCalls);
     }
 
     [TestMethod]
     public async Task GetMemoryUsageAsync_WhenSessionEndedSampleArrives_MovesToEnded()
     {
-        var diagnosticSession = new ControlledDiagnosticsSession(
-            _process,
-            new MemoryUsageSample(
-                Utc("2026-09-02T08:01:00Z"),
-                null,
-                null,
-                MemoryUsageSampleState.SessionEnded));
-        await using var session = CreateSession(diagnosticSession);
+        var endedProcess = new TargetProcess(int.MaxValue, Utc("2026-09-02T08:00:00Z"), "ended-target", null);
+        var sampler = new ProcessMemorySampler(
+            endedProcess,
+            new ProcessMemoryReader(),
+            new UnavailableManagedHeapReader(),
+            TimeProvider.System,
+            TimeSpan.Zero);
+        await using var session = new ProcessDiagnosticsSession(
+            endedProcess,
+            sampler,
+            new RecordingEventBus(),
+            TimeProvider.System,
+            NullLogger<ProcessDiagnosticsSession>.Instance);
 
         await foreach (var _ in session.GetMemoryUsageAsync(CancellationToken.None))
         {
@@ -106,12 +108,7 @@ public sealed class AttachedProcessSessionTests
     public async Task EndAsync_PublishesSessionLifecycleEvents()
     {
         var eventBus = new RecordingEventBus();
-        await using var session = new AttachedProcessSession(
-            ProcessDiagnosticsSessionId.New(),
-            new ControlledDiagnosticsSession(_process),
-            eventBus,
-            TimeProvider.System,
-            NullLogger<AttachedProcessSession>.Instance);
+        await using var session = CreateSession(new ControlledCapture(), eventBus);
 
         await session.EndAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(1));
 
@@ -135,12 +132,8 @@ public sealed class AttachedProcessSessionTests
     public async Task CaptureSnapshotAsync_WhenUnexpectedExceptionOccurs_LogsStructuredStageAndWrapsStableErrorCode()
     {
         var innerException = new InvalidOperationException("boom");
-        var diagnosticSession = new ControlledDiagnosticsSession(_process)
-        {
-            CaptureException = innerException
-        };
-        var logger = new RecordingLogger<AttachedProcessSession>();
-        await using var session = CreateSession(diagnosticSession, logger);
+        var logger = new RecordingLogger<ProcessDiagnosticsSession>();
+        await using var session = CreateSession(new ControlledCapture { Failure = innerException }, logger: logger);
 
         var exception = await Assert.ThrowsAsync<DiagnosticsException>(
             async () => await session.CaptureSnapshotAsync(CancellationToken.None));
@@ -169,15 +162,26 @@ public sealed class AttachedProcessSessionTests
         }
     }
 
-    private static AttachedProcessSession CreateSession(
-        ControlledDiagnosticsSession diagnosticSession,
-        ILogger<AttachedProcessSession>? logger = null)
+    private ProcessDiagnosticsSession CreateSession(
+        ControlledCapture capture,
+        IEventBus? eventBus = null,
+        IAsyncDisposable? ownedResource = null,
+        ILogger<ProcessDiagnosticsSession>? logger = null)
     {
-        return new AttachedProcessSession(
-            ProcessDiagnosticsSessionId.New(),
-            diagnosticSession,
+        var sampler = new ProcessMemorySampler(
+            _process,
+            new UnavailableProcessMemoryReader(),
+            new UnavailableManagedHeapReader(),
             TimeProvider.System,
-            logger ?? NullLogger<AttachedProcessSession>.Instance);
+            TimeSpan.Zero);
+        return new ProcessDiagnosticsSession(
+            _process,
+            sampler,
+            eventBus ?? new RecordingEventBus(),
+            TimeProvider.System,
+            logger ?? NullLogger<ProcessDiagnosticsSession>.Instance,
+            capture.CaptureAsync,
+            ownedResource);
     }
 
     private static MemorySnapshot Snapshot() =>
@@ -192,50 +196,26 @@ public sealed class AttachedProcessSessionTests
     private static DateTimeOffset Utc(string value) =>
         DateTimeOffset.Parse(value, CultureInfo.InvariantCulture);
 
-    private sealed class ControlledDiagnosticsSession(
-        TargetProcess process,
-        params MemoryUsageSample[] samples) : IProcessDiagnosticsSession
+    private sealed class ControlledCapture
     {
-        public ProcessDiagnosticsSessionId Id { get; } = ProcessDiagnosticsSessionId.New();
-
-        public TargetProcess Process { get; } = process;
-
-        public ProcessDiagnosticsSessionState State { get; private set; } = ProcessDiagnosticsSessionState.Monitoring;
-
-        public Task EndAsync(CancellationToken cancellationToken)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            State = ProcessDiagnosticsSessionState.Ended;
-            return Task.CompletedTask;
-        }
-
-        public TaskCompletionSource CaptureStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public TaskCompletionSource? CaptureGate { get; init; }
 
-        public Exception? CaptureException { get; set; }
+        public Exception? Failure { get; set; }
 
-        public int CaptureCalls { get; private set; }
+        public int Calls { get; private set; }
 
-        public int DisposeCalls { get; private set; }
+        public bool WaitForCancellation { get; init; }
 
-        public bool WaitForCaptureCancellation { get; init; }
-
-        public async Task<MemorySnapshot> CaptureSnapshotAsync(CancellationToken cancellationToken)
+        public async Task<MemorySnapshot> CaptureAsync(CancellationToken cancellationToken)
         {
-            CaptureCalls++;
-            CaptureStarted.TrySetResult();
+            Calls++;
+            Started.TrySetResult();
 
-            if (WaitForCaptureCancellation)
+            if (WaitForCancellation)
             {
-                try
-                {
-                    await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-                {
-                    throw new DiagnosticsException(DiagnosticsErrorCode.CaptureCancelled, "Capture cancelled.");
-                }
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(false);
             }
 
             if (CaptureGate is not null)
@@ -243,24 +223,23 @@ public sealed class AttachedProcessSessionTests
                 await CaptureGate.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            if (CaptureException is not null)
+            if (Failure is not null)
             {
-                throw CaptureException;
+                throw Failure;
             }
 
             return Snapshot();
         }
+    }
 
-        public async IAsyncEnumerable<MemoryUsageSample> GetMemoryUsageAsync(
-            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
-        {
-            foreach (var sample in samples)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                yield return sample;
-                await Task.Yield();
-            }
-        }
+    private sealed class UnavailableProcessMemoryReader : IProcessMemoryReader
+    {
+        public long? ReadPrivateWorkingSetBytes(int processId) => null;
+    }
+
+    private sealed class TrackingAsyncDisposable : IAsyncDisposable
+    {
+        public int DisposeCalls { get; private set; }
 
         public ValueTask DisposeAsync()
         {

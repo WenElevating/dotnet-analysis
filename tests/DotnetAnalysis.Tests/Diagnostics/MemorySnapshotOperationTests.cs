@@ -2,13 +2,13 @@ using System.Globalization;
 using System.Diagnostics.CodeAnalysis;
 using DotnetAnalysis.Application.Contracts.Diagnostics;
 using DotnetAnalysis.Application.Events;
-using DotnetAnalysis.Application.Snapshots;
 using DotnetAnalysis.Core.Diagnostics;
 using DotnetAnalysis.Core.Events;
+using DotnetAnalysis.Diagnostics.Windows;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
-namespace DotnetAnalysis.Tests.Application;
+namespace DotnetAnalysis.Tests.Diagnostics;
 
 [TestClass]
 [SuppressMessage("Naming", "CA1707:Identifiers should not contain underscores", Justification = "Test names describe behavior.")]

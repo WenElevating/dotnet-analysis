@@ -21,15 +21,18 @@
 
   <ItemGroup Condition="'$(CoreDiagnosticsOnly)' == 'true'">
     <Compile Remove="Application\**\*.cs" />
+    <Compile Remove="Diagnostics\**\*.cs" />
     <Compile Remove="Desktop\**\*.cs" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(ApplicationOnly)' == 'true'">
+    <Compile Remove="Diagnostics\**\*.cs" />
     <Compile Remove="Desktop\**\*.cs" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(Task2Only)' == 'true'">
     <Compile Remove="Application\InProcessEventBusTests.cs" />
+    <Compile Remove="Diagnostics\**\*.cs" />
     <Compile Remove="Desktop\**\*.cs" />
   </ItemGroup>
 
