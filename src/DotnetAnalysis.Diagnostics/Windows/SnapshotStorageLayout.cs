@@ -8,6 +8,14 @@ namespace DotnetAnalysis.Diagnostics.Windows;
 public sealed class SnapshotStorageLayout
 {
     /// <summary>
+    /// 获取由应用管理的本地数据快照目录。
+    /// </summary>
+    public static string GetDefaultRootDirectory() => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "DotnetAnalysis",
+        "Snapshots");
+
+    /// <summary>
     /// 创建并规范化快照根目录。
     /// </summary>
     /// <param name="rootDirectory">快照文件的根目录。</param>

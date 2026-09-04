@@ -26,7 +26,7 @@ public static class DiagnosticsServiceCollectionExtensions
         services.AddSingleton<IProcessMemoryReader, ProcessMemoryReader>();
         services.AddSingleton<ImportedSnapshotCatalog>();
         services.TryAddSingleton<SnapshotStorageLayout>(_ =>
-            new SnapshotStorageLayout(Path.Combine(Path.GetTempPath(), "DotnetAnalysis", "Snapshots")));
+            new SnapshotStorageLayout(SnapshotStorageLayout.GetDefaultRootDirectory()));
         services.AddSingleton<MemorySnapshotStore>();
         services.AddSingleton<IMemorySnapshotReader, GCDumpSnapshotReader>();
         services.AddSingleton<IMemorySnapshotReader, DumpSnapshotReader>();

@@ -49,7 +49,7 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
         _processMemoryReader = processMemoryReader ?? new ProcessMemoryReader();
         _importedSnapshots = importedSnapshots ?? new ImportedSnapshotCatalog();
         _snapshotLayout = snapshotLayout ?? new SnapshotStorageLayout(
-            Path.Combine(Path.GetTempPath(), "DotnetAnalysis", "Snapshots"));
+            SnapshotStorageLayout.GetDefaultRootDirectory());
         _snapshotStore = new MemorySnapshotStore(_snapshotLayout, _importedSnapshots);
         _snapshotCapture = new GCDumpMemorySnapshotCapture(
             _identityValidator,
@@ -90,7 +90,7 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
         await _identityValidator.ValidateAsync(process, cancellationToken).ConfigureAwait(false);
         await _capabilitiesResolver.ValidateAsync(process, cancellationToken).ConfigureAwait(false);
         var sampler = new ProcessMemorySampler(process, _processMemoryReader);
-        var allocationCollector = new AllocationSampleCollector(
+        var allocationCollector = new AllocationSamplingSession(
             new AllocationProfileBuilder(_timeProvider.GetUtcNow()));
         try
         {
@@ -120,7 +120,7 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
     /// <param name="filePath">现有 .gcdump 文件路径。</param>
     /// <param name="cancellationToken">打开前检查的取消令牌。</param>
     /// <returns>已登记到导入目录的快照描述。</returns>
-    public Task<MemorySnapshot> OpenSnapshotAsync(
+    public async Task<MemorySnapshot> OpenSnapshotAsync(
         string filePath,
         CancellationToken cancellationToken)
     {
@@ -141,6 +141,12 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
                 "The snapshot file does not exist.");
         }
 
+        var restored = await _snapshotStore.TryRestoreAsync(filePath, cancellationToken).ConfigureAwait(false);
+        if (restored is not null)
+        {
+            return restored.Snapshot;
+        }
+
         var lastWriteUtc = File.GetLastWriteTimeUtc(filePath);
         var snapshot = new MemorySnapshot(
             MemorySnapshotId.New(),
@@ -150,7 +156,7 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
             new DateTimeOffset(lastWriteUtc),
             MemorySnapshotState.Analyzing);
         _importedSnapshots.Register(snapshot.Id, filePath);
-        return Task.FromResult(snapshot);
+        return snapshot;
     }
 
 }

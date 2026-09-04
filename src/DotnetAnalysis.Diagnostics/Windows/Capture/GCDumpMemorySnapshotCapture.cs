@@ -32,7 +32,7 @@ internal sealed class GCDumpMemorySnapshotCapture : IMemorySnapshotCapture
     /// <inheritdoc />
     public async Task<MemorySnapshot> CaptureAsync(
         TargetProcess target,
-        AllocationSampleCollector allocationCollector,
+        AllocationSamplingSession allocationCollector,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(target);
@@ -49,19 +49,20 @@ internal sealed class GCDumpMemorySnapshotCapture : IMemorySnapshotCapture
             cancellationToken).ConfigureAwait(false);
 
         var allocationProfile = allocationCollector.Seal(capturedAtUtc);
-        await _snapshotStore.PromoteAsync(
-            snapshotId,
-            temporaryPath,
-            allocationProfile,
-            cancellationToken).ConfigureAwait(false);
-        allocationCollector.BeginNextInterval(capturedAtUtc);
-
-        return new MemorySnapshot(
+        var snapshot = new MemorySnapshot(
             snapshotId,
             MemorySnapshotOrigin.Captured,
             requestedAtUtc,
             captureStartedAtUtc,
             capturedAtUtc,
             MemorySnapshotState.Analyzing);
+        await _snapshotStore.PromoteAsync(
+            snapshot,
+            temporaryPath,
+            allocationProfile,
+            cancellationToken).ConfigureAwait(false);
+        allocationCollector.BeginNextInterval(capturedAtUtc);
+
+        return snapshot;
     }
 }

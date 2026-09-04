@@ -12,11 +12,13 @@ public sealed record AllocationProfile
     /// <param name="endedAtUtc">采样结束时间。</param>
     /// <param name="hotspots">聚合后的分配热点。</param>
     /// <param name="dataQuality">采样数据完整性。</param>
+    /// <param name="callStackQuality">采样调用栈的可用程度。</param>
     public AllocationProfile(
         DateTimeOffset startedAtUtc,
         DateTimeOffset endedAtUtc,
         IReadOnlyList<AllocationHotspot> hotspots,
-        AllocationProfileDataQuality dataQuality)
+        AllocationProfileDataQuality dataQuality,
+        AllocationCallStackQuality callStackQuality)
     {
         ArgumentNullException.ThrowIfNull(hotspots);
         if (endedAtUtc < startedAtUtc)
@@ -34,6 +36,7 @@ public sealed record AllocationProfile
         EndedAtUtc = endedAtUtc;
         Hotspots = hotspotSnapshot;
         DataQuality = dataQuality;
+        CallStackQuality = callStackQuality;
     }
 
     /// <summary>
@@ -57,11 +60,21 @@ public sealed record AllocationProfile
     public AllocationProfileDataQuality DataQuality { get; }
 
     /// <summary>
+    /// 采样调用栈的可用程度；与 <see cref="DataQuality"/> 的采样流连续性独立。
+    /// </summary>
+    public AllocationCallStackQuality CallStackQuality { get; }
+
+    /// <summary>
     /// 创建没有可用分配数据的概要。
     /// </summary>
     /// <param name="startedAtUtc">逻辑区间开始时间。</param>
     /// <param name="endedAtUtc">逻辑区间结束时间。</param>
     /// <returns>热点为空且质量为不可用的概要。</returns>
     public static AllocationProfile NotAvailable(DateTimeOffset startedAtUtc, DateTimeOffset endedAtUtc) =>
-        new(startedAtUtc, endedAtUtc, Array.Empty<AllocationHotspot>(), AllocationProfileDataQuality.NotAvailable);
+        new(
+            startedAtUtc,
+            endedAtUtc,
+            Array.Empty<AllocationHotspot>(),
+            AllocationProfileDataQuality.NotAvailable,
+            AllocationCallStackQuality.NotAvailable);
 }
