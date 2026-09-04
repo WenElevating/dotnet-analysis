@@ -6,6 +6,7 @@ using DotnetAnalysis.Application.Events;
 using DotnetAnalysis.Core.Diagnostics;
 using DotnetAnalysis.Core.Events;
 using DotnetAnalysis.Diagnostics.Windows;
+using DotnetAnalysis.Diagnostics.Windows.Capture;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -60,11 +61,12 @@ public sealed class ProcessDiagnosticsSessionTests
     }
 
     [TestMethod]
-    public async Task EndAsync_CancelsInFlightCaptureAndReleasesOwnedResourceOnce()
+    public async Task EndAsync_CancelsInFlightCaptureAndDisposesAllocationCollector()
     {
         var capture = new ControlledCapture { WaitForCancellation = true };
-        var resource = new TrackingAsyncDisposable();
-        await using var session = CreateSession(capture, ownedResource: resource);
+        var allocationCollector = new AllocationSampleCollector(
+            new AllocationProfileBuilder(Utc("2026-09-02T08:00:00Z")));
+        await using var session = CreateSession(capture, allocationCollector: allocationCollector);
 
         var activeCapture = session.CaptureSnapshotAsync(CancellationToken.None);
         await capture.Started.Task.WaitAsync(TimeSpan.FromSeconds(1));
@@ -77,7 +79,8 @@ public sealed class ProcessDiagnosticsSessionTests
 
         Assert.AreEqual(DiagnosticsErrorCode.CaptureCancelled, exception.ErrorCode);
         Assert.AreEqual(ProcessDiagnosticsSessionState.Ended, session.State);
-        Assert.AreEqual(1, resource.DisposeCalls);
+        await Assert.ThrowsAsync<ObjectDisposedException>(
+            async () => await allocationCollector.StartAsync(_process, CancellationToken.None));
     }
 
     [TestMethod]
@@ -90,9 +93,13 @@ public sealed class ProcessDiagnosticsSessionTests
             new UnavailableManagedHeapReader(),
             TimeProvider.System,
             TimeSpan.Zero);
+        var allocationCollector = new AllocationSampleCollector(
+            new AllocationProfileBuilder(Utc("2026-09-02T08:00:00Z")));
         await using var session = new ProcessDiagnosticsSession(
             endedProcess,
             sampler,
+            allocationCollector,
+            new ControlledCapture(),
             new RecordingEventBus(),
             TimeProvider.System,
             NullLogger<ProcessDiagnosticsSession>.Instance);
@@ -165,8 +172,8 @@ public sealed class ProcessDiagnosticsSessionTests
     private ProcessDiagnosticsSession CreateSession(
         ControlledCapture capture,
         IEventBus? eventBus = null,
-        IAsyncDisposable? ownedResource = null,
-        ILogger<ProcessDiagnosticsSession>? logger = null)
+        ILogger<ProcessDiagnosticsSession>? logger = null,
+        AllocationSampleCollector? allocationCollector = null)
     {
         var sampler = new ProcessMemorySampler(
             _process,
@@ -174,14 +181,16 @@ public sealed class ProcessDiagnosticsSessionTests
             new UnavailableManagedHeapReader(),
             TimeProvider.System,
             TimeSpan.Zero);
+        allocationCollector ??= new AllocationSampleCollector(
+            new AllocationProfileBuilder(Utc("2026-09-02T08:00:00Z")));
         return new ProcessDiagnosticsSession(
             _process,
             sampler,
+            allocationCollector,
+            capture,
             eventBus ?? new RecordingEventBus(),
             TimeProvider.System,
-            logger ?? NullLogger<ProcessDiagnosticsSession>.Instance,
-            capture.CaptureAsync,
-            ownedResource);
+            logger ?? NullLogger<ProcessDiagnosticsSession>.Instance);
     }
 
     private static MemorySnapshot Snapshot() =>
@@ -196,7 +205,7 @@ public sealed class ProcessDiagnosticsSessionTests
     private static DateTimeOffset Utc(string value) =>
         DateTimeOffset.Parse(value, CultureInfo.InvariantCulture);
 
-    private sealed class ControlledCapture
+    private sealed class ControlledCapture : IMemorySnapshotCapture
     {
         public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -208,7 +217,10 @@ public sealed class ProcessDiagnosticsSessionTests
 
         public bool WaitForCancellation { get; init; }
 
-        public async Task<MemorySnapshot> CaptureAsync(CancellationToken cancellationToken)
+        public async Task<MemorySnapshot> CaptureAsync(
+            TargetProcess target,
+            AllocationSampleCollector allocationCollector,
+            CancellationToken cancellationToken)
         {
             Calls++;
             Started.TrySetResult();
@@ -235,17 +247,6 @@ public sealed class ProcessDiagnosticsSessionTests
     private sealed class UnavailableProcessMemoryReader : IProcessMemoryReader
     {
         public long? ReadPrivateWorkingSetBytes(int processId) => null;
-    }
-
-    private sealed class TrackingAsyncDisposable : IAsyncDisposable
-    {
-        public int DisposeCalls { get; private set; }
-
-        public ValueTask DisposeAsync()
-        {
-            DisposeCalls++;
-            return ValueTask.CompletedTask;
-        }
     }
 
     private sealed class RecordingLogger<T> : ILogger<T>

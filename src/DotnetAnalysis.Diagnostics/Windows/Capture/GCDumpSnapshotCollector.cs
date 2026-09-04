@@ -5,13 +5,15 @@ using Microsoft.Diagnostics.Tracing;
 using Microsoft.Diagnostics.Tracing.Parsers;
 using System.Diagnostics.Tracing;
 
-namespace DotnetAnalysis.Diagnostics.Windows;
+using DotnetAnalysis.Diagnostics.Windows;
+
+namespace DotnetAnalysis.Diagnostics.Windows.Capture;
 
 /// <summary>
 /// 直接捕获运行时 GC 堆的 EventPipe 流，不依赖外部命令行收集器；
 /// 结果先按 .gcdump 约定保存，再由 <see cref="GCDumpSnapshotReader"/> 解析。
 /// </summary>
-public sealed class GCDumpSnapshotCollector
+internal static class GCDumpSnapshotCollector
 {
     private static readonly TimeSpan s_defaultTimeout = TimeSpan.FromSeconds(30);
 

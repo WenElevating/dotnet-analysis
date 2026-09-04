@@ -1,6 +1,7 @@
 using DotnetAnalysis.Application.Contracts.Diagnostics;
 using DotnetAnalysis.Application.Events;
 using DotnetAnalysis.Core.Diagnostics;
+using DotnetAnalysis.Diagnostics.Windows.Capture;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -18,6 +19,7 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
     private readonly ImportedSnapshotCatalog _importedSnapshots;
     private readonly SnapshotStorageLayout _snapshotLayout;
     private readonly MemorySnapshotStore _snapshotStore;
+    private readonly IMemorySnapshotCapture _snapshotCapture;
     private readonly IEventBus _eventBus;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<ProcessDiagnosticsSession> _sessionLogger;
@@ -49,6 +51,11 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
         _snapshotLayout = snapshotLayout ?? new SnapshotStorageLayout(
             Path.Combine(Path.GetTempPath(), "DotnetAnalysis", "Snapshots"));
         _snapshotStore = new MemorySnapshotStore(_snapshotLayout, _importedSnapshots);
+        _snapshotCapture = new GCDumpMemorySnapshotCapture(
+            _identityValidator,
+            _snapshotLayout,
+            _snapshotStore,
+            _timeProvider);
     }
 
     /// <summary>
@@ -84,7 +91,7 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
         await _capabilitiesResolver.ValidateAsync(process, cancellationToken).ConfigureAwait(false);
         var sampler = new ProcessMemorySampler(process, _processMemoryReader);
         var allocationCollector = new AllocationSampleCollector(
-            new AllocationProfileBuilder(DateTimeOffset.UtcNow));
+            new AllocationProfileBuilder(_timeProvider.GetUtcNow()));
         try
         {
             await allocationCollector.StartAsync(process, cancellationToken).ConfigureAwait(false);
@@ -100,45 +107,11 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
         return new ProcessDiagnosticsSession(
             process,
             sampler,
+            allocationCollector,
+            _snapshotCapture,
             _eventBus,
             _timeProvider,
-            _sessionLogger,
-            capture: cancellationToken => CaptureSnapshotCoreAsync(process, allocationCollector, cancellationToken),
-            ownedResource: allocationCollector);
-    }
-
-    /// <summary>
-    /// 执行快照捕获、分配概要封存和持久化提升。
-    /// </summary>
-    private async Task<MemorySnapshot> CaptureSnapshotCoreAsync(
-        TargetProcess target,
-        AllocationSampleCollector allocationCollector,
-        CancellationToken cancellationToken)
-    {
-        await _identityValidator.ValidateAsync(target, cancellationToken).ConfigureAwait(false);
-        var snapshotId = MemorySnapshotId.New();
-        var requestedAtUtc = DateTimeOffset.UtcNow;
-        var captureStartedAtUtc = DateTimeOffset.UtcNow;
-        var (temporaryPath, capturedAtUtc) = await GCDumpSnapshotCollector.CaptureAsync(
-            target,
-            _snapshotLayout,
-            cancellationToken).ConfigureAwait(false);
-
-        var allocationProfile = allocationCollector.Seal(capturedAtUtc);
-        await _snapshotStore.PromoteAsync(
-            snapshotId,
-            temporaryPath,
-            allocationProfile,
-            cancellationToken).ConfigureAwait(false);
-        allocationCollector.BeginNextInterval(capturedAtUtc);
-
-        return new MemorySnapshot(
-            snapshotId,
-            MemorySnapshotOrigin.Captured,
-            requestedAtUtc,
-            captureStartedAtUtc,
-            capturedAtUtc,
-            MemorySnapshotState.Analyzing);
+            _sessionLogger);
     }
 
     /// <summary>

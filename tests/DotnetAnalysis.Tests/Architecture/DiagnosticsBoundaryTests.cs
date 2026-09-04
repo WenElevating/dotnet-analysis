@@ -81,6 +81,38 @@ public sealed class DiagnosticsBoundaryTests
         CollectionAssert.AreEqual(Array.Empty<string>(), matches);
     }
 
+    [TestMethod]
+    public void DiagnosticsCaptureResponsibilities_AreSeparatedIntoTheCaptureLayer()
+    {
+        var sourceRoot = GetSourceRoot();
+        var diagnosticsRoot = Path.Combine(sourceRoot, "DotnetAnalysis.Diagnostics", "Windows");
+        var sessionSource = File.ReadAllText(Path.Combine(diagnosticsRoot, "ProcessDiagnosticsSession.cs"));
+        var diagnosticsSource = File.ReadAllText(Path.Combine(diagnosticsRoot, "WindowsProcessDiagnostics.cs"));
+        var captureRoot = Path.Combine(diagnosticsRoot, "Capture");
+        var captureSourcePath = Path.Combine(captureRoot, "GCDumpMemorySnapshotCapture.cs");
+
+        Assert.IsFalse(sessionSource.Contains(
+            "Func<CancellationToken, Task<MemorySnapshot>>",
+            StringComparison.Ordinal));
+        Assert.IsFalse(sessionSource.Contains("IAsyncDisposable ownedResource", StringComparison.Ordinal));
+        Assert.IsFalse(sessionSource.Contains("_ownedResource", StringComparison.Ordinal));
+        StringAssert.Contains(sessionSource, "IMemorySnapshotCapture");
+
+        Assert.IsFalse(diagnosticsSource.Contains("CaptureSnapshotCoreAsync", StringComparison.Ordinal));
+        Assert.IsFalse(diagnosticsSource.Contains("GCDumpSnapshotCollector", StringComparison.Ordinal));
+        Assert.IsFalse(diagnosticsSource.Contains("PromoteAsync", StringComparison.Ordinal));
+        StringAssert.Contains(diagnosticsSource, "IMemorySnapshotCapture _snapshotCapture");
+
+        Assert.IsTrue(File.Exists(Path.Combine(captureRoot, "IMemorySnapshotCapture.cs")));
+        Assert.IsTrue(File.Exists(captureSourcePath));
+
+        var captureSource = File.ReadAllText(captureSourcePath);
+        StringAssert.Contains(captureSource, "GCDumpSnapshotCollector.CaptureAsync");
+        StringAssert.Contains(captureSource, "_snapshotStore.PromoteAsync");
+        StringAssert.Contains(captureSource, "allocationCollector.Seal");
+        StringAssert.Contains(captureSource, "allocationCollector.BeginNextInterval");
+    }
+
     private static string GetSourceRoot() => Path.GetFullPath(Path.Combine(
         AppContext.BaseDirectory,
         "..", "..", "..", "..", "..", "src"));

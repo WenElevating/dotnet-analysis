@@ -3,6 +3,7 @@ using DotnetAnalysis.Application.Contracts.Diagnostics;
 using DotnetAnalysis.Application.Events;
 using DotnetAnalysis.Core.Diagnostics;
 using DotnetAnalysis.Core.Events;
+using DotnetAnalysis.Diagnostics.Windows.Capture;
 using Microsoft.Extensions.Logging;
 
 namespace DotnetAnalysis.Diagnostics.Windows;
@@ -28,8 +29,8 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
 
     private readonly object _syncRoot = new();
     private readonly ProcessMemorySampler _sampler;
-    private readonly Func<CancellationToken, Task<MemorySnapshot>> _capture;
-    private readonly IAsyncDisposable? _ownedResource;
+    private readonly AllocationSampleCollector _allocationCollector;
+    private readonly IMemorySnapshotCapture _capture;
     private readonly IEventBus _eventBus;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<ProcessDiagnosticsSession> _logger;
@@ -37,7 +38,6 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
     private Task<MemorySnapshot>? _captureTask;
     private CancellationTokenSource? _captureCancellation;
     private Task? _endTask;
-    private bool _disposedOwnedResource;
 
     /// <summary>
     /// 创建绑定目标进程、采样器和运行期资源的唯一诊断会话。
@@ -47,26 +47,24 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
     /// <param name="eventBus">发布共享诊断生命周期事件的事件总线。</param>
     /// <param name="timeProvider">事件时间来源。</param>
     /// <param name="logger">记录失败和事件投递问题的日志记录器。</param>
-    /// <param name="capture">异步捕获快照的委托；省略时表示当前适配器不支持实时捕获。</param>
-    /// <param name="ownedResource">会话结束时只释放一次的运行期资源，例如分配采样收集器。</param>
-    public ProcessDiagnosticsSession(
+    /// <param name="allocationCollector">为捕获封存分配概要的会话级收集器。</param>
+    /// <param name="capture">执行底层快照捕获的内部实现。</param>
+    internal ProcessDiagnosticsSession(
         TargetProcess process,
         ProcessMemorySampler sampler,
+        AllocationSampleCollector allocationCollector,
+        IMemorySnapshotCapture capture,
         IEventBus eventBus,
         TimeProvider timeProvider,
-        ILogger<ProcessDiagnosticsSession> logger,
-        Func<CancellationToken, Task<MemorySnapshot>>? capture = null,
-        IAsyncDisposable? ownedResource = null)
+        ILogger<ProcessDiagnosticsSession> logger)
     {
         Process = process ?? throw new ArgumentNullException(nameof(process));
         _sampler = sampler ?? throw new ArgumentNullException(nameof(sampler));
+        _allocationCollector = allocationCollector ?? throw new ArgumentNullException(nameof(allocationCollector));
+        _capture = capture ?? throw new ArgumentNullException(nameof(capture));
         _eventBus = eventBus ?? throw new ArgumentNullException(nameof(eventBus));
         _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-        _capture = capture ?? (_ => Task.FromException<MemorySnapshot>(new DiagnosticsException(
-            DiagnosticsErrorCode.RuntimeNotSupported,
-            "Live snapshot capture is not available on this adapter.")));
-        _ownedResource = ownedResource;
         State = ProcessDiagnosticsSessionState.Monitoring;
         _ = PublishEventAsync(new ProcessDiagnosticsSessionStateChanged(
             Id,
@@ -178,7 +176,9 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
 
         try
         {
-            var snapshot = await _capture(captureCancellation.Token).ConfigureAwait(false);
+            var snapshot = await _capture
+                .CaptureAsync(Process, _allocationCollector, captureCancellation.Token)
+                .ConfigureAwait(false);
             _ = PublishEventAsync(new MemorySnapshotCaptured(
                 Id,
                 snapshot.Id,
@@ -280,7 +280,7 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
             }
         }
 
-        await DisposeOwnedResourceOnceAsync().ConfigureAwait(false);
+        await DisposeAllocationCollectorAsync().ConfigureAwait(false);
 
         lock (_syncRoot)
         {
@@ -297,26 +297,11 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
     }
 
     /// <summary>
-    /// 确保会话拥有的运行期资源只异步释放一次。
+    /// 释放为会话捕获操作提供分配概要的收集器。
     /// </summary>
-    private async ValueTask DisposeOwnedResourceOnceAsync()
+    private async ValueTask DisposeAllocationCollectorAsync()
     {
-        if (_ownedResource is null)
-        {
-            return;
-        }
-
-        lock (_syncRoot)
-        {
-            if (_disposedOwnedResource)
-            {
-                return;
-            }
-
-            _disposedOwnedResource = true;
-        }
-
-        await _ownedResource.DisposeAsync().ConfigureAwait(false);
+        await _allocationCollector.DisposeAsync().ConfigureAwait(false);
     }
 
     /// <summary>
