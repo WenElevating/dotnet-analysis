@@ -135,6 +135,25 @@ GetExecutionProfileAsync(range)
 - 诊断层临时会话存储路径不穿过 Application 契约，也不作为用户文件展示。
 - `EndAsync` 或 `DisposeAsync` 在排空已到达的事件、结束在途查询后删除会话存储和索引。
 
+### 5.1 性能、内存、CPU 与耗时硬门槛
+
+下表是交付门槛，不是预先宣称已经达到的性能结论。全部测量必须使用受控目标、固定运行时、记录机器规格和原始 JSON 结果；任一门槛不满足即不能把执行采样能力标记为完成。
+
+基准负载为：Windows x64 .NET 10 受控目标启动 8 个持续 CPU 工作线程，循环经过至少 200 条不同托管调用栈；采样频率使用运行时 Sample Profiler 默认频率。每次测量先预热 30 秒，再记录数据。
+
+| 维度 | 硬门槛 | 测量方式 |
+| --- | --- | --- |
+| 目标进程 CPU 开销 | 与不附着执行采样的同负载基线相比，120 秒完成工作量下降不得超过 5%。 | 同一机器、同一目标、三轮基线和三轮采样运行，比较中位数完成量。 |
+| 诊断进程 CPU | 60 分钟稳定采样期间，诊断进程用于执行采样的平均 CPU 时间不得超过 0.05 个逻辑核。 | `TotalProcessorTime` 增量除以墙钟时间；采样、查询和快照分别记录。 |
+| 诊断进程内存 | 60 分钟会话结束前，诊断进程相对执行采样启动后基线的峰值私有内存增量不得超过 128 MiB。 | 记录进程私有内存峰值；会话数据必须写入私有压缩存储，不能以无界托管集合保存样本。 |
+| 会话存储增长 | 60 分钟基准会话的私有采样存储不得超过 128 MiB。 | 记录所有段、帧表、栈表和索引文件总大小。 |
+| 全会话查询耗时 | 对完整 60 分钟范围构建热点和调用树，连续 10 次查询的 P95 不得超过 2 秒。 | 只测已写入数据的读取、聚合与符号缓存命中路径；单独记录冷符号解析。 |
+| 查询临时分配 | 完整 60 分钟查询的每次托管分配不得超过 64 MiB，且连续查询后私有内存不得阶梯式增长。 | 使用分配计数和进程私有内存双重记录。 |
+| 并发查询 | 8 个并发随机时间范围查询、其中 2 个取消时，其余查询必须返回正确结果；采样不得中断。 | 校验样本总数、调用树计数、取消语义和写入连续性。 |
+| 快照并发 | 连续执行 3 次 `.gcdump` 捕获期间，执行采样器不得停止；捕获前后均必须有持续样本。 | 验证采样时间连续、会话未失败，并记录 `LostEventCount`。 |
+
+`LostEventCount` 必须始终写入基准和压力测试结果。受控负载下出现非零丢失事件即为失败；在不受控真实目标上它是诊断事实，不得被清零、隐藏或解释成完整采样。
+
 ## 6. 符号与源码定位
 
 `ExecutionSymbolResolver` 是 Diagnostics 内部组件。它在查询阶段为去重帧做按需解析，并对同一帧采用单飞加载，避免多个并发查询重复访问同一 PDB。
@@ -174,16 +193,31 @@ GetExecutionProfileAsync(range)
 4. PDB 或源码缺失时，调用树和热点仍正确，`SourceLocation` 为 `null`。
 5. 执行采样与现有内存时间线、分配采样和 `.gcdump` 捕获并发运行时，不相互中断。
 
-正式测试至少包括：
+### 9.1 单元、集成、性能和压力测试
 
-- Core 模型的时间范围、半开边界、不可变性和参数验证。
-- 帧/栈去重、跨段完整读取、热点排序、调用树包含与独占样本计数。
-- 全会话长时记录、高对象/高采样负载下的存储与查询分配基准。
-- 并发查询、单查询取消、结束时排空、清理和重复释放。
-- EventPipe 启动失败、事件丢失、存储失败和范围越界的稳定错误码。
-- 真实 Windows .NET 8/9/10 目标的附着、调用树、源码定位、无源码降级，以及与快照并发的集成测试。
+测试分层必须独立执行，不能以“能编译”或少量集成测试替代性能与稳定性证据。
 
-因为这是新增的 Diagnostics 公开接口，性能和压力测试必须覆盖正常、边界、并发、取消和失败负载。百万对象快照基准仍按既有门禁显式启用；执行采样应增加独立的长会话压力基准，不能用小型单元测试替代。
+| 层级 | 必测内容 | 默认执行 |
+| --- | --- | --- |
+| 单元测试 | 时间范围半开边界、模型不可变性、参数验证、帧/栈去重、跨段完整读取、热点排序、调用树包含/独占计数、空样本语义、单飞符号解析、查询取消、结束排空、清理与重复释放。 | 是 |
+| 契约与故障测试 | `ExecutionProfilingUnavailable`、`ExecutionProfileRangeUnavailable`、`ExecutionProfileStorageFailed`、目标退出、EventPipe 事件丢失和 I/O 失败；断言既有时间线与快照不因执行采样失败失效。 | 是 |
+| Windows 集成测试 | 对真实 .NET 8、.NET 9、.NET 10 x64 受控目标执行附着、调用树查询、热点方法命中、Debug PDB 文件行定位、无 PDB 源码降级，以及与三次 `.gcdump` 捕获并发。 | 是 |
+| 性能基准 | 执行第 5.1 节全部 60 分钟门槛：目标吞吐、诊断 CPU、私有内存、存储体积、完整会话查询 P95、分配和并发查询。 | 显式启用 |
+| 压力/浸泡测试 | 2 小时连续附着，8 个 CPU 工作线程、至少 200 条调用栈、每分钟一次随机范围查询、每 10 分钟一次并发查询与取消；验证零受控丢失、无会话存储泄漏、无句柄增长、无调用树计数损坏。 | 显式启用 |
+
+性能与压力测试命令必须独立于常规集成测试：
+
+```powershell
+$env:DOTNET_ANALYSIS_RUN_EXECUTION_PROFILE_BENCHMARK = 'true'
+dotnet test .\tests\DotnetAnalysis.Diagnostics.IntegrationTests\DotnetAnalysis.Diagnostics.IntegrationTests.csproj --configuration Debug --no-build --filter "FullyQualifiedName~ExecutionSamplingBenchmark"
+
+$env:DOTNET_ANALYSIS_RUN_EXECUTION_PROFILE_STRESS = 'true'
+dotnet test .\tests\DotnetAnalysis.Diagnostics.IntegrationTests\DotnetAnalysis.Diagnostics.IntegrationTests.csproj --configuration Debug --no-build --filter "FullyQualifiedName~ExecutionSamplingStress"
+```
+
+每次显式性能或压力运行必须写入 `TestResults/ExecutionSampling-<timestamp>/`，至少包含：Git 提交、SDK/运行时、Windows 版本、逻辑处理器数、目标负载参数、采样频率、原始样本数、丢失事件数、诊断 CPU、目标吞吐、私有内存峰值、存储大小、查询耗时列表和分配列表。结果文件是验收证据；只报告 P50/P95 摘要而不保留原始列表不算通过。
+
+因为这是新增的 Diagnostics 公开接口，单元、集成、性能和压力测试必须覆盖正常、边界、并发、取消和失败负载。既有百万对象快照基准仍按现有门禁显式启用；执行采样的长会话证据不能由小型单元测试或一次短集成测试替代。
 
 ## 10. 已确认决策
 
