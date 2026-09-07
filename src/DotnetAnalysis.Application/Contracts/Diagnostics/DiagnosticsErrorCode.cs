@@ -36,5 +36,17 @@ public enum DiagnosticsErrorCode
     /// <summary>
     /// 快照对象数量过大，不能执行完整对象枚举，应改用分页查询。
     /// </summary>
-    SnapshotTooLargeForFullEnumeration
+    SnapshotTooLargeForFullEnumeration,
+    /// <summary>
+    /// 目标运行时或当前会话不支持执行采样。
+    /// </summary>
+    ExecutionProfilingUnavailable,
+    /// <summary>
+    /// 请求的执行采样时间区间不可用。
+    /// </summary>
+    ExecutionProfileRangeUnavailable,
+    /// <summary>
+    /// 读取或持久化执行采样分析结果失败。
+    /// </summary>
+    ExecutionProfileStorageFailed
 }

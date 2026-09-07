@@ -1,5 +1,7 @@
 using System.Xml.Linq;
 using System.Diagnostics.CodeAnalysis;
+using DotnetAnalysis.Application.Contracts.Diagnostics;
+using DotnetAnalysis.Core.Diagnostics;
 
 namespace DotnetAnalysis.Tests.Architecture;
 
@@ -26,7 +28,10 @@ public sealed class DiagnosticsBoundaryTests
             "GCDump",
             "SnapshotReader",
             "ProcessMemorySampler",
-            "DotnetAnalysis.Diagnostics"
+            "DotnetAnalysis.Diagnostics",
+            "Microsoft.Diagnostics.NETCore.Client",
+            "Microsoft.Diagnostics.Tracing",
+            "Microsoft.Diagnostics.Symbols"
         };
 
         foreach (var source in Directory.EnumerateFiles(applicationRoot, "*.cs", SearchOption.AllDirectories))
@@ -67,6 +72,46 @@ public sealed class DiagnosticsBoundaryTests
 
         Assert.IsFalse(applicationReferences.Any(include => include!.Contains("DotnetAnalysis.Diagnostics", StringComparison.Ordinal)));
         Assert.IsTrue(diagnosticsReferences.Any(include => include!.Contains("DotnetAnalysis.Application", StringComparison.Ordinal)));
+    }
+
+    [TestMethod]
+    public void Application_DoesNotReferenceExecutionProfilingInfrastructurePackages()
+    {
+        var sourceRoot = GetSourceRoot();
+        var applicationProject = XDocument.Load(Path.Combine(
+            sourceRoot,
+            "DotnetAnalysis.Application",
+            "DotnetAnalysis.Application.csproj"));
+        var packageReferences = applicationProject
+            .Descendants("PackageReference")
+            .Select(reference => (string?)reference.Attribute("Include"))
+            .Where(include => include is not null)
+            .ToArray();
+
+        var forbiddenPackages = new[]
+        {
+            "Microsoft.Diagnostics.NETCore.Client",
+            "Microsoft.Diagnostics.Tracing",
+            "Microsoft.Diagnostics.Symbols"
+        };
+
+        foreach (var forbiddenPackage in forbiddenPackages)
+        {
+            Assert.IsFalse(
+                packageReferences.Any(package => package!.Equals(forbiddenPackage, StringComparison.Ordinal)),
+                $"Application must not reference '{forbiddenPackage}'.");
+        }
+    }
+
+    [TestMethod]
+    public void ProcessDiagnosticsSession_ExposesExecutionProfileQueryContract()
+    {
+        var method = typeof(IProcessDiagnosticsSession).GetMethod(
+            "GetExecutionProfileAsync",
+            [typeof(ExecutionTimeRange), typeof(CancellationToken)]);
+
+        Assert.IsNotNull(method);
+        Assert.AreEqual(typeof(Task<ExecutionProfile>), method.ReturnType);
     }
 
     [TestMethod]

@@ -159,6 +159,13 @@ public sealed class ProcessDiagnosticsSessionTests
     {
         var inner = new InvalidOperationException("raw");
 
+        var executionProfilingErrorCodes = new[]
+        {
+            DiagnosticsErrorCode.ExecutionProfilingUnavailable,
+            DiagnosticsErrorCode.ExecutionProfileRangeUnavailable,
+            DiagnosticsErrorCode.ExecutionProfileStorageFailed
+        };
+
         foreach (var errorCode in Enum.GetValues<DiagnosticsErrorCode>())
         {
             var exception = new DiagnosticsException(errorCode, "stable", inner);
@@ -167,6 +174,30 @@ public sealed class ProcessDiagnosticsSessionTests
             Assert.AreEqual("stable", exception.Message);
             Assert.AreSame(inner, exception.InnerException);
         }
+
+        foreach (var errorCode in executionProfilingErrorCodes)
+        {
+            var exception = new DiagnosticsException(errorCode, "stable", inner);
+
+            Assert.AreEqual(errorCode, exception.ErrorCode);
+            Assert.AreEqual("stable", exception.Message);
+            Assert.AreSame(inner, exception.InnerException);
+        }
+    }
+
+    [TestMethod]
+    public async Task GetExecutionProfileAsync_WhenSessionDoesNotProvideProfiling_ThrowsStableUnavailableError()
+    {
+        IProcessDiagnosticsSession session = new InterfaceDefaultExecutionProfileSession(_process);
+        var timeRange = new ExecutionTimeRange(
+            Utc("2026-09-02T08:00:00Z"),
+            Utc("2026-09-02T08:01:00Z"));
+
+        var exception = await Assert.ThrowsAsync<DiagnosticsException>(
+            async () => await session.GetExecutionProfileAsync(timeRange, CancellationToken.None));
+
+        Assert.AreEqual(DiagnosticsErrorCode.ExecutionProfilingUnavailable, exception.ErrorCode);
+        StringAssert.Contains(exception.Message, "执行采样");
     }
 
     private ProcessDiagnosticsSession CreateSession(
@@ -204,6 +235,35 @@ public sealed class ProcessDiagnosticsSessionTests
 
     private static DateTimeOffset Utc(string value) =>
         DateTimeOffset.Parse(value, CultureInfo.InvariantCulture);
+
+    private sealed class InterfaceDefaultExecutionProfileSession : IProcessDiagnosticsSession
+    {
+        public InterfaceDefaultExecutionProfileSession(TargetProcess process)
+        {
+            Process = process;
+        }
+
+        public ProcessDiagnosticsSessionId Id { get; } = ProcessDiagnosticsSessionId.New();
+
+        public TargetProcess Process { get; }
+
+        public ProcessDiagnosticsSessionState State => ProcessDiagnosticsSessionState.Monitoring;
+
+        public Task EndAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task<MemorySnapshot> CaptureSnapshotAsync(CancellationToken cancellationToken) =>
+            Task.FromException<MemorySnapshot>(new NotSupportedException());
+
+        public IAsyncEnumerable<MemoryUsageSample> GetMemoryUsageAsync(CancellationToken cancellationToken) =>
+            EmptyMemoryUsageSamples();
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+        private static async IAsyncEnumerable<MemoryUsageSample> EmptyMemoryUsageSamples()
+        {
+            yield break;
+        }
+    }
 
     private sealed class ControlledCapture : IMemorySnapshotCapture
     {
