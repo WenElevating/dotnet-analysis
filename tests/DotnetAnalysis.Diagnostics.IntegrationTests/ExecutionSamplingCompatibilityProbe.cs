@@ -26,11 +26,8 @@ internal static class ExecutionSamplingCompatibilityProbe
         TimeSpan duration,
         CancellationToken cancellationToken)
     {
-        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(duration, TimeSpan.Zero);
-        cancellationToken.ThrowIfCancellationRequested();
-
         var managedMethodNames = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
-        var runtimeTargetFramework = ResolveRuntimeTargetFramework(processId);
+        var runtimeTargetFramework = "unknown";
         var capturedAtUtc = DateTimeOffset.UtcNow;
         long receivedSampleCount = 0;
         long eventsLost = 0;
@@ -38,6 +35,10 @@ internal static class ExecutionSamplingCompatibilityProbe
 
         try
         {
+            runtimeTargetFramework = ResolveRuntimeTargetFramework(processId);
+            ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(duration, TimeSpan.Zero);
+            cancellationToken.ThrowIfCancellationRequested();
+
             var client = new DiagnosticsClient(processId);
             var providers = new[]
             {
@@ -103,14 +104,20 @@ internal static class ExecutionSamplingCompatibilityProbe
         }
         finally
         {
-            await WriteEvidenceAsync(
-                capturedAtUtc,
-                runtimeTargetFramework,
-                processId,
-                receivedSampleCount,
-                eventsLost,
-                managedMethodNames.Keys.OrderBy(static name => name, StringComparer.Ordinal).Take(20).ToArray(),
-                probeException).ConfigureAwait(false);
+            try
+            {
+                await WriteEvidenceAsync(
+                    capturedAtUtc,
+                    runtimeTargetFramework,
+                    processId,
+                    receivedSampleCount,
+                    eventsLost,
+                    managedMethodNames.Keys.OrderBy(static name => name, StringComparer.Ordinal).Take(20).ToArray(),
+                    probeException).ConfigureAwait(false);
+            }
+            catch when (probeException is not null)
+            {
+            }
         }
     }
 

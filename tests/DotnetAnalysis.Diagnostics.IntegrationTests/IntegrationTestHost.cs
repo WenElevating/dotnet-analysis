@@ -10,6 +10,7 @@ internal sealed record IntegrationTargetOptions(
 
 public sealed class IntegrationTestHost : IAsyncDisposable
 {
+    private const string ExecutionWorkloadVariable = "DOTNET_ANALYSIS_TEST_EXECUTION_WORKLOAD";
     private static readonly Lazy<ReadOnlyCollection<int>> s_installedRuntimeMajorVersions = new(LoadInstalledRuntimeMajorVersions);
     private readonly Process _process;
 
@@ -19,16 +20,20 @@ public sealed class IntegrationTestHost : IAsyncDisposable
 
     public static ReadOnlyCollection<int> GetInstalledRuntimeMajorVersions() => s_installedRuntimeMajorVersions.Value;
 
-    public static IEnumerable<string> GetSupportedTargetFrameworks()
+    public static IEnumerable<string> GetSupportedTargetFrameworks() =>
+        GetSupportedTargetFrameworks(GetInstalledRuntimeMajorVersions());
+
+    internal static IEnumerable<string> GetSupportedTargetFrameworks(IReadOnlyCollection<int> installedRuntimeMajorVersions)
     {
-        yield return "net8.0";
+        ArgumentNullException.ThrowIfNull(installedRuntimeMajorVersions);
 
-        if (GetInstalledRuntimeMajorVersions().Contains(9))
+        foreach (var runtimeMajorVersion in new[] { 8, 9, 10 })
         {
-            yield return "net9.0";
+            if (installedRuntimeMajorVersions.Contains(runtimeMajorVersion))
+            {
+                yield return $"net{runtimeMajorVersion}.0";
+            }
         }
-
-        yield return "net10.0";
     }
 
     public static string ResolveTargetExecutablePath(string targetFramework)
@@ -81,7 +86,25 @@ public sealed class IntegrationTestHost : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(options);
         var targetExecutable = ResolveTargetExecutablePath(targetFramework);
-        var psi = new ProcessStartInfo(targetExecutable)
+        var psi = CreateTargetProcessStartInfo(targetExecutable, options);
+        var process = Process.Start(psi) ?? throw new InvalidOperationException("Could not start target process.");
+        var ready = await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(15));
+        if (!string.Equals(ready, "READY", StringComparison.Ordinal))
+        {
+            process.Dispose();
+            throw new InvalidOperationException("Target process did not become ready.");
+        }
+
+        return new IntegrationTestHost(process);
+    }
+
+    internal static ProcessStartInfo CreateTargetProcessStartInfo(
+        string targetExecutable,
+        IntegrationTargetOptions options)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(targetExecutable);
+        ArgumentNullException.ThrowIfNull(options);
+        var processStartInfo = new ProcessStartInfo(targetExecutable)
         {
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
@@ -92,23 +115,11 @@ public sealed class IntegrationTestHost : IAsyncDisposable
         if (options.InitialObjectCount is { } count)
         {
             ArgumentOutOfRangeException.ThrowIfNegative(count);
-            psi.Environment["DOTNET_ANALYSIS_TEST_OBJECT_COUNT"] = count.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            processStartInfo.Environment["DOTNET_ANALYSIS_TEST_OBJECT_COUNT"] = count.ToString(System.Globalization.CultureInfo.InvariantCulture);
         }
 
-        if (options.EnableExecutionWorkload)
-        {
-            psi.Environment["DOTNET_ANALYSIS_TEST_EXECUTION_WORKLOAD"] = "true";
-        }
-
-        var process = Process.Start(psi) ?? throw new InvalidOperationException("Could not start target process.");
-        var ready = await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(15));
-        if (!string.Equals(ready, "READY", StringComparison.Ordinal))
-        {
-            process.Dispose();
-            throw new InvalidOperationException("Target process did not become ready.");
-        }
-
-        return new IntegrationTestHost(process);
+        processStartInfo.Environment[ExecutionWorkloadVariable] = options.EnableExecutionWorkload ? "true" : "false";
+        return processStartInfo;
     }
 
     public async ValueTask DisposeAsync()
