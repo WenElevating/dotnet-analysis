@@ -204,6 +204,7 @@ GetExecutionProfileAsync(range)
 | Windows 集成测试 | 对真实 .NET 8、.NET 9、.NET 10 x64 受控目标执行附着、调用树查询、热点方法命中、Debug PDB 文件行定位、无 PDB 源码降级，以及与三次 `.gcdump` 捕获并发。 | 是 |
 | 性能基准 | 执行第 5.1 节全部 60 分钟门槛：目标吞吐、诊断 CPU、私有内存、存储体积、完整会话查询 P95、分配和并发查询。 | 显式启用 |
 | 压力/浸泡测试 | 2 小时连续附着，8 个 CPU 工作线程、至少 200 条调用栈、每分钟一次随机范围查询、每 10 分钟一次并发查询与取消；验证零受控丢失、无会话存储泄漏、无句柄增长、无调用树计数损坏。 | 显式启用 |
+| 真实应用验收 | 诊断一个独立运行的真实 .NET 应用，而非 `DotnetAnalysis.Diagnostics.TestTarget`、单元测试宿主或合成事件源；完整执行附着、全会话查询、代码定位和快照并发流程。 | 发布前显式执行，必需 |
 
 性能与压力测试命令必须独立于常规集成测试：
 
@@ -213,9 +214,22 @@ dotnet test .\tests\DotnetAnalysis.Diagnostics.IntegrationTests\DotnetAnalysis.D
 
 $env:DOTNET_ANALYSIS_RUN_EXECUTION_PROFILE_STRESS = 'true'
 dotnet test .\tests\DotnetAnalysis.Diagnostics.IntegrationTests\DotnetAnalysis.Diagnostics.IntegrationTests.csproj --configuration Debug --no-build --filter "FullyQualifiedName~ExecutionSamplingStress"
+
+$env:DOTNET_ANALYSIS_RUN_REAL_APPLICATION_ACCEPTANCE = 'true'
+$env:DOTNET_ANALYSIS_REAL_APPLICATION_PATH = '.\src\DotnetAnalysis.Desktop\bin\x64\Debug\net10.0-windows\DotnetAnalysis.Desktop.exe'
+dotnet test .\tests\DotnetAnalysis.Diagnostics.IntegrationTests\DotnetAnalysis.Diagnostics.IntegrationTests.csproj --configuration Debug --no-build --filter "FullyQualifiedName~ExecutionSamplingRealApplicationAcceptance"
 ```
 
-每次显式性能或压力运行必须写入 `TestResults/ExecutionSampling-<timestamp>/`，至少包含：Git 提交、SDK/运行时、Windows 版本、逻辑处理器数、目标负载参数、采样频率、原始样本数、丢失事件数、诊断 CPU、目标吞吐、私有内存峰值、存储大小、查询耗时列表和分配列表。结果文件是验收证据；只报告 P50/P95 摘要而不保留原始列表不算通过。
+每次显式性能、压力或真实应用验收运行必须写入 `TestResults/ExecutionSampling-<timestamp>/`，至少包含：Git 提交、SDK/运行时、Windows 版本、逻辑处理器数、目标负载参数、采样频率、原始样本数、丢失事件数、诊断 CPU、目标吞吐、私有内存峰值、存储大小、查询耗时列表和分配列表。真实应用验收还必须保存第 9.1 节规定的目标身份、符号身份、三段查询原始结果和异常记录。结果文件是验收证据；只报告 P50/P95 摘要而不保留原始列表不算通过。
+
+真实应用验收至少使用本仓库编译出的 `DotnetAnalysis.Desktop` Debug x64 应用，或经记录的用户指定 Windows x64 .NET 8/9/10 CoreCLR 应用。目标必须在独立进程中正常运行，并且不是诊断测试目标。验收执行者使用独立诊断宿主附着该应用，在不少于 10 分钟的真实工作负载期间：
+
+1. 保留从附着成功到结束前的全部执行采样，并针对早期、中期和末期的三个时间范围查询调用树。
+2. 在目标应用自身模块中验证至少一个方法解析到匹配源码文件和行号；若使用用户指定应用，记录其可复现的二进制和 PDB 版本。
+3. 在采样期间至少执行一次 `.gcdump` 捕获，验证采样前后仍有连续样本且会话没有失败。
+4. 记录目标 PID、进程启动时间、应用路径及 SHA-256、PDB 路径及 SHA-256、附着/结束时间、三个查询的原始结果、丢失事件数、诊断 CPU/内存和任何异常。
+
+真实应用验收不得由受控测试目标、模拟对象或只检查返回值的自动化测试替代。没有这份实际诊断证据，即使单元、集成、性能和压力测试均通过，也不得宣称功能完成。
 
 因为这是新增的 Diagnostics 公开接口，单元、集成、性能和压力测试必须覆盖正常、边界、并发、取消和失败负载。既有百万对象快照基准仍按现有门禁显式启用；执行采样的长会话证据不能由小型单元测试或一次短集成测试替代。
 
