@@ -20,6 +20,7 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
     private readonly SnapshotStorageLayout _snapshotLayout;
     private readonly MemorySnapshotStore _snapshotStore;
     private readonly IMemorySnapshotCapture _snapshotCapture;
+    private readonly Func<IExecutionSamplingSession> _executionSamplingSessionFactory;
     private readonly IEventBus _eventBus;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<ProcessDiagnosticsSession> _sessionLogger;
@@ -39,9 +40,36 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
         IProcessMemoryReader? processMemoryReader = null,
         ImportedSnapshotCatalog? importedSnapshots = null,
         SnapshotStorageLayout? snapshotLayout = null)
+        : this(
+            eventBus,
+            timeProvider,
+            static () => new ExecutionSamplingSession(),
+            sessionLogger,
+            enumerator,
+            identityValidator,
+            capabilitiesResolver,
+            processMemoryReader,
+            importedSnapshots,
+            snapshotLayout)
+    {
+    }
+
+    internal WindowsProcessDiagnostics(
+        IEventBus eventBus,
+        TimeProvider timeProvider,
+        Func<IExecutionSamplingSession> executionSamplingSessionFactory,
+        ILogger<ProcessDiagnosticsSession>? sessionLogger = null,
+        ProcessEnumerator? enumerator = null,
+        ProcessIdentityValidator? identityValidator = null,
+        RuntimeCapabilitiesResolver? capabilitiesResolver = null,
+        IProcessMemoryReader? processMemoryReader = null,
+        ImportedSnapshotCatalog? importedSnapshots = null,
+        SnapshotStorageLayout? snapshotLayout = null)
     {
         _eventBus = eventBus ?? throw new ArgumentNullException(nameof(eventBus));
         _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
+        _executionSamplingSessionFactory = executionSamplingSessionFactory
+            ?? throw new ArgumentNullException(nameof(executionSamplingSessionFactory));
         _sessionLogger = sessionLogger ?? NullLogger<ProcessDiagnosticsSession>.Instance;
         _enumerator = enumerator ?? new ProcessEnumerator();
         _identityValidator = identityValidator ?? new ProcessIdentityValidator();
@@ -104,10 +132,23 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
             allocationCollector.MarkInterrupted(DateTimeOffset.UtcNow);
         }
 
+        var executionSampling = _executionSamplingSessionFactory();
+        try
+        {
+            await executionSampling.StartAsync(process, cancellationToken).ConfigureAwait(false);
+        }
+        catch (DiagnosticsException exception) when (
+            exception.ErrorCode is DiagnosticsErrorCode.ExecutionProfilingUnavailable)
+        {
+            // Execution sampling is independent from the attached memory and
+            // snapshot timelines.  Retain its unavailable state for queries.
+        }
+
         return new ProcessDiagnosticsSession(
             process,
             sampler,
             allocationCollector,
+            executionSampling,
             _snapshotCapture,
             _eventBus,
             _timeProvider,

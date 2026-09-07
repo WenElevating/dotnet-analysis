@@ -84,6 +84,122 @@ public sealed class ProcessDiagnosticsSessionTests
     }
 
     [TestMethod]
+    public async Task GetExecutionProfileAsync_WhenExecutionSamplingIsUnavailable_KeepsOtherSessionOperationsAvailable()
+    {
+        var capture = new ControlledCapture();
+        var executionSampling = new ControlledExecutionSamplingSession { IsUnavailable = true };
+        await using var session = CreateSession(capture, executionSampling: executionSampling);
+
+        await using var samples = session.GetMemoryUsageAsync(CancellationToken.None).GetAsyncEnumerator();
+        Assert.IsTrue(await samples.MoveNextAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(1)));
+        Assert.AreEqual(MemoryUsageSampleState.Unavailable, samples.Current.State);
+
+        var snapshot = await session.CaptureSnapshotAsync(CancellationToken.None);
+        var exception = await Assert.ThrowsAsync<DiagnosticsException>(
+            async () => await session.GetExecutionProfileAsync(TimeRange(), CancellationToken.None));
+
+        Assert.AreEqual(DiagnosticsErrorCode.ExecutionProfilingUnavailable, exception.ErrorCode);
+        Assert.AreEqual(MemorySnapshotState.Analyzing, snapshot.State);
+        Assert.AreEqual(ProcessDiagnosticsSessionState.Monitoring, session.State);
+    }
+
+    [TestMethod]
+    public async Task GetExecutionProfileAsync_AllowsSnapshotCaptureToRunConcurrently()
+    {
+        var capture = new ControlledCapture
+        {
+            CaptureGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+        };
+        var executionSampling = new ControlledExecutionSamplingSession
+        {
+            QueryGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
+        };
+        await using var session = CreateSession(capture, executionSampling: executionSampling);
+
+        var profileTask = session.GetExecutionProfileAsync(TimeRange(), CancellationToken.None);
+        var snapshotTask = session.CaptureSnapshotAsync(CancellationToken.None);
+        await Task.WhenAll(
+            executionSampling.QueryStarted.Task,
+            capture.Started.Task).WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.IsFalse(profileTask.IsCompleted);
+        Assert.IsFalse(snapshotTask.IsCompleted);
+
+        executionSampling.QueryGate.TrySetResult();
+        capture.CaptureGate.TrySetResult();
+        var profile = await profileTask.WaitAsync(TimeSpan.FromSeconds(1));
+        var snapshot = await snapshotTask.WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.AreEqual(TimeRange(), profile.TimeRange);
+        Assert.AreEqual(MemorySnapshotState.Analyzing, snapshot.State);
+    }
+
+    [TestMethod]
+    public async Task EndAsync_CancelsExecutionQueryAndDisposesExecutionSamplingBeforeMemorySampling()
+    {
+        var disposalOrder = new List<string>();
+        var capture = new ControlledCapture { WaitForCancellation = true };
+        var executionSampling = new ControlledExecutionSamplingSession
+        {
+            WaitForQueryCancellation = true,
+            DisposeGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously),
+            DisposalOrder = disposalOrder
+        };
+        var managedHeapReader = new RecordingManagedHeapReader(disposalOrder);
+        var sampler = new ProcessMemorySampler(
+            _process,
+            new UnavailableProcessMemoryReader(),
+            managedHeapReader,
+            TimeProvider.System,
+            TimeSpan.Zero);
+        var allocationCollector = new AllocationSamplingSession(
+            new AllocationProfileBuilder(Utc("2026-09-02T08:00:00Z")));
+        await using var session = new ProcessDiagnosticsSession(
+            _process,
+            sampler,
+            allocationCollector,
+            executionSampling,
+            capture,
+            new RecordingEventBus(),
+            TimeProvider.System,
+            NullLogger<ProcessDiagnosticsSession>.Instance);
+
+        var profileTask = session.GetExecutionProfileAsync(TimeRange(), CancellationToken.None);
+        var snapshotTask = session.CaptureSnapshotAsync(CancellationToken.None);
+        await Task.WhenAll(
+            executionSampling.QueryStarted.Task,
+            capture.Started.Task).WaitAsync(TimeSpan.FromSeconds(1));
+
+        var endTask = session.EndAsync(CancellationToken.None);
+        await executionSampling.DisposeStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.AreEqual(ProcessDiagnosticsSessionState.Ending, session.State);
+        Assert.IsTrue(snapshotTask.IsCompleted);
+        Assert.IsTrue(executionSampling.QueryCancellationObserved.Task.IsCompletedSuccessfully);
+        Assert.HasCount(1, disposalOrder);
+        Assert.AreEqual("execution", disposalOrder[0]);
+
+        executionSampling.DisposeGate.TrySetResult();
+        await endTask.WaitAsync(TimeSpan.FromSeconds(1));
+
+        await Assert.ThrowsAsync<OperationCanceledException>(
+            async () => await profileTask.WaitAsync(TimeSpan.FromSeconds(1)));
+        var captureException = await Assert.ThrowsAsync<DiagnosticsException>(
+            async () => await snapshotTask.WaitAsync(TimeSpan.FromSeconds(1)));
+        Assert.AreEqual(DiagnosticsErrorCode.CaptureCancelled, captureException.ErrorCode);
+        await Assert.ThrowsAsync<ObjectDisposedException>(
+            async () => await allocationCollector.StartAsync(_process, CancellationToken.None));
+        Assert.HasCount(2, disposalOrder);
+        Assert.AreEqual("execution", disposalOrder[0]);
+        Assert.AreEqual("memory", disposalOrder[1]);
+        Assert.AreEqual(ProcessDiagnosticsSessionState.Ended, session.State);
+
+        var endedQueryException = await Assert.ThrowsAsync<DiagnosticsException>(
+            async () => await session.GetExecutionProfileAsync(TimeRange(), CancellationToken.None));
+        Assert.AreEqual(DiagnosticsErrorCode.ExecutionProfileRangeUnavailable, endedQueryException.ErrorCode);
+    }
+
+    [TestMethod]
     public async Task GetMemoryUsageAsync_WhenSessionEndedSampleArrives_MovesToEnded()
     {
         var endedProcess = new TargetProcess(int.MaxValue, Utc("2026-09-02T08:00:00Z"), "ended-target", null);
@@ -95,10 +211,12 @@ public sealed class ProcessDiagnosticsSessionTests
             TimeSpan.Zero);
         var allocationCollector = new AllocationSamplingSession(
             new AllocationProfileBuilder(Utc("2026-09-02T08:00:00Z")));
+        var executionSampling = new ControlledExecutionSamplingSession();
         await using var session = new ProcessDiagnosticsSession(
             endedProcess,
             sampler,
             allocationCollector,
+            executionSampling,
             new ControlledCapture(),
             new RecordingEventBus(),
             TimeProvider.System,
@@ -109,6 +227,11 @@ public sealed class ProcessDiagnosticsSessionTests
         }
 
         Assert.AreEqual(ProcessDiagnosticsSessionState.Ended, session.State);
+
+        var exception = await Assert.ThrowsAsync<DiagnosticsException>(
+            async () => await session.GetExecutionProfileAsync(TimeRange(), CancellationToken.None));
+        Assert.AreEqual(DiagnosticsErrorCode.ExecutionProfileRangeUnavailable, exception.ErrorCode);
+        Assert.AreEqual(0, executionSampling.QueryCallCount);
     }
 
     [TestMethod]
@@ -204,7 +327,8 @@ public sealed class ProcessDiagnosticsSessionTests
         ControlledCapture capture,
         IEventBus? eventBus = null,
         ILogger<ProcessDiagnosticsSession>? logger = null,
-        AllocationSamplingSession? allocationCollector = null)
+        AllocationSamplingSession? allocationCollector = null,
+        IExecutionSamplingSession? executionSampling = null)
     {
         var sampler = new ProcessMemorySampler(
             _process,
@@ -214,10 +338,12 @@ public sealed class ProcessDiagnosticsSessionTests
             TimeSpan.Zero);
         allocationCollector ??= new AllocationSamplingSession(
             new AllocationProfileBuilder(Utc("2026-09-02T08:00:00Z")));
+        executionSampling ??= new ControlledExecutionSamplingSession();
         return new ProcessDiagnosticsSession(
             _process,
             sampler,
             allocationCollector,
+            executionSampling,
             capture,
             eventBus ?? new RecordingEventBus(),
             TimeProvider.System,
@@ -235,6 +361,11 @@ public sealed class ProcessDiagnosticsSessionTests
 
     private static DateTimeOffset Utc(string value) =>
         DateTimeOffset.Parse(value, CultureInfo.InvariantCulture);
+
+    private static ExecutionTimeRange TimeRange() =>
+        new(
+            Utc("2026-09-02T08:00:00Z"),
+            Utc("2026-09-02T08:01:00Z"));
 
     private sealed class InterfaceDefaultExecutionProfileSession : IProcessDiagnosticsSession
     {
@@ -307,6 +438,99 @@ public sealed class ProcessDiagnosticsSessionTests
     private sealed class UnavailableProcessMemoryReader : IProcessMemoryReader
     {
         public long? ReadPrivateWorkingSetBytes(int processId) => null;
+    }
+
+    private sealed class RecordingManagedHeapReader : IManagedHeapReader, IDisposable
+    {
+        private readonly List<string> _disposalOrder;
+
+        public RecordingManagedHeapReader(List<string> disposalOrder)
+        {
+            _disposalOrder = disposalOrder;
+        }
+
+        public long? ReadManagedHeapBytes(int processId) => null;
+
+        public void Dispose() => _disposalOrder.Add("memory");
+    }
+
+    private sealed class ControlledExecutionSamplingSession : IExecutionSamplingSession
+    {
+        private int _queryCallCount;
+
+        public TaskCompletionSource QueryStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource QueryCancellationObserved { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource DisposeStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource? QueryGate { get; init; }
+
+        public TaskCompletionSource? DisposeGate { get; init; }
+
+        public List<string>? DisposalOrder { get; init; }
+
+        public bool IsUnavailable { get; init; }
+
+        public bool WaitForQueryCancellation { get; init; }
+
+        public int QueryCallCount => Volatile.Read(ref _queryCallCount);
+
+        public Task StartAsync(TargetProcess target, CancellationToken cancellationToken)
+        {
+            ArgumentNullException.ThrowIfNull(target);
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.CompletedTask;
+        }
+
+        public async Task<ExecutionProfile> GetExecutionProfileAsync(
+            ExecutionTimeRange timeRange,
+            CancellationToken cancellationToken)
+        {
+            ArgumentNullException.ThrowIfNull(timeRange);
+            cancellationToken.ThrowIfCancellationRequested();
+            Interlocked.Increment(ref _queryCallCount);
+            QueryStarted.TrySetResult();
+            if (IsUnavailable)
+            {
+                throw new DiagnosticsException(
+                    DiagnosticsErrorCode.ExecutionProfilingUnavailable,
+                    "Execution sampling is unavailable.");
+            }
+
+            if (WaitForQueryCancellation)
+            {
+                try
+                {
+                    await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    QueryCancellationObserved.TrySetResult();
+                    throw;
+                }
+            }
+
+            if (QueryGate is not null)
+            {
+                await QueryGate.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            return new ExecutionProfile(timeRange, 0, 0, [], []);
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            DisposalOrder?.Add("execution");
+            DisposeStarted.TrySetResult();
+            if (DisposeGate is not null)
+            {
+                await DisposeGate.Task.ConfigureAwait(false);
+            }
+        }
     }
 
     private sealed class RecordingLogger<T> : ILogger<T>

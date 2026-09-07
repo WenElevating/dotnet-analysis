@@ -30,6 +30,7 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
     private readonly object _syncRoot = new();
     private readonly ProcessMemorySampler _sampler;
     private readonly AllocationSamplingSession _allocationCollector;
+    private readonly IExecutionSamplingSession _executionSampling;
     private readonly IMemorySnapshotCapture _capture;
     private readonly IEventBus _eventBus;
     private readonly TimeProvider _timeProvider;
@@ -48,11 +49,13 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
     /// <param name="timeProvider">事件时间来源。</param>
     /// <param name="logger">记录失败和事件投递问题的日志记录器。</param>
     /// <param name="allocationCollector">为捕获封存分配概要的会话级收集器。</param>
+    /// <param name="executionSampling">提供附着期执行采样查询的会话级资源。</param>
     /// <param name="capture">执行底层快照捕获的内部实现。</param>
     internal ProcessDiagnosticsSession(
         TargetProcess process,
         ProcessMemorySampler sampler,
         AllocationSamplingSession allocationCollector,
+        IExecutionSamplingSession executionSampling,
         IMemorySnapshotCapture capture,
         IEventBus eventBus,
         TimeProvider timeProvider,
@@ -61,6 +64,7 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
         Process = process ?? throw new ArgumentNullException(nameof(process));
         _sampler = sampler ?? throw new ArgumentNullException(nameof(sampler));
         _allocationCollector = allocationCollector ?? throw new ArgumentNullException(nameof(allocationCollector));
+        _executionSampling = executionSampling ?? throw new ArgumentNullException(nameof(executionSampling));
         _capture = capture ?? throw new ArgumentNullException(nameof(capture));
         _eventBus = eventBus ?? throw new ArgumentNullException(nameof(eventBus));
         _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
@@ -155,6 +159,43 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
             }
 
             yield return sample;
+        }
+    }
+
+    /// <summary>
+    /// 查询当前附着会话已采集时间区间内的托管执行分析结果。
+    /// </summary>
+    /// <param name="timeRange">需要查询的 UTC 执行采样时间区间。</param>
+    /// <param name="cancellationToken">取消本次查询或随会话结束停止查询的标记。</param>
+    /// <returns>指定时间区间内的执行采样分析结果。</returns>
+    /// <exception cref="DiagnosticsException">执行采样不可用、区间不可查询或读取失败时引发。</exception>
+    public async Task<ExecutionProfile> GetExecutionProfileAsync(
+        ExecutionTimeRange timeRange,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(timeRange);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        CancellationTokenSource queryCancellation;
+        lock (_syncRoot)
+        {
+            if (State is not ProcessDiagnosticsSessionState.Monitoring)
+            {
+                throw new DiagnosticsException(
+                    DiagnosticsErrorCode.ExecutionProfileRangeUnavailable,
+                    "The requested execution profile range is not available after the session has ended.");
+            }
+
+            queryCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken,
+                _endCancellation.Token);
+        }
+
+        using (queryCancellation)
+        {
+            return await _executionSampling
+                .GetExecutionProfileAsync(timeRange, queryCancellation.Token)
+                .ConfigureAwait(false);
         }
     }
 
@@ -280,6 +321,7 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
             }
         }
 
+        await _executionSampling.DisposeAsync().ConfigureAwait(false);
         await DisposeAllocationCollectorAsync().ConfigureAwait(false);
         await _sampler.DisposeAsync().ConfigureAwait(false);
 
