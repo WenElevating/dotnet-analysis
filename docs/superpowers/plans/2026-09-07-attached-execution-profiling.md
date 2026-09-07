@@ -137,7 +137,7 @@
   };
   ```
 
-  使用 `TraceLog.CreateFromEventPipeSession(session, TraceLog.EventPipeRundownConfiguration.Enable(client))`，在 `source.Dynamic.All` 中仅接收 `ProviderName == SampleProfilerTraceEventParser.ProviderName` 的有栈事件。调用 `data.CallStack()`，自当前帧沿 `Caller` 收集 `CodeAddress.FullMethodName`；停止 session 后记录 `source.EventsLost`。探针写入 JSON：运行时 TFM、PID、样本数、丢失数、前 20 个方法名、是否命中目标方法和异常。
+  使用 `TraceLog.CreateFromEventPipeSession(session, TraceLog.EventPipeRundownConfiguration.Enable(client))`，再创建 `new SampleProfilerTraceEventParser(source)` 并订阅其强类型 `ThreadSample` 事件。`ClrThreadSampleTraceData` 继承 `TraceEvent`，调用 `data.CallStack()`，自当前帧沿 `Caller` 收集 `CodeAddress.FullMethodName`；停止 session 后记录 `source.EventsLost`。不得依赖 `source.Dynamic.All` 接收该 provider，因为 TraceEvent 已为它注册专用解析器。探针写入 JSON：运行时 TFM、PID、样本数、丢失数、前 20 个方法名、是否命中目标方法和异常。
 
 - [ ] **Step 5: 验证探针并审查证据。**
 
