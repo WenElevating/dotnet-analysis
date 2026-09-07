@@ -3,6 +3,11 @@ using System.Diagnostics;
 
 namespace DotnetAnalysis.Diagnostics.IntegrationTests;
 
+internal sealed record IntegrationTargetOptions(
+    int? InitialObjectCount = null,
+    bool EnableExecutionWorkload = false,
+    bool CopyWithoutPdb = false);
+
 public sealed class IntegrationTestHost : IAsyncDisposable
 {
     private static readonly Lazy<ReadOnlyCollection<int>> s_installedRuntimeMajorVersions = new(LoadInstalledRuntimeMajorVersions);
@@ -54,7 +59,7 @@ public sealed class IntegrationTestHost : IAsyncDisposable
 
     public static async Task<IntegrationTestHost> StartTargetAsync(string targetFramework)
     {
-        return await StartTargetAsync(targetFramework, null).ConfigureAwait(false);
+        return await StartTargetAsync(targetFramework, (int?)null).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -65,6 +70,16 @@ public sealed class IntegrationTestHost : IAsyncDisposable
     /// <returns>已输出 READY 的受控目标宿主。</returns>
     public static async Task<IntegrationTestHost> StartTargetAsync(string targetFramework, int? initialObjectCount)
     {
+        return await StartTargetAsync(
+            targetFramework,
+            new IntegrationTargetOptions(InitialObjectCount: initialObjectCount)).ConfigureAwait(false);
+    }
+
+    internal static async Task<IntegrationTestHost> StartTargetAsync(
+        string targetFramework,
+        IntegrationTargetOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
         var targetExecutable = ResolveTargetExecutablePath(targetFramework);
         var psi = new ProcessStartInfo(targetExecutable)
         {
@@ -74,10 +89,15 @@ public sealed class IntegrationTestHost : IAsyncDisposable
             UseShellExecute = false,
             CreateNoWindow = true
         };
-        if (initialObjectCount is { } count)
+        if (options.InitialObjectCount is { } count)
         {
             ArgumentOutOfRangeException.ThrowIfNegative(count);
             psi.Environment["DOTNET_ANALYSIS_TEST_OBJECT_COUNT"] = count.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        if (options.EnableExecutionWorkload)
+        {
+            psi.Environment["DOTNET_ANALYSIS_TEST_EXECUTION_WORKLOAD"] = "true";
         }
 
         var process = Process.Start(psi) ?? throw new InvalidOperationException("Could not start target process.");
