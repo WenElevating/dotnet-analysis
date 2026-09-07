@@ -41,6 +41,8 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
     private readonly object _stateLock = new();
     private readonly Dictionary<ExecutionFrameDescriptor, int> _frameIds = [];
     private readonly Dictionary<ExecutionStackKey, int> _stackIds = [];
+    private readonly List<ExecutionFrameDescriptor> _framesById = [];
+    private readonly List<ExecutionStackKey> _stacksById = [];
     private readonly List<ExecutionCaptureSegment> _segments = [];
     private readonly DateTimeOffset _startedAtUtc = DateTimeOffset.UtcNow;
 
@@ -92,6 +94,7 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
 
             var frameId = _frameIds.Count;
             _frameIds.Add(frame, frameId);
+            _framesById.Add(frame);
             return frameId;
         }
         finally
@@ -121,7 +124,51 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
 
             var stackId = _stackIds.Count;
             _stackIds.Add(key, stackId);
+            _stacksById.Add(key);
             return stackId;
+        }
+        finally
+        {
+            _writer.Release();
+        }
+    }
+
+    /// <summary>
+    /// 获取指定调用栈从根到叶的帧描述符防御性副本。
+    /// </summary>
+    /// <param name="stackId">会话内调用栈标识。</param>
+    /// <param name="cancellationToken">取消读取等待和调用链还原的令牌。</param>
+    /// <returns>从根帧到叶帧、不可修改的帧描述符集合。</returns>
+    /// <exception cref="ArgumentOutOfRangeException">调用栈标识无效时引发。</exception>
+    /// <exception cref="OperationCanceledException">操作被取消时引发。</exception>
+    public async ValueTask<IReadOnlyList<ExecutionFrameDescriptor>> GetStackFramesAsync(
+        int stackId,
+        CancellationToken cancellationToken)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(stackId);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        await _writer.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposing();
+            if ((uint)stackId >= (uint)_stacksById.Count)
+            {
+                throw new ArgumentOutOfRangeException(nameof(stackId), stackId, "Stack identifier is not known by this execution capture store.");
+            }
+
+            var frames = new List<ExecutionFrameDescriptor>();
+            var currentStackId = stackId;
+            while (currentStackId >= 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var stack = _stacksById[currentStackId];
+                frames.Add(_framesById[stack.FrameId]);
+                currentStackId = stack.ParentStackId;
+            }
+
+            frames.Reverse();
+            return Array.AsReadOnly(frames.ToArray());
         }
         finally
         {

@@ -1,0 +1,237 @@
+using DotnetAnalysis.Core.Diagnostics;
+using DotnetAnalysis.Diagnostics.Windows;
+using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
+
+namespace DotnetAnalysis.Tests.Diagnostics;
+
+[TestClass]
+[SuppressMessage("Naming", "CA1707:Identifiers should not contain underscores", Justification = "Test names describe behavior.")]
+public sealed class ExecutionProfileBuilderTests
+{
+    private static readonly string[] ExpectedHotspots =
+    [
+        "Root|App|4|0",
+        "SharedLeaf|App|3|3",
+        "CallerOne|App|2|0",
+        "Alpha|ModuleA|1|1",
+        "Alpha|ModuleB|1|1",
+        "OtherLeaf|App|1|1",
+        "Zeta|ModuleC|1|1",
+        "CallerTwo|App|1|0"
+    ];
+
+    private static readonly string[] ExpectedRootToLeafFrameNames = ["Root", "Leaf"];
+
+    [TestMethod]
+    public async Task BuildAsync_AggregatesPathsHotspotsAndLostEventsWithStableOrdering()
+    {
+        await using var temporaryStore = CreateTemporaryStore();
+        var store = temporaryStore.Store;
+        var root = await AddFrameAsync(store, "Root", "App", "root");
+        var callerOne = await AddFrameAsync(store, "CallerOne", "App", "caller-one");
+        var callerTwo = await AddFrameAsync(store, "CallerTwo", "App", "caller-two");
+        var sharedLeaf = await AddFrameAsync(store, "SharedLeaf", "App", "shared-leaf");
+        var otherLeaf = await AddFrameAsync(store, "OtherLeaf", "App", "other-leaf");
+        var alphaModuleB = await AddFrameAsync(store, "Alpha", "ModuleB", "alpha-b");
+        var alphaModuleA = await AddFrameAsync(store, "Alpha", "ModuleA", "alpha-a");
+        var zeta = await AddFrameAsync(store, "Zeta", "ModuleC", "zeta");
+
+        var rootStack = await store.GetOrAddStackAsync(-1, root, CancellationToken.None);
+        var callerOneStack = await store.GetOrAddStackAsync(rootStack, callerOne, CancellationToken.None);
+        var callerOneLeafStack = await store.GetOrAddStackAsync(callerOneStack, sharedLeaf, CancellationToken.None);
+        var callerTwoStack = await store.GetOrAddStackAsync(rootStack, callerTwo, CancellationToken.None);
+        var callerTwoLeafStack = await store.GetOrAddStackAsync(callerTwoStack, sharedLeaf, CancellationToken.None);
+        var otherLeafStack = await store.GetOrAddStackAsync(rootStack, otherLeaf, CancellationToken.None);
+        var alphaModuleBStack = await store.GetOrAddStackAsync(-1, alphaModuleB, CancellationToken.None);
+        var alphaModuleAStack = await store.GetOrAddStackAsync(-1, alphaModuleA, CancellationToken.None);
+        var zetaStack = await store.GetOrAddStackAsync(-1, zeta, CancellationToken.None);
+        await AppendAsync(store, "00:00:01", callerOneLeafStack);
+        await AppendAsync(store, "00:00:02", callerOneLeafStack);
+        await AppendAsync(store, "00:00:03", callerTwoLeafStack);
+        await AppendAsync(store, "00:00:04", otherLeafStack);
+        await AppendAsync(store, "00:00:05", alphaModuleBStack);
+        await AppendAsync(store, "00:00:06", alphaModuleAStack);
+        await AppendAsync(store, "00:00:07", zetaStack);
+        var boundary = store.CaptureReadBoundary();
+
+        var profile = await new ExecutionProfileBuilder(store).BuildAsync(
+            Range("00:00:00", "00:00:08"),
+            boundary,
+            lostEventCount: 13,
+            CancellationToken.None);
+
+        Assert.AreEqual(7, profile.ReceivedSampleCount);
+        Assert.AreEqual(13, profile.LostEventCount);
+        CollectionAssert.AreEqual(
+            ExpectedHotspots,
+            profile.Hotspots
+                .Select(hotspot => $"{hotspot.Frame.MethodName}|{hotspot.Frame.ModuleName}|{hotspot.InclusiveSampleCount}|{hotspot.ExclusiveSampleCount}")
+                .ToArray());
+
+        var rootNode = profile.CallTreeRoots.Single(node => node.Frame.MethodName == "Root");
+        Assert.AreEqual(4, rootNode.InclusiveSampleCount);
+        Assert.AreEqual(0, rootNode.ExclusiveSampleCount);
+        var callerOneNode = rootNode.Children.Single(node => node.Frame.MethodName == "CallerOne");
+        var callerTwoNode = rootNode.Children.Single(node => node.Frame.MethodName == "CallerTwo");
+        var otherLeafNode = rootNode.Children.Single(node => node.Frame.MethodName == "OtherLeaf");
+        var callerOneLeafNode = AssertSingleChild(callerOneNode);
+        var callerTwoLeafNode = AssertSingleChild(callerTwoNode);
+
+        Assert.AreEqual(2, callerOneNode.InclusiveSampleCount);
+        Assert.AreEqual(0, callerOneNode.ExclusiveSampleCount);
+        Assert.AreEqual(2, callerOneLeafNode.InclusiveSampleCount);
+        Assert.AreEqual(2, callerOneLeafNode.ExclusiveSampleCount);
+        Assert.AreEqual(1, callerTwoNode.InclusiveSampleCount);
+        Assert.AreEqual(0, callerTwoNode.ExclusiveSampleCount);
+        Assert.AreEqual(1, callerTwoLeafNode.InclusiveSampleCount);
+        Assert.AreEqual(1, callerTwoLeafNode.ExclusiveSampleCount);
+        Assert.AreEqual(1, otherLeafNode.InclusiveSampleCount);
+        Assert.AreEqual(1, otherLeafNode.ExclusiveSampleCount);
+        Assert.AreNotSame(callerOneLeafNode, callerTwoLeafNode);
+        Assert.AreEqual(callerOneLeafNode.Frame, callerTwoLeafNode.Frame);
+    }
+
+    [TestMethod]
+    public async Task BuildAsync_WhenRangeContainsNoSamples_ReturnsEmptyProfile()
+    {
+        await using var temporaryStore = CreateTemporaryStore();
+        var store = temporaryStore.Store;
+        var frameId = await AddFrameAsync(store, "Worker", "App", "worker");
+        var stackId = await store.GetOrAddStackAsync(-1, frameId, CancellationToken.None);
+        await AppendAsync(store, "00:00:01", stackId);
+        var range = Range("00:00:02", "00:00:03");
+
+        var profile = await new ExecutionProfileBuilder(store).BuildAsync(
+            range,
+            store.CaptureReadBoundary(),
+            lostEventCount: 0,
+            CancellationToken.None);
+
+        Assert.AreEqual(range, profile.TimeRange);
+        Assert.AreEqual(0, profile.ReceivedSampleCount);
+        Assert.AreEqual(0, profile.LostEventCount);
+        Assert.IsEmpty(profile.Hotspots);
+        Assert.IsEmpty(profile.CallTreeRoots);
+    }
+
+    [TestMethod]
+    public async Task BuildAsync_UsesSuppliedReadBoundaryAndExcludesLaterSamples()
+    {
+        await using var temporaryStore = CreateTemporaryStore();
+        var store = temporaryStore.Store;
+        var frameId = await AddFrameAsync(store, "Worker", "App", "worker");
+        var stackId = await store.GetOrAddStackAsync(-1, frameId, CancellationToken.None);
+        await AppendAsync(store, "00:00:01", stackId);
+        var boundary = store.CaptureReadBoundary();
+        await AppendAsync(store, "00:00:02", stackId);
+
+        var profile = await new ExecutionProfileBuilder(store).BuildAsync(
+            Range("00:00:00", "00:00:03"),
+            boundary,
+            lostEventCount: 0,
+            CancellationToken.None);
+
+        Assert.AreEqual(1, profile.ReceivedSampleCount);
+        Assert.AreEqual(1, profile.Hotspots.Single().InclusiveSampleCount);
+    }
+
+    [TestMethod]
+    public async Task BuildAsync_WhenCancelled_SubsequentQueryRemainsUsable()
+    {
+        await using var temporaryStore = CreateTemporaryStore();
+        var store = temporaryStore.Store;
+        var frameId = await AddFrameAsync(store, "Worker", "App", "worker");
+        var stackId = await store.GetOrAddStackAsync(-1, frameId, CancellationToken.None);
+        await AppendAsync(store, "00:00:01", stackId);
+        var range = Range("00:00:00", "00:00:02");
+        var boundary = store.CaptureReadBoundary();
+        var builder = new ExecutionProfileBuilder(store);
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsExactlyAsync<OperationCanceledException>(async () =>
+            await builder.BuildAsync(range, boundary, lostEventCount: 0, cancellation.Token));
+
+        var profile = await builder.BuildAsync(range, boundary, lostEventCount: 0, CancellationToken.None);
+
+        Assert.AreEqual(1, profile.ReceivedSampleCount);
+        Assert.AreEqual("Worker", profile.Hotspots.Single().Frame.MethodName);
+    }
+
+    [TestMethod]
+    public async Task GetStackFramesAsync_ReturnsDefensiveRootToLeafFrames()
+    {
+        await using var temporaryStore = CreateTemporaryStore();
+        var store = temporaryStore.Store;
+        var rootFrameId = await AddFrameAsync(store, "Root", "App", "root");
+        var leafFrameId = await AddFrameAsync(store, "Leaf", "App", "leaf");
+        var rootStackId = await store.GetOrAddStackAsync(-1, rootFrameId, CancellationToken.None);
+        var leafStackId = await store.GetOrAddStackAsync(rootStackId, leafFrameId, CancellationToken.None);
+
+        var frames = await store.GetStackFramesAsync(leafStackId, CancellationToken.None);
+
+        CollectionAssert.AreEqual(ExpectedRootToLeafFrameNames, frames.Select(frame => frame.MethodName).ToArray());
+        Assert.IsFalse(frames is ExecutionFrameDescriptor[]);
+        var mutableFrames = (IList<ExecutionFrameDescriptor>)frames;
+        Assert.ThrowsExactly<NotSupportedException>(() => mutableFrames[0] = frames[1]);
+    }
+
+    private static ExecutionCallTreeNode AssertSingleChild(ExecutionCallTreeNode parent)
+    {
+        Assert.HasCount(1, parent.Children);
+        return parent.Children[0];
+    }
+
+    private static async Task<int> AddFrameAsync(
+        ExecutionCaptureStore store,
+        string methodName,
+        string moduleName,
+        string symbolKey) =>
+        await store.GetOrAddFrameAsync(
+            new ExecutionFrameDescriptor(methodName, moduleName, $"C:\\{moduleName}.dll", symbolKey),
+            CancellationToken.None);
+
+    private static Task AppendAsync(ExecutionCaptureStore store, string time, int stackId) =>
+        store.AppendAsync(
+            new ExecutionSampleRecord(Instant(time), ThreadId: 7, stackId),
+            CancellationToken.None).AsTask();
+
+    private static ExecutionTimeRange Range(string start, string end) => new(Instant(start), Instant(end));
+
+    private static DateTimeOffset Instant(string time) =>
+        DateTimeOffset.ParseExact(
+            $"2026-09-07T{time}Z",
+            "yyyy-MM-dd'T'HH:mm:ss'Z'",
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal);
+
+    private static TemporaryExecutionCaptureStore CreateTemporaryStore()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "DotnetAnalysis.Tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        return new TemporaryExecutionCaptureStore(root, new ExecutionCaptureStore(new ExecutionCaptureStorageLayout(root)));
+    }
+
+    private sealed class TemporaryExecutionCaptureStore : IAsyncDisposable
+    {
+        private readonly string _root;
+
+        public TemporaryExecutionCaptureStore(string root, ExecutionCaptureStore store)
+        {
+            _root = root;
+            Store = store;
+        }
+
+        public ExecutionCaptureStore Store { get; }
+
+        public async ValueTask DisposeAsync()
+        {
+            await Store.DisposeAsync();
+            if (Directory.Exists(_root))
+            {
+                Directory.Delete(_root, recursive: true);
+            }
+        }
+    }
+}
