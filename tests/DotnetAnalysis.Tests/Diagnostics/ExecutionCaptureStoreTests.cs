@@ -102,34 +102,114 @@ public sealed class ExecutionCaptureStoreTests
     }
 
     [TestMethod]
-    public async Task ReadAsync_WhenAppendIsPausedBeforeBoundaryPublish_ExcludesPendingRecord()
+    public async Task ReadAsync_TwoReadersOverlapPendingBoundaryPublishAndCompletePriorBoundary()
     {
-        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var writerPausedBeforeBoundaryPublish = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releasePendingAppend = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource<ExecutionSampleRecord>[] firstRecordsRead =
+        [
+            new(TaskCreationOptions.RunContinuationsAsynchronously),
+            new(TaskCreationOptions.RunContinuationsAsynchronously)
+        ];
         var calls = 0;
         await using var temporaryStore = CreateTemporaryStore(beforeBoundaryPublishAsync: async () =>
         {
             if (Interlocked.Increment(ref calls) == 2)
             {
-                entered.TrySetResult();
-                await release.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                writerPausedBeforeBoundaryPublish.TrySetResult();
+                await releasePendingAppend.Task.WaitAsync(TimeSpan.FromSeconds(5));
             }
         });
         var store = temporaryStore.Store;
-        await store.AppendAsync(Sample("00:00:01"), CancellationToken.None);
-        var pendingAppend = store.AppendAsync(Sample("00:00:02"), CancellationToken.None).AsTask();
+        var committedSample = Sample("00:00:01");
+        var pendingSample = Sample("00:00:02");
+        ExecutionSampleRecord[] committedPrefix = [committedSample];
+        await store.AppendAsync(committedSample, CancellationToken.None);
+        var pendingAppend = store.AppendAsync(pendingSample, CancellationToken.None).AsTask();
+        using var readerCancellation = new CancellationTokenSource(ConcurrentTestTimeout);
+        Task<BoundaryObservation>[] readers = [];
         try
         {
-            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-            var boundary = store.CaptureReadBoundary();
-            var records = await store.ReadAsync(Range("00:00:00", "00:00:03"), boundary, CancellationToken.None).ToListAsync();
+            await writerPausedBeforeBoundaryPublish.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.IsFalse(pendingAppend.IsCompleted, "Append completed before readers captured the prior boundary.");
+            readers =
+            [
+                ReadBoundaryWithFirstRecordHandshakeAsync(
+                    store,
+                    readerIndex: 0,
+                    firstRecordsRead[0],
+                    releasePendingAppend.Task,
+                    readerCancellation.Token),
+                ReadBoundaryWithFirstRecordHandshakeAsync(
+                    store,
+                    readerIndex: 1,
+                    firstRecordsRead[1],
+                    releasePendingAppend.Task,
+                    readerCancellation.Token)
+            ];
 
-            Assert.HasCount(1, records);
+            var firstRecords = await Task.WhenAll(firstRecordsRead.Select(source => source.Task))
+                .WaitAsync(TimeSpan.FromSeconds(5));
+            ExecutionSampleRecord[] expectedFirstRecords = [committedSample, committedSample];
+
+            AssertRecordPrefix(
+                expectedFirstRecords,
+                expectedFirstRecords.Length,
+                firstRecords,
+                "First-record handshakes");
+            Assert.IsFalse(
+                pendingAppend.IsCompleted,
+                "Append completed before both readers proved that they were enumerating the prior boundary.");
+
+            releasePendingAppend.TrySetResult();
+            var observations = await Task.WhenAll(readers).WaitAsync(readerCancellation.Token);
+            await pendingAppend.WaitAsync(readerCancellation.Token);
+
+            Assert.HasCount(2, observations);
+            foreach (var observation in observations)
+            {
+                Assert.AreEqual(
+                    0,
+                    observation.Boundary.LastCompletedRecord,
+                    $"Reader {observation.ReaderIndex} captured a boundary containing the pending record.");
+                AssertRecordPrefix(
+                    committedPrefix,
+                    committedPrefix.Length,
+                    observation.Records,
+                    $"Reader {observation.ReaderIndex} prior boundary");
+            }
+
+            var publishedBoundary = store.CaptureReadBoundary();
+            var publishedRecords = await store.ReadAsync(
+                Range("00:00:00", "00:00:03"),
+                publishedBoundary,
+                readerCancellation.Token).ToListAsync().AsTask().WaitAsync(readerCancellation.Token);
+            ExecutionSampleRecord[] publishedSamples = [committedSample, pendingSample];
+
+            Assert.AreEqual(
+                observations[0].Boundary.LastCompletedRecord + 1,
+                publishedBoundary.LastCompletedRecord,
+                "Publishing the pending append must advance the stable boundary by exactly one record.");
+            AssertRecordPrefix(publishedSamples, publishedSamples.Length, publishedRecords, "Published boundary");
         }
         finally
         {
-            release.TrySetResult();
-            await pendingAppend.WaitAsync(TimeSpan.FromSeconds(5));
+            releasePendingAppend.TrySetResult();
+            Task[] cleanupTasks = [pendingAppend, .. readers];
+            var cleanup = Task.WhenAll(cleanupTasks);
+            try
+            {
+                await cleanup.WaitAsync(TimeSpan.FromSeconds(5));
+            }
+            catch (TimeoutException)
+            {
+                readerCancellation.Cancel();
+                await cleanup.WaitAsync(TimeSpan.FromSeconds(5));
+            }
+            finally
+            {
+                readerCancellation.Cancel();
+            }
         }
     }
 
@@ -409,6 +489,33 @@ public sealed class ExecutionCaptureStoreTests
             cancellation.Cancel();
             throw;
         }
+    }
+
+    private static async Task<BoundaryObservation> ReadBoundaryWithFirstRecordHandshakeAsync(
+        ExecutionCaptureStore store,
+        int readerIndex,
+        TaskCompletionSource<ExecutionSampleRecord> firstRecordRead,
+        Task releaseAfterFirstRecordsRead,
+        CancellationToken cancellationToken)
+    {
+        var boundary = store.CaptureReadBoundary();
+        var records = new List<ExecutionSampleRecord>();
+        await using var reader = store.ReadAsync(
+            Range("00:00:00", "00:00:03"),
+            boundary,
+            cancellationToken).GetAsyncEnumerator(cancellationToken);
+        var hasFirstRecord = await reader.MoveNextAsync().AsTask().WaitAsync(cancellationToken);
+        Assert.IsTrue(hasFirstRecord, $"Reader {readerIndex} did not observe the committed prefix.");
+        records.Add(reader.Current);
+        firstRecordRead.TrySetResult(reader.Current);
+        await releaseAfterFirstRecordsRead.WaitAsync(cancellationToken);
+
+        while (await reader.MoveNextAsync().AsTask().WaitAsync(cancellationToken))
+        {
+            records.Add(reader.Current);
+        }
+
+        return new BoundaryObservation(readerIndex, ObservationIndex: 0, boundary, records);
     }
 
     private static async Task AppendInControlledBatchesAsync(
