@@ -1,6 +1,7 @@
 using System.Diagnostics.CodeAnalysis;
 using DotnetAnalysis.Core.Diagnostics;
 using DotnetAnalysis.Diagnostics.Windows;
+using Microsoft.Diagnostics.Symbols;
 using Microsoft.Extensions.Logging;
 
 namespace DotnetAnalysis.Tests.Diagnostics;
@@ -220,6 +221,42 @@ public sealed class ExecutionSymbolResolverTests
         Assert.AreEqual(4, reader.ModuleIdentity?.PdbAge);
         Assert.AreEqual(Path.GetFullPath(modulePath), reader.ModulePath);
         Assert.AreEqual(1, reader.SourceLineCallCount);
+        Assert.IsNotNull(readerFactory.SecurityCheck);
+        Assert.IsTrue(readerFactory.SecurityCheck(pdbPath));
+        Assert.IsFalse(readerFactory.SecurityCheck("C:\\other\\Worker.pdb"));
+        Assert.IsFalse(readerFactory.SecurityCheck("C:\\app\\nested\\Worker.pdb"));
+        Assert.IsFalse(readerFactory.SecurityCheck("\\\\?\\C:\\app\\Worker.pdb"));
+        Assert.IsFalse(readerFactory.SecurityCheck("\\\\.\\C:\\app\\Worker.pdb"));
+    }
+
+    [TestMethod]
+    public void CreateConfiguredReader_AppliesOfflineSettingsAndSecurityCheck()
+    {
+        var moduleDirectory = Path.Combine(Path.GetTempPath(), "DotnetAnalysis.Tests", Guid.NewGuid().ToString("N"));
+        var allowedPath = Path.Combine(moduleDirectory, "Worker.pdb");
+        var deniedPath = Path.Combine(moduleDirectory, "Other.pdb");
+        Directory.CreateDirectory(moduleDirectory);
+
+        try
+        {
+            Func<string, bool> securityCheck =
+                path => string.Equals(path, allowedPath, StringComparison.OrdinalIgnoreCase);
+            using var reader = TraceEventExecutionSymbolReaderFactory.CreateConfiguredReader(
+                moduleDirectory,
+                securityCheck);
+
+            Assert.AreEqual(moduleDirectory, reader.SymbolPath);
+            Assert.AreEqual(string.Empty, reader.SourcePath);
+            Assert.IsTrue(reader.Options.HasFlag(SymbolReaderOptions.CacheOnly));
+            Assert.IsTrue(reader.Options.HasFlag(SymbolReaderOptions.NoNGenSymbolCreation));
+            Assert.AreSame(securityCheck, reader.SecurityCheck);
+            Assert.IsTrue(reader.SecurityCheck(allowedPath));
+            Assert.IsFalse(reader.SecurityCheck(deniedPath));
+        }
+        finally
+        {
+            Directory.Delete(moduleDirectory, recursive: true);
+        }
     }
 
     [TestMethod]
@@ -279,7 +316,9 @@ public sealed class ExecutionSymbolResolverTests
     [TestMethod]
     [DataRow("\\\\server\\share\\Worker.dll")]
     [DataRow("M:\\Worker.dll")]
-    public async Task ResolveAsync_DefaultLookup_WhenModuleIsNetworkPath_DoesNotProbeFileSystem(string modulePath)
+    [DataRow("\\\\?\\C:\\app\\Worker.dll")]
+    [DataRow("\\\\.\\C:\\app\\Worker.dll")]
+    public async Task ResolveAsync_DefaultLookup_WhenModuleIsNonLocalPath_DoesNotProbeFileSystem(string modulePath)
     {
         var fileSystem = new ControlledExecutionLocalFileSystem([], ["M:\\"]);
         var readerFactory = new ControlledExecutionSymbolReaderFactory(
@@ -304,7 +343,9 @@ public sealed class ExecutionSymbolResolverTests
     [TestMethod]
     [DataRow("\\\\server\\share\\Worker.pdb")]
     [DataRow("M:\\Worker.pdb")]
-    public async Task ResolveAsync_DefaultLookup_WhenPdbMetadataIsNetworkPath_DoesNotProbePdb(string pdbMetadataPath)
+    [DataRow("\\\\?\\C:\\app\\Worker.pdb")]
+    [DataRow("\\\\.\\C:\\app\\Worker.pdb")]
+    public async Task ResolveAsync_DefaultLookup_WhenPdbMetadataIsNonLocalPath_DoesNotProbePdb(string pdbMetadataPath)
     {
         var fileSystem = new ControlledExecutionLocalFileSystem([], ["M:\\"]);
         var readerFactory = new ControlledExecutionSymbolReaderFactory(
@@ -329,7 +370,9 @@ public sealed class ExecutionSymbolResolverTests
     [TestMethod]
     [DataRow("\\\\server\\share\\Worker.pdb")]
     [DataRow("M:\\Worker.pdb")]
-    public async Task ResolveAsync_DefaultLookup_WhenMatchedPdbIsNetworkPath_DoesNotReadSource(string matchedPdbPath)
+    [DataRow("\\\\?\\C:\\app\\Worker.pdb")]
+    [DataRow("\\\\.\\C:\\app\\Worker.pdb")]
+    public async Task ResolveAsync_DefaultLookup_WhenMatchedPdbIsNonLocalPath_DoesNotReadSource(string matchedPdbPath)
     {
         const string localPdbPath = "C:\\app\\Worker.pdb";
         var fileSystem = new ControlledExecutionLocalFileSystem([localPdbPath], ["M:\\"]);
@@ -357,7 +400,9 @@ public sealed class ExecutionSymbolResolverTests
     [TestMethod]
     [DataRow("\\\\server\\share\\Worker.cs")]
     [DataRow("M:\\Worker.cs")]
-    public async Task ResolveAsync_WhenSourceIsNetworkPath_DoesNotProbeSourceExistence(string sourcePath)
+    [DataRow("\\\\?\\C:\\app\\Worker.cs")]
+    [DataRow("\\\\.\\C:\\app\\Worker.cs")]
+    public async Task ResolveAsync_WhenSourceIsNonLocalPath_DoesNotProbeSourceExistence(string sourcePath)
     {
         var fileSystem = new ControlledExecutionLocalFileSystem([], ["M:\\"]);
         var lookup = new ControlledSourceLocationLookup(
@@ -532,11 +577,13 @@ public sealed class ExecutionSymbolResolverTests
 
         public string? ModuleDirectory { get; private set; }
 
+        public Func<string, bool>? SecurityCheck { get; private set; }
+
         public IExecutionSymbolReader Create(string moduleDirectory, Func<string, bool> securityCheck)
         {
-            _ = securityCheck;
             CreateCallCount++;
             ModuleDirectory = moduleDirectory;
+            SecurityCheck = securityCheck;
             return _reader;
         }
     }

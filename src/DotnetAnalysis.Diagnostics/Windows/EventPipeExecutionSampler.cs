@@ -110,7 +110,7 @@ internal sealed class DiagnosticsClientExecutionSamplingRuntime : IEventPipeExec
         public void Dispose() => Session.Dispose();
     }
 
-    private sealed class TraceEventExecutionTraceSource : IEventPipeExecutionTraceSource
+    internal sealed class TraceEventExecutionTraceSource : IEventPipeExecutionTraceSource
     {
         private readonly TraceLogEventSource _source;
         private SampleProfilerTraceEventParser? _sampleProfiler;

@@ -91,13 +91,23 @@ internal sealed class TraceEventExecutionSymbolReaderFactory : IExecutionSymbolR
 {
     public IExecutionSymbolReader Create(string moduleDirectory, Func<string, bool> securityCheck)
     {
-        var reader = new SymbolReader(TextWriter.Null, moduleDirectory)
+        var reader = CreateConfiguredReader(moduleDirectory, securityCheck);
+        return new TraceEventExecutionSymbolReader(reader);
+    }
+
+    internal static SymbolReader CreateConfiguredReader(
+        string moduleDirectory,
+        Func<string, bool> securityCheck)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(moduleDirectory);
+        ArgumentNullException.ThrowIfNull(securityCheck);
+
+        return new SymbolReader(TextWriter.Null, moduleDirectory)
         {
             Options = SymbolReaderOptions.CacheOnly | SymbolReaderOptions.NoNGenSymbolCreation,
             SourcePath = string.Empty,
             SecurityCheck = securityCheck
         };
-        return new TraceEventExecutionSymbolReader(reader);
     }
 
     private sealed class TraceEventExecutionSymbolReader : IExecutionSymbolReader

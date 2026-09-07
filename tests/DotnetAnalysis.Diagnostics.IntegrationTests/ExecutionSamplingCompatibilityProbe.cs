@@ -1,21 +1,17 @@
-using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.Diagnostics.Tracing;
 using System.Globalization;
 using System.Text.Json;
-using Microsoft.Diagnostics.NETCore.Client;
-using Microsoft.Diagnostics.Tracing;
-using Microsoft.Diagnostics.Tracing.EventPipe;
-using Microsoft.Diagnostics.Tracing.Etlx;
-using Microsoft.Diagnostics.Tracing.Parsers;
-using Microsoft.Diagnostics.Tracing.Parsers.Clr;
+using DotnetAnalysis.Core.Diagnostics;
+using DotnetAnalysis.Diagnostics.Windows;
 
 namespace DotnetAnalysis.Diagnostics.IntegrationTests;
 
 internal sealed record ExecutionSamplingProbeResult(
     long ReceivedSampleCount,
     long EventsLost,
-    IReadOnlyList<string> ManagedMethodNames);
+    IReadOnlyList<string> ManagedMethodNames,
+    IReadOnlyList<string> RepresentativeManagedStack,
+    bool UsedTraceEventExecutionSource);
 
 internal static class ExecutionSamplingCompatibilityProbe
 {
@@ -26,9 +22,15 @@ internal static class ExecutionSamplingCompatibilityProbe
         TimeSpan duration,
         CancellationToken cancellationToken)
     {
-        var managedMethodNames = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+        var managedMethodNames = new HashSet<string>(StringComparer.Ordinal);
+        string[] representativeManagedStack = [];
+        var usedTraceEventExecutionSource = false;
         var runtimeTargetFramework = "unknown";
         var capturedAtUtc = DateTimeOffset.UtcNow;
+        var storageRoot = Path.Combine(
+            Path.GetTempPath(),
+            "DotnetAnalysis.Diagnostics.IntegrationTests",
+            Guid.NewGuid().ToString("N"));
         long receivedSampleCount = 0;
         long eventsLost = 0;
         Exception? probeException = null;
@@ -39,56 +41,70 @@ internal static class ExecutionSamplingCompatibilityProbe
             ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(duration, TimeSpan.Zero);
             cancellationToken.ThrowIfCancellationRequested();
 
-            var client = new DiagnosticsClient(processId);
-            var providers = new[]
+            var store = new ExecutionCaptureStore(new ExecutionCaptureStorageLayout(storageRoot));
+            await using (store.ConfigureAwait(false))
             {
-                new EventPipeProvider(
-                    ClrTraceEventParser.ProviderName,
-                    EventLevel.Informational,
-                    (long)ClrTraceEventParser.Keywords.Default),
-                new EventPipeProvider(
-                    SampleProfilerTraceEventParser.ProviderName,
-                    EventLevel.Informational)
-            };
-            using var session = client.StartEventPipeSession(providers, requestRundown: false);
-            using var source = TraceLog.CreateFromEventPipeSession(
-                session,
-                TraceLog.EventPipeRundownConfiguration.Enable(client));
-            var sampleProfiler = new SampleProfilerTraceEventParser(source);
-            sampleProfiler.ThreadSample += data =>
-            {
-                Interlocked.Increment(ref receivedSampleCount);
-                var stack = data.CallStack();
-                if (stack is null)
+                var runtime = new ProductionAdapterObservingRuntime();
+                var sampler = new EventPipeExecutionSampler(store, runtime, TimeSpan.FromSeconds(5));
+                await using (sampler.ConfigureAwait(false))
                 {
-                    return;
-                }
-                for (TraceCallStack? frame = stack; frame is not null; frame = frame.Caller)
-                {
-                    var methodName = frame.CodeAddress.FullMethodName;
-                    if (!string.IsNullOrWhiteSpace(methodName))
+                    await sampler.StartAsync(CreateTargetProcess(processId), cancellationToken).ConfigureAwait(false);
+                    try
                     {
-                        managedMethodNames.TryAdd(methodName, 0);
+                        await Task.Delay(duration, cancellationToken).ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        await sampler.StopAsync(CancellationToken.None).ConfigureAwait(false);
+                    }
+
+                    if (sampler.TerminalFailure is { } terminalFailure)
+                    {
+                        throw terminalFailure;
+                    }
+
+                    receivedSampleCount = sampler.SuccessfulSampleCount;
+                    eventsLost = sampler.LostEventCount;
+                    usedTraceEventExecutionSource = runtime.UsedTraceEventExecutionSource;
+
+                    var boundary = store.CaptureReadBoundary();
+                    var rangeEnd = boundary.WrittenThroughUtc == DateTimeOffset.MaxValue
+                        ? boundary.WrittenThroughUtc
+                        : boundary.WrittenThroughUtc.AddTicks(1);
+                    var range = new ExecutionTimeRange(boundary.StartedAtUtc, rangeEnd);
+                    var stacksById = new Dictionary<int, IReadOnlyList<ExecutionFrameReference>>();
+                    await foreach (var sample in store.ReadAsync(range, boundary, cancellationToken)
+                        .WithCancellation(cancellationToken)
+                        .ConfigureAwait(false))
+                    {
+                        if (!stacksById.TryGetValue(sample.StackId, out var frames))
+                        {
+                            frames = await store.GetStackFramesAsync(sample.StackId, cancellationToken).ConfigureAwait(false);
+                            stacksById.Add(sample.StackId, frames);
+                        }
+
+                        var methodNames = frames
+                            .Select(static frame => frame.Descriptor.MethodName)
+                            .ToArray();
+                        foreach (var methodName in methodNames)
+                        {
+                            managedMethodNames.Add(methodName);
+                        }
+
+                        if (representativeManagedStack.Length == 0 && ContainsWorkloadRootAndPath(methodNames))
+                        {
+                            representativeManagedStack = methodNames;
+                        }
                     }
                 }
-            };
-
-            var processing = Task.Run(source.Process, CancellationToken.None);
-            try
-            {
-                await Task.Delay(duration, cancellationToken).ConfigureAwait(false);
-            }
-            finally
-            {
-                session.Stop();
-                await processing.WaitAsync(TimeSpan.FromSeconds(5), CancellationToken.None).ConfigureAwait(false);
-                eventsLost = source.EventsLost;
             }
 
             return new ExecutionSamplingProbeResult(
                 receivedSampleCount,
                 eventsLost,
-                managedMethodNames.Keys.OrderBy(static name => name, StringComparer.Ordinal).ToArray());
+                managedMethodNames.OrderBy(static name => name, StringComparer.Ordinal).ToArray(),
+                representativeManagedStack,
+                usedTraceEventExecutionSource);
         }
         catch (Exception exception)
         {
@@ -99,20 +115,52 @@ internal static class ExecutionSamplingCompatibilityProbe
         {
             try
             {
-                await WriteEvidenceAsync(
-                    capturedAtUtc,
-                    runtimeTargetFramework,
-                    processId,
-                    receivedSampleCount,
-                    eventsLost,
-                    managedMethodNames.Keys.OrderBy(static name => name, StringComparer.Ordinal).Take(20).ToArray(),
-                    probeException).ConfigureAwait(false);
+                try
+                {
+                    await WriteEvidenceAsync(
+                        capturedAtUtc,
+                        runtimeTargetFramework,
+                        processId,
+                        receivedSampleCount,
+                        eventsLost,
+                        managedMethodNames.OrderBy(static name => name, StringComparer.Ordinal).Take(20).ToArray(),
+                        representativeManagedStack,
+                        usedTraceEventExecutionSource,
+                        probeException).ConfigureAwait(false);
+                }
+                catch when (probeException is not null)
+                {
+                }
             }
-            catch when (probeException is not null)
+            finally
             {
+                try
+                {
+                    if (Directory.Exists(storageRoot))
+                    {
+                        Directory.Delete(storageRoot, recursive: true);
+                    }
+                }
+                catch when (probeException is not null)
+                {
+                }
             }
         }
     }
+
+    private static TargetProcess CreateTargetProcess(int processId)
+    {
+        using var process = Process.GetProcessById(processId);
+        return new TargetProcess(
+            process.Id,
+            new DateTimeOffset(process.StartTime.ToUniversalTime()),
+            process.ProcessName,
+            process.MainModule?.FileName);
+    }
+
+    private static bool ContainsWorkloadRootAndPath(IReadOnlyList<string> methodNames) =>
+        methodNames.Any(static name => name.Contains("ExecutionSamplingWorkload.RunWorker(", StringComparison.Ordinal))
+        && methodNames.Any(static name => name.Contains("ExecutionSamplingWorkload.Path", StringComparison.Ordinal));
 
     private static string ResolveRuntimeTargetFramework(int processId)
     {
@@ -144,6 +192,8 @@ internal static class ExecutionSamplingCompatibilityProbe
         long receivedSampleCount,
         long eventsLost,
         IReadOnlyList<string> managedMethodNames,
+        IReadOnlyList<string> representativeManagedStack,
+        bool usedTraceEventExecutionSource,
         Exception? exception)
     {
         var artifactDirectory = Path.Combine(
@@ -159,11 +209,35 @@ internal static class ExecutionSamplingCompatibilityProbe
             receivedSampleCount,
             eventsLost,
             managedMethodNames = managedMethodNames.Take(20).ToArray(),
+            representativeManagedStack,
+            usedTraceEventExecutionSource,
             targetMethodObserved = managedMethodNames.Any(name => name.Contains("ExecutionSamplingWorkload", StringComparison.Ordinal)),
             exception = exception?.ToString()
         };
         return File.WriteAllTextAsync(
             Path.Combine(artifactDirectory, "compatibility-probe.json"),
             JsonSerializer.Serialize(artifact, s_indentedJson));
+    }
+
+    private sealed class ProductionAdapterObservingRuntime : IEventPipeExecutionRuntime
+    {
+        private readonly DiagnosticsClientExecutionSamplingRuntime _runtime = new();
+
+        public bool UsedTraceEventExecutionSource { get; private set; }
+
+        public IEventPipeExecutionSession StartSession(
+            int processId,
+            IReadOnlyCollection<Microsoft.Diagnostics.NETCore.Client.EventPipeProvider> providers,
+            bool requestRundown,
+            int circularBufferMegabytes) =>
+            _runtime.StartSession(processId, providers, requestRundown, circularBufferMegabytes);
+
+        public IEventPipeExecutionTraceSource CreateTraceSource(IEventPipeExecutionSession session)
+        {
+            var source = _runtime.CreateTraceSource(session);
+            UsedTraceEventExecutionSource =
+                source is DiagnosticsClientExecutionSamplingRuntime.TraceEventExecutionTraceSource;
+            return source;
+        }
     }
 }

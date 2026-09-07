@@ -15,7 +15,8 @@ public sealed class ExecutionSamplingCompatibilityProbeTests
     [TestCategory("WindowsDiagnosticsIntegration")]
     [DoNotParallelize]
     [Timeout(15_000, CooperativeCancellation = true)]
-    public async Task SampleProfiler_OnSupportedTarget_ProducesManagedStackAndNoLostEvents(string targetFramework)
+    public async Task EventPipeExecutionSampler_OnSupportedTarget_UsesProductionAdapterAndPersistsRootToLeafStack(
+        string targetFramework)
     {
         await using var target = await IntegrationTestHost.StartTargetAsync(
             targetFramework,
@@ -27,10 +28,22 @@ public sealed class ExecutionSamplingCompatibilityProbeTests
             TimeSpan.FromSeconds(10),
             timeout.Token);
 
+        Assert.IsTrue(
+            result.UsedTraceEventExecutionSource,
+            "The sampler must consume the production TraceEvent execution source adapter.");
         Assert.IsGreaterThan(0L, result.ReceivedSampleCount);
         Assert.IsTrue(
             result.ManagedMethodNames.Any(name => name.Contains("ExecutionSamplingWorkload", StringComparison.Ordinal)),
             "The Sample Profiler call stacks must contain the controlled execution workload.");
+        var rootIndex = FindFrameIndex(
+            result.RepresentativeManagedStack,
+            "ExecutionSamplingWorkload.RunWorker(");
+        var leafIndex = FindFrameIndex(
+            result.RepresentativeManagedStack,
+            "ExecutionSamplingWorkload.Path");
+        Assert.IsGreaterThanOrEqualTo(0, rootIndex, "The representative stack must contain RunWorker.");
+        Assert.IsGreaterThanOrEqualTo(0, leafIndex, "The representative stack must contain a Path method.");
+        Assert.IsLessThan(leafIndex, rootIndex, "Managed frames must be persisted from root to leaf.");
         Assert.AreEqual(0L, result.EventsLost);
     }
 
@@ -75,6 +88,19 @@ public sealed class ExecutionSamplingCompatibilityProbeTests
             ? Directory.EnumerateFiles(artifactRoot, "compatibility-probe.json", SearchOption.AllDirectories)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase)
             : [];
+    }
+
+    private static int FindFrameIndex(IReadOnlyList<string> frames, string methodFragment)
+    {
+        for (var index = 0; index < frames.Count; index++)
+        {
+            if (frames[index].Contains(methodFragment, StringComparison.Ordinal))
+            {
+                return index;
+            }
+        }
+
+        return -1;
     }
 
     private static void AssertNewExceptionEvidence(
