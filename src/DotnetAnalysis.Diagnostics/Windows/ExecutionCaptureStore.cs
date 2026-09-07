@@ -48,6 +48,7 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
     private long _lastCompletedRecord = -1;
     private int _activeReaderCount;
     private bool _disposeStarted;
+    private DiagnosticsException? _writeFailure;
     private TaskCompletionSource? _readersDrained;
     private Task? _disposeTask;
 
@@ -107,6 +108,7 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         try
         {
             ThrowIfDisposing();
+            ThrowIfWriteFailed();
             var key = new ExecutionStackKey(parentStackId, frameId);
             if (_stackIds.TryGetValue(key, out var existingId))
             {
@@ -154,15 +156,27 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
                 {
                     if (segment is not null)
                     {
-                        await SealSegmentAsync(segment, CancellationToken.None).ConfigureAwait(false);
+                        await SealSegmentAsync(segment).ConfigureAwait(false);
                     }
 
                     segment = await CreateSegmentAsync(normalizedSample.ObservedAtUtc, CancellationToken.None).ConfigureAwait(false);
                     recordLength = EncodeRecord(normalizedSample, segment.AnchorUtc, record);
                 }
 
-                await WriteRecordAsync(segment.Stream, record.AsMemory(0, recordLength), cancellationToken).ConfigureAwait(false);
-                await FlushRecordAsync(segment.Stream, cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    await WriteRecordAsync(segment.Stream, record.AsMemory(0, recordLength), CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (DiagnosticsException exception)
+                {
+                    lock (_stateLock)
+                    {
+                        _writeFailure ??= exception;
+                    }
+
+                    throw;
+                }
+
                 lock (_stateLock)
                 {
                     segment.DataLength += recordLength;
@@ -282,7 +296,7 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
                 await readersDrained.ConfigureAwait(false);
                 if (_currentSegment is not null)
                 {
-                    await SealSegmentAsync(_currentSegment, CancellationToken.None).ConfigureAwait(false);
+                    await SealSegmentAsync(_currentSegment).ConfigureAwait(false);
                 }
 
                 foreach (var segment in _segments)
@@ -292,9 +306,12 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
 
                 _currentSegment = null;
 
-                if (Directory.Exists(_layout.SessionDirectory))
+                try
                 {
                     Directory.Delete(_layout.SessionDirectory, recursive: true);
+                }
+                catch (DirectoryNotFoundException)
+                {
                 }
             }
             finally
@@ -321,7 +338,7 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
                 FileMode.CreateNew,
                 FileAccess.ReadWrite,
                 FileShare.ReadWrite,
-                bufferSize: 64 * 1024,
+                bufferSize: 1,
                 options: FileOptions.Asynchronous | FileOptions.SequentialScan);
             await WriteSegmentHeaderAsync(segment, cancellationToken).ConfigureAwait(false);
             segment.Stream.Position = SegmentHeaderLength;
@@ -339,23 +356,15 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
-    private static async Task SealSegmentAsync(ExecutionCaptureSegment segment, CancellationToken cancellationToken)
+    private static Task SealSegmentAsync(ExecutionCaptureSegment segment)
     {
         if (segment.IsSealed)
         {
-            return;
+            return Task.CompletedTask;
         }
 
-        await WriteSegmentHeaderAsync(segment, cancellationToken).ConfigureAwait(false);
-        try
-        {
-            await segment.Stream.FlushAsync(cancellationToken).ConfigureAwait(false);
-            segment.IsSealed = true;
-        }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-        {
-            throw ExecutionCaptureStorageLayout.CreateStorageException("Execution capture segment could not be sealed.", exception);
-        }
+        segment.IsSealed = true;
+        return Task.CompletedTask;
     }
 
     private static async Task WriteRecordAsync(FileStream stream, ReadOnlyMemory<byte> record, CancellationToken cancellationToken)
@@ -367,18 +376,6 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
             throw ExecutionCaptureStorageLayout.CreateStorageException("Execution sample could not be written.", exception);
-        }
-    }
-
-    private static async Task FlushRecordAsync(FileStream stream, CancellationToken cancellationToken)
-    {
-        try
-        {
-            await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-        {
-            throw ExecutionCaptureStorageLayout.CreateStorageException("Completed execution sample could not be flushed.", exception);
         }
     }
 
@@ -519,6 +516,17 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         lock (_stateLock)
         {
             ThrowIfDisposingLocked();
+        }
+    }
+
+    private void ThrowIfWriteFailed()
+    {
+        lock (_stateLock)
+        {
+            if (_writeFailure is not null)
+            {
+                throw _writeFailure;
+            }
         }
     }
 

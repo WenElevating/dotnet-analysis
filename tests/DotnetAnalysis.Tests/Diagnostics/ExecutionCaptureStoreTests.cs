@@ -79,6 +79,26 @@ public sealed class ExecutionCaptureStoreTests
     }
 
     [TestMethod]
+    public async Task ReadAsync_RemainsValidWhenAppendRotatesAnotherSegment()
+    {
+        await using var temporaryStore = CreateTemporaryStore(segmentDataLimitBytes: 3);
+        var store = temporaryStore.Store;
+        await store.AppendAsync(Sample("00:00:01"), CancellationToken.None);
+        var boundary = store.CaptureReadBoundary();
+        var reader = store.ReadAsync(Range("00:00:00", "00:00:03"), boundary, CancellationToken.None).GetAsyncEnumerator();
+        try
+        {
+            Assert.IsTrue(await reader.MoveNextAsync());
+            await store.AppendAsync(Sample("00:00:02"), CancellationToken.None);
+            Assert.IsFalse(await reader.MoveNextAsync());
+        }
+        finally
+        {
+            await reader.DisposeAsync();
+        }
+    }
+
+    [TestMethod]
     public async Task ReadAsync_CancellingOneReadDoesNotCancelAnotherRead()
     {
         await using var temporaryStore = CreateTemporaryStore();
