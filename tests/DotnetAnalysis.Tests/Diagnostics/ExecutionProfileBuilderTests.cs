@@ -160,6 +160,149 @@ public sealed class ExecutionProfileBuilderTests
     }
 
     [TestMethod]
+    public async Task BuildAsync_WhenCancelledDuringPostReadHotspotSort_SubsequentQueryRemainsUsable()
+    {
+        await using var temporaryStore = CreateTemporaryStore();
+        var store = temporaryStore.Store;
+        const int sampleCount = 128;
+        for (var index = 0; index < sampleCount; index++)
+        {
+            var frameId = await AddFrameAsync(
+                store,
+                $"Worker{sampleCount - index:D3}",
+                "App",
+                $"worker-{index}");
+            var stackId = await store.GetOrAddStackAsync(-1, frameId, CancellationToken.None);
+            await AppendAsync(store, "00:00:01", stackId);
+        }
+
+        var range = Range("00:00:00", "00:00:02");
+        var boundary = store.CaptureReadBoundary();
+        using var cancellation = new CancellationTokenSource();
+        var hotspotComparisons = 0;
+        var cancelledBuilder = new ExecutionProfileBuilder(
+            store,
+            beforeHotspotComparison: () =>
+            {
+                if (Interlocked.Increment(ref hotspotComparisons) == 1)
+                {
+                    cancellation.Cancel();
+                }
+            });
+
+        await Assert.ThrowsExactlyAsync<OperationCanceledException>(async () =>
+            await cancelledBuilder.BuildAsync(range, boundary, lostEventCount: 0, cancellation.Token));
+
+        Assert.IsGreaterThan(0, hotspotComparisons);
+        var profile = await new ExecutionProfileBuilder(store).BuildAsync(
+            range,
+            boundary,
+            lostEventCount: 0,
+            CancellationToken.None);
+
+        Assert.AreEqual(sampleCount, profile.ReceivedSampleCount);
+        Assert.HasCount(sampleCount, profile.Hotspots);
+    }
+
+    [TestMethod]
+    public async Task BuildAsync_WhenCancelledDuringRecursiveCallTreeMaterialization_SubsequentQueryRemainsUsable()
+    {
+        await using var temporaryStore = CreateTemporaryStore();
+        var store = temporaryStore.Store;
+        var rootFrameId = await AddFrameAsync(store, "Root", "App", "root");
+        var leafFrameId = await AddFrameAsync(store, "Leaf", "App", "leaf");
+        var rootStackId = await store.GetOrAddStackAsync(-1, rootFrameId, CancellationToken.None);
+        var leafStackId = await store.GetOrAddStackAsync(rootStackId, leafFrameId, CancellationToken.None);
+        await AppendAsync(store, "00:00:01", leafStackId);
+        var range = Range("00:00:00", "00:00:02");
+        var boundary = store.CaptureReadBoundary();
+        using var cancellation = new CancellationTokenSource();
+        var materializedNodeCount = 0;
+        var cancelledBuilder = new ExecutionProfileBuilder(
+            store,
+            beforeCallTreeNodeMaterialization: () =>
+            {
+                if (Interlocked.Increment(ref materializedNodeCount) == 2)
+                {
+                    cancellation.Cancel();
+                }
+            });
+
+        await Assert.ThrowsExactlyAsync<OperationCanceledException>(async () =>
+            await cancelledBuilder.BuildAsync(range, boundary, lostEventCount: 0, cancellation.Token));
+
+        Assert.AreEqual(2, materializedNodeCount);
+        var profile = await new ExecutionProfileBuilder(store).BuildAsync(
+            range,
+            boundary,
+            lostEventCount: 0,
+            CancellationToken.None);
+
+        Assert.AreEqual(1, profile.ReceivedSampleCount);
+        Assert.AreEqual("Root", profile.CallTreeRoots.Single().Frame.MethodName);
+    }
+
+    [TestMethod]
+    public async Task BuildAsync_WhenDisposeOwnsWriterDuringStackResolution_CompletesAndCleansUp()
+    {
+        var stackResolutionEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseStackResolution = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var disposerOwnsWriter = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var temporaryStore = CreateTemporaryStore(
+            beforeStackFramesReadAsync: async () =>
+            {
+                stackResolutionEntered.TrySetResult();
+                await releaseStackResolution.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            },
+            afterDisposeWriterAcquiredAsync: () =>
+            {
+                disposerOwnsWriter.TrySetResult();
+                return Task.CompletedTask;
+            });
+        var store = temporaryStore.Store;
+        var frameId = await AddFrameAsync(store, "Worker", "App", "worker");
+        var stackId = await store.GetOrAddStackAsync(-1, frameId, CancellationToken.None);
+        await AppendAsync(store, "00:00:01", stackId);
+        var builder = new ExecutionProfileBuilder(store);
+        using var cancellation = new CancellationTokenSource();
+        Task<ExecutionProfile>? buildTask = null;
+        Task? disposeTask = null;
+        try
+        {
+            buildTask = builder.BuildAsync(
+                Range("00:00:00", "00:00:02"),
+                store.CaptureReadBoundary(),
+                lostEventCount: 0,
+                cancellation.Token);
+            await stackResolutionEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            disposeTask = store.DisposeAsync().AsTask();
+            await disposerOwnsWriter.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            releaseStackResolution.TrySetResult();
+
+            var profile = await buildTask.WaitAsync(TimeSpan.FromSeconds(5));
+            await disposeTask.WaitAsync(TimeSpan.FromSeconds(5));
+
+            Assert.AreEqual(1, profile.ReceivedSampleCount);
+            Assert.IsEmpty(Directory.EnumerateFileSystemEntries(temporaryStore.Root));
+        }
+        finally
+        {
+            cancellation.Cancel();
+            releaseStackResolution.TrySetResult();
+            if (buildTask is not null)
+            {
+                await IgnoreExpectedCancellationAsync(buildTask);
+            }
+
+            if (disposeTask is not null)
+            {
+                await disposeTask.WaitAsync(TimeSpan.FromSeconds(5));
+            }
+        }
+    }
+
+    [TestMethod]
     public async Task GetStackFramesAsync_ReturnsDefensiveRootToLeafFrames()
     {
         await using var temporaryStore = CreateTemporaryStore();
@@ -206,11 +349,29 @@ public sealed class ExecutionProfileBuilderTests
             CultureInfo.InvariantCulture,
             DateTimeStyles.AssumeUniversal);
 
-    private static TemporaryExecutionCaptureStore CreateTemporaryStore()
+    private static async Task IgnoreExpectedCancellationAsync(Task task)
+    {
+        try
+        {
+            await task.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    private static TemporaryExecutionCaptureStore CreateTemporaryStore(
+        Func<Task>? beforeStackFramesReadAsync = null,
+        Func<Task>? afterDisposeWriterAcquiredAsync = null)
     {
         var root = Path.Combine(Path.GetTempPath(), "DotnetAnalysis.Tests", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
-        return new TemporaryExecutionCaptureStore(root, new ExecutionCaptureStore(new ExecutionCaptureStorageLayout(root)));
+        return new TemporaryExecutionCaptureStore(
+            root,
+            new ExecutionCaptureStore(
+                new ExecutionCaptureStorageLayout(root),
+                beforeStackFramesReadAsync: beforeStackFramesReadAsync,
+                afterDisposeWriterAcquiredAsync: afterDisposeWriterAcquiredAsync));
     }
 
     private sealed class TemporaryExecutionCaptureStore : IAsyncDisposable
@@ -224,6 +385,8 @@ public sealed class ExecutionProfileBuilderTests
         }
 
         public ExecutionCaptureStore Store { get; }
+
+        public string Root => _root;
 
         public async ValueTask DisposeAsync()
         {

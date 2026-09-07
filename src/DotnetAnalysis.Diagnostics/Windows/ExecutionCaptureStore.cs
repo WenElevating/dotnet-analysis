@@ -37,6 +37,8 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
     private readonly ExecutionCaptureStorageLayout _layout;
     private readonly int _segmentDataLimitBytes;
     private readonly Func<Task>? _beforeBoundaryPublishAsync;
+    private readonly Func<Task>? _beforeStackFramesReadAsync;
+    private readonly Func<Task>? _afterDisposeWriterAcquiredAsync;
     private readonly SemaphoreSlim _writer = new(1, 1);
     private readonly object _stateLock = new();
     private readonly Dictionary<ExecutionFrameDescriptor, int> _frameIds = [];
@@ -63,13 +65,17 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
     public ExecutionCaptureStore(
         ExecutionCaptureStorageLayout layout,
         int segmentDataLimitBytes = DefaultSegmentDataLimitBytes,
-        Func<Task>? beforeBoundaryPublishAsync = null)
+        Func<Task>? beforeBoundaryPublishAsync = null,
+        Func<Task>? beforeStackFramesReadAsync = null,
+        Func<Task>? afterDisposeWriterAcquiredAsync = null)
     {
         _layout = layout ?? throw new ArgumentNullException(nameof(layout));
         ArgumentOutOfRangeException.ThrowIfLessThan(segmentDataLimitBytes, 3);
 
         _segmentDataLimitBytes = segmentDataLimitBytes;
         _beforeBoundaryPublishAsync = beforeBoundaryPublishAsync;
+        _beforeStackFramesReadAsync = beforeStackFramesReadAsync;
+        _afterDisposeWriterAcquiredAsync = afterDisposeWriterAcquiredAsync;
         _writtenThroughUtc = _startedAtUtc;
     }
 
@@ -86,16 +92,19 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         await _writer.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            ThrowIfDisposing();
-            if (_frameIds.TryGetValue(frame, out var existingId))
+            lock (_stateLock)
             {
-                return existingId;
-            }
+                ThrowIfDisposingLocked();
+                if (_frameIds.TryGetValue(frame, out var existingId))
+                {
+                    return existingId;
+                }
 
-            var frameId = _frameIds.Count;
-            _frameIds.Add(frame, frameId);
-            _framesById.Add(frame);
-            return frameId;
+                var frameId = _frameIds.Count;
+                _frameIds.Add(frame, frameId);
+                _framesById.Add(frame);
+                return frameId;
+            }
         }
         finally
         {
@@ -115,17 +124,20 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         await _writer.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            ThrowIfDisposing();
-            var key = new ExecutionStackKey(parentStackId, frameId);
-            if (_stackIds.TryGetValue(key, out var existingId))
+            lock (_stateLock)
             {
-                return existingId;
-            }
+                ThrowIfDisposingLocked();
+                var key = new ExecutionStackKey(parentStackId, frameId);
+                if (_stackIds.TryGetValue(key, out var existingId))
+                {
+                    return existingId;
+                }
 
-            var stackId = _stackIds.Count;
-            _stackIds.Add(key, stackId);
-            _stacksById.Add(key);
-            return stackId;
+                var stackId = _stackIds.Count;
+                _stackIds.Add(key, stackId);
+                _stacksById.Add(key);
+                return stackId;
+            }
         }
         finally
         {
@@ -148,10 +160,14 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         ArgumentOutOfRangeException.ThrowIfNegative(stackId);
         cancellationToken.ThrowIfCancellationRequested();
 
-        await _writer.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
+        if (_beforeStackFramesReadAsync is not null)
         {
-            ThrowIfDisposing();
+            await _beforeStackFramesReadAsync().ConfigureAwait(false);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_stateLock)
+        {
             if ((uint)stackId >= (uint)_stacksById.Count)
             {
                 throw new ArgumentOutOfRangeException(nameof(stackId), stackId, "Stack identifier is not known by this execution capture store.");
@@ -169,10 +185,6 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
 
             frames.Reverse();
             return Array.AsReadOnly(frames.ToArray());
-        }
-        finally
-        {
-            _writer.Release();
         }
     }
 
@@ -351,6 +363,11 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
             await _writer.WaitAsync().ConfigureAwait(false);
             try
             {
+                if (_afterDisposeWriterAcquiredAsync is not null)
+                {
+                    await _afterDisposeWriterAcquiredAsync().ConfigureAwait(false);
+                }
+
                 await readersDrained.ConfigureAwait(false);
                 if (_currentSegment is not null)
                 {

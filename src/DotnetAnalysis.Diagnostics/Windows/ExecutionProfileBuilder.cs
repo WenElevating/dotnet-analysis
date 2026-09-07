@@ -8,14 +8,21 @@ namespace DotnetAnalysis.Diagnostics.Windows;
 internal sealed class ExecutionProfileBuilder
 {
     private readonly ExecutionCaptureStore _store;
+    private readonly Action? _beforeHotspotComparison;
+    private readonly Action? _beforeCallTreeNodeMaterialization;
 
     /// <summary>
     /// 创建执行采样聚合器。
     /// </summary>
     /// <param name="store">提供固定边界样本和调用栈帧的会话存储。</param>
-    public ExecutionProfileBuilder(ExecutionCaptureStore store)
+    public ExecutionProfileBuilder(
+        ExecutionCaptureStore store,
+        Action? beforeHotspotComparison = null,
+        Action? beforeCallTreeNodeMaterialization = null)
     {
         _store = store ?? throw new ArgumentNullException(nameof(store));
+        _beforeHotspotComparison = beforeHotspotComparison;
+        _beforeCallTreeNodeMaterialization = beforeCallTreeNodeMaterialization;
     }
 
     /// <summary>
@@ -79,21 +86,30 @@ internal sealed class ExecutionProfileBuilder
             }
         }
 
-        var hotspots = hotspotsByDescriptor.Values
-            .OrderByDescending(hotspot => hotspot.InclusiveSampleCount)
-            .ThenByDescending(hotspot => hotspot.ExclusiveSampleCount)
-            .ThenBy(hotspot => hotspot.Frame.MethodName, StringComparer.Ordinal)
-            .ThenBy(hotspot => hotspot.Frame.ModuleName, StringComparer.Ordinal)
-            .ThenBy(hotspot => hotspot.FirstSeenOrder)
-            .Select(hotspot => new ExecutionHotspot(
+        cancellationToken.ThrowIfCancellationRequested();
+        var mutableHotspots = hotspotsByDescriptor.Values.ToList();
+        SortMutableHotspots(mutableHotspots, _beforeHotspotComparison, cancellationToken);
+        var hotspots = new ExecutionHotspot[mutableHotspots.Count];
+        for (var index = 0; index < mutableHotspots.Count; index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var hotspot = mutableHotspots[index];
+            hotspots[index] = new ExecutionHotspot(
                 hotspot.Frame,
                 hotspot.InclusiveSampleCount,
-                hotspot.ExclusiveSampleCount))
-            .ToArray();
-        var callTreeRoots = callTreeRootsByDescriptor.Values
-            .OrderBy(node => node.FirstSeenOrder)
-            .Select(ToExecutionCallTreeNode)
-            .ToArray();
+                hotspot.ExclusiveSampleCount);
+        }
+
+        var mutableCallTreeRoots = callTreeRootsByDescriptor.Values.ToList();
+        SortCallTreeNodes(mutableCallTreeRoots, cancellationToken);
+        var callTreeRoots = new ExecutionCallTreeNode[mutableCallTreeRoots.Count];
+        for (var index = 0; index < mutableCallTreeRoots.Count; index++)
+        {
+            callTreeRoots[index] = ToExecutionCallTreeNode(
+                mutableCallTreeRoots[index],
+                _beforeCallTreeNodeMaterialization,
+                cancellationToken);
+        }
 
         return new ExecutionProfile(range, receivedSampleCount, lostEventCount, hotspots, callTreeRoots);
     }
@@ -144,15 +160,66 @@ internal sealed class ExecutionProfileBuilder
         return root;
     }
 
-    private static ExecutionCallTreeNode ToExecutionCallTreeNode(MutableCallTreeNode node) =>
-        new(
+    private static ExecutionCallTreeNode ToExecutionCallTreeNode(
+        MutableCallTreeNode node,
+        Action? beforeMaterialization,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        beforeMaterialization?.Invoke();
+        cancellationToken.ThrowIfCancellationRequested();
+        var mutableChildren = node.ChildrenByDescriptor.Values.ToList();
+        SortCallTreeNodes(mutableChildren, cancellationToken);
+        var children = new ExecutionCallTreeNode[mutableChildren.Count];
+        for (var index = 0; index < mutableChildren.Count; index++)
+        {
+            children[index] = ToExecutionCallTreeNode(
+                mutableChildren[index],
+                beforeMaterialization,
+                cancellationToken);
+        }
+
+        return new ExecutionCallTreeNode(
             node.Frame,
             node.InclusiveSampleCount,
             node.ExclusiveSampleCount,
-            node.ChildrenByDescriptor.Values
-                .OrderBy(child => child.FirstSeenOrder)
-                .Select(ToExecutionCallTreeNode)
-                .ToArray());
+            children);
+    }
+
+    private static void SortCallTreeNodes(
+        List<MutableCallTreeNode> nodes,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            nodes.Sort((left, right) =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                return left.FirstSeenOrder.CompareTo(right.FirstSeenOrder);
+            });
+        }
+        catch (InvalidOperationException exception) when (exception.InnerException is OperationCanceledException)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            throw;
+        }
+    }
+
+    private static void SortMutableHotspots(
+        List<MutableHotspot> hotspots,
+        Action? beforeComparison,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            hotspots.Sort(new MutableHotspotComparer(beforeComparison, cancellationToken));
+        }
+        catch (InvalidOperationException exception) when (exception.InnerException is OperationCanceledException)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            throw;
+        }
+    }
 
     private sealed class MutableHotspot
     {
@@ -169,6 +236,62 @@ internal sealed class ExecutionProfileBuilder
         public long InclusiveSampleCount { get; set; }
 
         public long ExclusiveSampleCount { get; set; }
+    }
+
+    private sealed class MutableHotspotComparer : IComparer<MutableHotspot>
+    {
+        private readonly CancellationToken _cancellationToken;
+        private readonly Action? _beforeComparison;
+
+        public MutableHotspotComparer(Action? beforeComparison, CancellationToken cancellationToken)
+        {
+            _cancellationToken = cancellationToken;
+            _beforeComparison = beforeComparison;
+        }
+
+        public int Compare(MutableHotspot? left, MutableHotspot? right)
+        {
+            _cancellationToken.ThrowIfCancellationRequested();
+            _beforeComparison?.Invoke();
+            _cancellationToken.ThrowIfCancellationRequested();
+            if (ReferenceEquals(left, right))
+            {
+                return 0;
+            }
+
+            if (left is null)
+            {
+                return -1;
+            }
+
+            if (right is null)
+            {
+                return 1;
+            }
+
+            var comparison = right.InclusiveSampleCount.CompareTo(left.InclusiveSampleCount);
+            if (comparison != 0)
+            {
+                return comparison;
+            }
+
+            comparison = right.ExclusiveSampleCount.CompareTo(left.ExclusiveSampleCount);
+            if (comparison != 0)
+            {
+                return comparison;
+            }
+
+            comparison = StringComparer.Ordinal.Compare(left.Frame.MethodName, right.Frame.MethodName);
+            if (comparison != 0)
+            {
+                return comparison;
+            }
+
+            comparison = StringComparer.Ordinal.Compare(left.Frame.ModuleName, right.Frame.ModuleName);
+            return comparison != 0
+                ? comparison
+                : left.FirstSeenOrder.CompareTo(right.FirstSeenOrder);
+        }
     }
 
     private sealed class MutableCallTreeNode
