@@ -36,6 +36,7 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
 
     private readonly ExecutionCaptureStorageLayout _layout;
     private readonly int _segmentDataLimitBytes;
+    private readonly Func<Task>? _beforeBoundaryPublishAsync;
     private readonly SemaphoreSlim _writer = new(1, 1);
     private readonly object _stateLock = new();
     private readonly Dictionary<ExecutionFrameDescriptor, int> _frameIds = [];
@@ -57,12 +58,16 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
     /// </summary>
     /// <param name="layout">会话目录和样本段路径布局。</param>
     /// <param name="segmentDataLimitBytes">单个样本段数据区的最大字节数。</param>
-    public ExecutionCaptureStore(ExecutionCaptureStorageLayout layout, int segmentDataLimitBytes = DefaultSegmentDataLimitBytes)
+    public ExecutionCaptureStore(
+        ExecutionCaptureStorageLayout layout,
+        int segmentDataLimitBytes = DefaultSegmentDataLimitBytes,
+        Func<Task>? beforeBoundaryPublishAsync = null)
     {
         _layout = layout ?? throw new ArgumentNullException(nameof(layout));
         ArgumentOutOfRangeException.ThrowIfLessThan(segmentDataLimitBytes, 3);
 
         _segmentDataLimitBytes = segmentDataLimitBytes;
+        _beforeBoundaryPublishAsync = beforeBoundaryPublishAsync;
         _writtenThroughUtc = _startedAtUtc;
     }
 
@@ -108,7 +113,6 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         try
         {
             ThrowIfDisposing();
-            ThrowIfWriteFailed();
             var key = new ExecutionStackKey(parentStackId, frameId);
             if (_stackIds.TryGetValue(key, out var existingId))
             {
@@ -146,6 +150,7 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         try
         {
             ThrowIfDisposing();
+            ThrowIfWriteFailed();
             var normalizedSample = sample with { ObservedAtUtc = sample.ObservedAtUtc.ToUniversalTime() };
             var segment = _currentSegment;
             var record = ArrayPool<byte>.Shared.Rent(32);
@@ -166,15 +171,21 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
                 try
                 {
                     await WriteRecordAsync(segment.Stream, record.AsMemory(0, recordLength), CancellationToken.None).ConfigureAwait(false);
+                    if (_beforeBoundaryPublishAsync is not null)
+                    {
+                        await _beforeBoundaryPublishAsync().ConfigureAwait(false);
+                    }
                 }
-                catch (DiagnosticsException exception)
+                catch (Exception exception) when (exception is DiagnosticsException or IOException or UnauthorizedAccessException)
                 {
+                    var storageException = exception as DiagnosticsException
+                        ?? ExecutionCaptureStorageLayout.CreateStorageException("Execution sample could not be committed.", exception);
                     lock (_stateLock)
                     {
-                        _writeFailure ??= exception;
+                        _writeFailure ??= storageException;
                     }
 
-                    throw;
+                    throw storageException;
                 }
 
                 lock (_stateLock)

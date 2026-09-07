@@ -99,6 +99,57 @@ public sealed class ExecutionCaptureStoreTests
     }
 
     [TestMethod]
+    public async Task ReadAsync_WhenAppendIsPausedBeforeBoundaryPublish_ExcludesPendingRecord()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = 0;
+        await using var temporaryStore = CreateTemporaryStore(beforeBoundaryPublishAsync: async () =>
+        {
+            if (Interlocked.Increment(ref calls) == 2)
+            {
+                entered.TrySetResult();
+                await release.Task;
+            }
+        });
+        var store = temporaryStore.Store;
+        await store.AppendAsync(Sample("00:00:01"), CancellationToken.None);
+        var pendingAppend = store.AppendAsync(Sample("00:00:02"), CancellationToken.None).AsTask();
+        await entered.Task;
+
+        var boundary = store.CaptureReadBoundary();
+        var records = await store.ReadAsync(Range("00:00:00", "00:00:03"), boundary, CancellationToken.None).ToListAsync();
+
+        Assert.HasCount(1, records);
+        release.TrySetResult();
+        await pendingAppend;
+    }
+
+    [TestMethod]
+    public async Task AppendAsync_WhenCommitFailsAfterWrite_PoisonsLaterAppendAndKeepsPriorBoundaryReadable()
+    {
+        var calls = 0;
+        await using var temporaryStore = CreateTemporaryStore(beforeBoundaryPublishAsync: () =>
+            Interlocked.Increment(ref calls) == 2
+                ? Task.FromException(new IOException("commit fault"))
+                : Task.CompletedTask);
+        var store = temporaryStore.Store;
+        await store.AppendAsync(Sample("00:00:01"), CancellationToken.None);
+        var boundary = store.CaptureReadBoundary();
+
+        var firstFailure = await Assert.ThrowsExactlyAsync<DiagnosticsException>(async () =>
+            await store.AppendAsync(Sample("00:00:02"), CancellationToken.None));
+        var repeatedFailure = await Assert.ThrowsExactlyAsync<DiagnosticsException>(async () =>
+            await store.AppendAsync(Sample("00:00:03"), CancellationToken.None));
+        var records = await store.ReadAsync(Range("00:00:00", "00:00:04"), boundary, CancellationToken.None).ToListAsync();
+
+        Assert.AreEqual(DiagnosticsErrorCode.ExecutionProfileStorageFailed, firstFailure.ErrorCode);
+        Assert.IsInstanceOfType<IOException>(firstFailure.InnerException);
+        Assert.AreSame(firstFailure, repeatedFailure);
+        Assert.HasCount(1, records);
+    }
+
+    [TestMethod]
     public async Task ReadAsync_CancellingOneReadDoesNotCancelAnotherRead()
     {
         await using var temporaryStore = CreateTemporaryStore();
@@ -214,13 +265,17 @@ public sealed class ExecutionCaptureStoreTests
         }
     }
 
-    private static TemporaryExecutionCaptureStore CreateTemporaryStore(int? segmentDataLimitBytes = null)
+    private static TemporaryExecutionCaptureStore CreateTemporaryStore(int? segmentDataLimitBytes = null, Func<Task>? beforeBoundaryPublishAsync = null)
     {
         var root = CreateTemporaryRoot();
         var layout = new ExecutionCaptureStorageLayout(root);
         var store = segmentDataLimitBytes is null
             ? new ExecutionCaptureStore(layout)
-            : new ExecutionCaptureStore(layout, segmentDataLimitBytes.Value);
+            : new ExecutionCaptureStore(layout, segmentDataLimitBytes.Value, beforeBoundaryPublishAsync);
+        if (segmentDataLimitBytes is null)
+        {
+            store = new ExecutionCaptureStore(layout, beforeBoundaryPublishAsync: beforeBoundaryPublishAsync);
+        }
         return new TemporaryExecutionCaptureStore(root, store);
     }
 
