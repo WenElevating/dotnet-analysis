@@ -235,7 +235,7 @@ dotnet run --project 'D:\AIProject\MQTTnet\Source\MQTTnet.TestApp\MQTTnet.TestAp
 在菜单出现后人工按一次 `b`。该入口执行 `PerformanceTest.RunQoS1Test`：进程内启动 MQTT server 和 client，并持续进行 QoS 1 消息发布。保持此工作负载不少于 10 分钟；验收者使用独立诊断宿主附着这个已经运行的 PID，在该时间内：
 
 1. 保留从附着成功到结束前的全部执行采样，并针对早期、中期和末期的三个时间范围查询调用树。
-2. 在目标应用自身模块中验证至少一个方法解析到匹配源码文件和行号；若使用用户指定应用，记录其可复现的二进制和 PDB 版本。
+2. 在 `MQTTnet.TestApp` 或 `MQTTnet` 目标模块中验证至少一个方法解析到匹配源码文件和行号，并记录其可复现的二进制和 PDB SHA-256。
 3. 在采样期间至少执行一次 `.gcdump` 捕获，验证采样前后仍有连续样本且会话没有失败。
 4. 记录目标 PID、进程启动时间、应用路径及 SHA-256、PDB 路径及 SHA-256、附着/结束时间、三个查询的原始结果、丢失事件数、诊断 CPU/内存和任何异常。
 
