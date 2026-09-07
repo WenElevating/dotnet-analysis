@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using DotnetAnalysis.Application.Contracts.Diagnostics;
 using DotnetAnalysis.Application.Events;
 using DotnetAnalysis.Core.Diagnostics;
@@ -7,6 +8,33 @@ using DotnetAnalysis.Diagnostics.Windows.Capture;
 using Microsoft.Extensions.Logging;
 
 namespace DotnetAnalysis.Diagnostics.Windows;
+
+internal interface IAllocationSamplingSessionResource : IAsyncDisposable
+{
+    AllocationSamplingSession Collector { get; }
+
+    Task StartAsync(TargetProcess target, CancellationToken cancellationToken);
+
+    void MarkInterrupted(DateTimeOffset observedAtUtc);
+}
+
+internal sealed class AllocationSamplingSessionResource : IAllocationSamplingSessionResource
+{
+    public AllocationSamplingSessionResource(AllocationSamplingSession collector)
+    {
+        Collector = collector ?? throw new ArgumentNullException(nameof(collector));
+    }
+
+    public AllocationSamplingSession Collector { get; }
+
+    public Task StartAsync(TargetProcess target, CancellationToken cancellationToken) =>
+        Collector.StartAsync(target, cancellationToken);
+
+    public void MarkInterrupted(DateTimeOffset observedAtUtc) =>
+        Collector.MarkInterrupted(observedAtUtc);
+
+    public ValueTask DisposeAsync() => Collector.DisposeAsync();
+}
 
 /// <summary>
 /// 统一拥有 Windows 进程诊断的状态、采样、快照捕获、资源和生命周期事件。
@@ -29,12 +57,13 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
 
     private readonly object _syncRoot = new();
     private readonly ProcessMemorySampler _sampler;
-    private readonly AllocationSamplingSession _allocationCollector;
+    private readonly IAllocationSamplingSessionResource _allocationSampling;
     private readonly IExecutionSamplingSession _executionSampling;
     private readonly IMemorySnapshotCapture _capture;
     private readonly IEventBus _eventBus;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<ProcessDiagnosticsSession> _logger;
+    private readonly Func<int, bool> _isProcessAlive;
     private readonly CancellationTokenSource _endCancellation = new();
     private Task<MemorySnapshot>? _captureTask;
     private CancellationTokenSource? _captureCancellation;
@@ -59,16 +88,41 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
         IMemorySnapshotCapture capture,
         IEventBus eventBus,
         TimeProvider timeProvider,
-        ILogger<ProcessDiagnosticsSession> logger)
+        ILogger<ProcessDiagnosticsSession> logger,
+        Func<int, bool> isProcessAlive)
+        : this(
+            process,
+            sampler,
+            new AllocationSamplingSessionResource(allocationCollector),
+            executionSampling,
+            capture,
+            eventBus,
+            timeProvider,
+            logger,
+            isProcessAlive)
+    {
+    }
+
+    internal ProcessDiagnosticsSession(
+        TargetProcess process,
+        ProcessMemorySampler sampler,
+        IAllocationSamplingSessionResource allocationSampling,
+        IExecutionSamplingSession executionSampling,
+        IMemorySnapshotCapture capture,
+        IEventBus eventBus,
+        TimeProvider timeProvider,
+        ILogger<ProcessDiagnosticsSession> logger,
+        Func<int, bool> isProcessAlive)
     {
         Process = process ?? throw new ArgumentNullException(nameof(process));
         _sampler = sampler ?? throw new ArgumentNullException(nameof(sampler));
-        _allocationCollector = allocationCollector ?? throw new ArgumentNullException(nameof(allocationCollector));
+        _allocationSampling = allocationSampling ?? throw new ArgumentNullException(nameof(allocationSampling));
         _executionSampling = executionSampling ?? throw new ArgumentNullException(nameof(executionSampling));
         _capture = capture ?? throw new ArgumentNullException(nameof(capture));
         _eventBus = eventBus ?? throw new ArgumentNullException(nameof(eventBus));
         _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _isProcessAlive = isProcessAlive ?? throw new ArgumentNullException(nameof(isProcessAlive));
         State = ProcessDiagnosticsSessionState.Monitoring;
         _ = PublishEventAsync(new ProcessDiagnosticsSessionStateChanged(
             Id,
@@ -155,7 +209,7 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
         {
             if (sample.State is MemoryUsageSampleState.SessionEnded)
             {
-                MoveToEnded();
+                await CompleteEndAfterTargetExitAsync().ConfigureAwait(false);
             }
 
             yield return sample;
@@ -176,26 +230,46 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
         ArgumentNullException.ThrowIfNull(timeRange);
         cancellationToken.ThrowIfCancellationRequested();
 
-        CancellationTokenSource queryCancellation;
+        CancellationTokenSource? queryCancellation = null;
+        bool targetExited;
         lock (_syncRoot)
         {
             if (State is not ProcessDiagnosticsSessionState.Monitoring)
             {
-                throw new DiagnosticsException(
-                    DiagnosticsErrorCode.ExecutionProfileRangeUnavailable,
-                    "The requested execution profile range is not available after the session has ended.");
+                throw CreateExecutionProfileRangeUnavailableException();
             }
 
-            queryCancellation = CancellationTokenSource.CreateLinkedTokenSource(
-                cancellationToken,
-                _endCancellation.Token);
+            targetExited = !_isProcessAlive(Process.ProcessId);
+            if (!targetExited)
+            {
+                queryCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+                    cancellationToken,
+                    _endCancellation.Token);
+            }
         }
 
-        using (queryCancellation)
+        if (targetExited)
         {
-            return await _executionSampling
-                .GetExecutionProfileAsync(timeRange, queryCancellation.Token)
-                .ConfigureAwait(false);
+            await CompleteEndAfterTargetExitAsync().ConfigureAwait(false);
+            throw CreateExecutionProfileRangeUnavailableException();
+        }
+
+        var activeQueryCancellation = queryCancellation
+            ?? throw new InvalidOperationException("Execution query cancellation was not initialized.");
+        using (activeQueryCancellation)
+        {
+            try
+            {
+                return await _executionSampling
+                    .GetExecutionProfileAsync(timeRange, activeQueryCancellation.Token)
+                    .ConfigureAwait(false);
+            }
+            catch (DiagnosticsException exception) when (
+                exception.ErrorCode is DiagnosticsErrorCode.TargetExited)
+            {
+                await CompleteEndAfterTargetExitAsync().ConfigureAwait(false);
+                throw CreateExecutionProfileRangeUnavailableException();
+            }
         }
     }
 
@@ -204,8 +278,14 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
     /// </summary>
     public async ValueTask DisposeAsync()
     {
-        await EndAsync(CancellationToken.None).ConfigureAwait(false);
-        _endCancellation.Dispose();
+        try
+        {
+            await EndAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        finally
+        {
+            _endCancellation.Dispose();
+        }
     }
 
     /// <summary>
@@ -218,7 +298,7 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
         try
         {
             var snapshot = await _capture
-                .CaptureAsync(Process, _allocationCollector, captureCancellation.Token)
+                .CaptureAsync(Process, _allocationSampling.Collector, captureCancellation.Token)
                 .ConfigureAwait(false);
             _ = PublishEventAsync(new MemorySnapshotCaptured(
                 Id,
@@ -289,6 +369,7 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
     {
         Task<MemorySnapshot>? activeCapture;
         CancellationTokenSource? activeCaptureCancellation;
+        ExceptionDispatchInfo? cleanupFailure = null;
 
         lock (_syncRoot)
         {
@@ -304,10 +385,25 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
         try
         {
             _endCancellation.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+        catch (Exception exception)
+        {
+            cleanupFailure = ExceptionDispatchInfo.Capture(exception);
+        }
+
+        try
+        {
             activeCaptureCancellation?.Cancel();
         }
         catch (ObjectDisposedException)
         {
+        }
+        catch (Exception exception)
+        {
+            cleanupFailure ??= ExceptionDispatchInfo.Capture(exception);
         }
 
         if (activeCapture is not null)
@@ -321,22 +417,54 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
             }
         }
 
-        await _executionSampling.DisposeAsync().ConfigureAwait(false);
-        await DisposeAllocationCollectorAsync().ConfigureAwait(false);
-        await _sampler.DisposeAsync().ConfigureAwait(false);
-
-        lock (_syncRoot)
+        try
         {
-            if (State is ProcessDiagnosticsSessionState.Ending)
-            {
-                MoveTo(ProcessDiagnosticsSessionState.Ended);
-            }
+            await _executionSampling.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            cleanupFailure ??= ExceptionDispatchInfo.Capture(exception);
         }
 
-        _ = PublishEventAsync(new ProcessDiagnosticsSessionEnded(
+        try
+        {
+            await DisposeAllocationCollectorAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            cleanupFailure ??= ExceptionDispatchInfo.Capture(exception);
+        }
+
+        try
+        {
+            await _sampler.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            cleanupFailure ??= ExceptionDispatchInfo.Capture(exception);
+        }
+
+        try
+        {
+            lock (_syncRoot)
+            {
+                if (State is ProcessDiagnosticsSessionState.Ending)
+                {
+                    MoveTo(ProcessDiagnosticsSessionState.Ended);
+                }
+            }
+        }
+        catch (Exception exception)
+        {
+            cleanupFailure ??= ExceptionDispatchInfo.Capture(exception);
+        }
+
+        await PublishEventAsync(new ProcessDiagnosticsSessionEnded(
             Id,
             _timeProvider.GetUtcNow(),
-            nameof(ProcessDiagnosticsSession))).AsTask();
+            nameof(ProcessDiagnosticsSession))).ConfigureAwait(false);
+
+        cleanupFailure?.Throw();
     }
 
     /// <summary>
@@ -344,7 +472,7 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
     /// </summary>
     private async ValueTask DisposeAllocationCollectorAsync()
     {
-        await _allocationCollector.DisposeAsync().ConfigureAwait(false);
+        await _allocationSampling.DisposeAsync().ConfigureAwait(false);
     }
 
     /// <summary>
@@ -359,12 +487,6 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
             switch (exception.ErrorCode)
             {
                 case DiagnosticsErrorCode.TargetExited:
-                    if (State is ProcessDiagnosticsSessionState.Monitoring)
-                    {
-                        MoveTo(ProcessDiagnosticsSessionState.Ending);
-                        MoveTo(ProcessDiagnosticsSessionState.Ended);
-                    }
-
                     break;
                 case DiagnosticsErrorCode.AccessDenied:
                 case DiagnosticsErrorCode.TargetChanged:
@@ -377,22 +499,20 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
                     break;
             }
         }
-    }
 
-    /// <summary>
-    /// 在采样器报告目标结束时完成会话状态迁移。
-    /// </summary>
-    private void MoveToEnded()
-    {
-        lock (_syncRoot)
+        if (exception.ErrorCode is DiagnosticsErrorCode.TargetExited)
         {
-            if (State is ProcessDiagnosticsSessionState.Monitoring)
-            {
-                MoveTo(ProcessDiagnosticsSessionState.Ending);
-                MoveTo(ProcessDiagnosticsSessionState.Ended);
-            }
+            _ = CompleteEndAfterTargetExitAsync();
         }
     }
+
+    private async Task CompleteEndAfterTargetExitAsync() =>
+        await EndAsync(CancellationToken.None).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+
+    private static DiagnosticsException CreateExecutionProfileRangeUnavailableException() =>
+        new(
+            DiagnosticsErrorCode.ExecutionProfileRangeUnavailable,
+            "The requested execution profile range is not available after the session has ended.");
 
     /// <summary>
     /// 校验并执行一次会话状态转移，同时发布状态事件。
