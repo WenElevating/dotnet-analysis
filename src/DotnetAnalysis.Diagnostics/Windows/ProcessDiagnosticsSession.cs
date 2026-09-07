@@ -63,7 +63,7 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
     private readonly IEventBus _eventBus;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<ProcessDiagnosticsSession> _logger;
-    private readonly Func<int, bool> _isProcessAlive;
+    private readonly ProcessIdentityValidator _identityValidator;
     private readonly CancellationTokenSource _endCancellation = new();
     private Task<MemorySnapshot>? _captureTask;
     private CancellationTokenSource? _captureCancellation;
@@ -89,7 +89,7 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
         IEventBus eventBus,
         TimeProvider timeProvider,
         ILogger<ProcessDiagnosticsSession> logger,
-        Func<int, bool> isProcessAlive)
+        ProcessIdentityValidator identityValidator)
         : this(
             process,
             sampler,
@@ -99,7 +99,7 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
             eventBus,
             timeProvider,
             logger,
-            isProcessAlive)
+            identityValidator)
     {
     }
 
@@ -112,7 +112,7 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
         IEventBus eventBus,
         TimeProvider timeProvider,
         ILogger<ProcessDiagnosticsSession> logger,
-        Func<int, bool> isProcessAlive)
+        ProcessIdentityValidator identityValidator)
     {
         Process = process ?? throw new ArgumentNullException(nameof(process));
         _sampler = sampler ?? throw new ArgumentNullException(nameof(sampler));
@@ -122,7 +122,7 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
         _eventBus = eventBus ?? throw new ArgumentNullException(nameof(eventBus));
         _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-        _isProcessAlive = isProcessAlive ?? throw new ArgumentNullException(nameof(isProcessAlive));
+        _identityValidator = identityValidator ?? throw new ArgumentNullException(nameof(identityValidator));
         State = ProcessDiagnosticsSessionState.Monitoring;
         _ = PublishEventAsync(new ProcessDiagnosticsSessionStateChanged(
             Id,
@@ -209,7 +209,7 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
         {
             if (sample.State is MemoryUsageSampleState.SessionEnded)
             {
-                await CompleteEndAfterTargetExitAsync().ConfigureAwait(false);
+                await CompleteEndAfterTargetLossAsync().ConfigureAwait(false);
             }
 
             yield return sample;
@@ -230,8 +230,7 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
         ArgumentNullException.ThrowIfNull(timeRange);
         cancellationToken.ThrowIfCancellationRequested();
 
-        CancellationTokenSource? queryCancellation = null;
-        bool targetExited;
+        CancellationTokenSource queryCancellation;
         lock (_syncRoot)
         {
             if (State is not ProcessDiagnosticsSessionState.Monitoring)
@@ -239,37 +238,35 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
                 throw CreateExecutionProfileRangeUnavailableException();
             }
 
-            targetExited = !_isProcessAlive(Process.ProcessId);
-            if (!targetExited)
-            {
-                queryCancellation = CancellationTokenSource.CreateLinkedTokenSource(
-                    cancellationToken,
-                    _endCancellation.Token);
-            }
+            queryCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken,
+                _endCancellation.Token);
         }
 
-        if (targetExited)
+        using (queryCancellation)
         {
-            await CompleteEndAfterTargetExitAsync().ConfigureAwait(false);
-            throw CreateExecutionProfileRangeUnavailableException();
-        }
-
-        var activeQueryCancellation = queryCancellation
-            ?? throw new InvalidOperationException("Execution query cancellation was not initialized.");
-        using (activeQueryCancellation)
-        {
+            await EnsureTargetIdentityCurrentAsync(queryCancellation.Token).ConfigureAwait(false);
+            ExecutionProfile profile;
             try
             {
-                return await _executionSampling
-                    .GetExecutionProfileAsync(timeRange, activeQueryCancellation.Token)
+                profile = await _executionSampling
+                    .GetExecutionProfileAsync(timeRange, queryCancellation.Token)
                     .ConfigureAwait(false);
             }
-            catch (DiagnosticsException exception) when (
-                exception.ErrorCode is DiagnosticsErrorCode.TargetExited)
+            catch (DiagnosticsException exception)
             {
-                await CompleteEndAfterTargetExitAsync().ConfigureAwait(false);
-                throw CreateExecutionProfileRangeUnavailableException();
+                if (IsTargetIdentityFailure(exception))
+                {
+                    await CompleteEndAfterTargetLossAsync().ConfigureAwait(false);
+                    throw CreateExecutionProfileRangeUnavailableException();
+                }
+
+                await EnsureTargetIdentityCurrentAsync(queryCancellation.Token).ConfigureAwait(false);
+                throw;
             }
+
+            await EnsureTargetIdentityCurrentAsync(queryCancellation.Token).ConfigureAwait(false);
+            return profile;
         }
     }
 
@@ -502,11 +499,27 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
 
         if (exception.ErrorCode is DiagnosticsErrorCode.TargetExited)
         {
-            _ = CompleteEndAfterTargetExitAsync();
+            _ = CompleteEndAfterTargetLossAsync();
         }
     }
 
-    private async Task CompleteEndAfterTargetExitAsync() =>
+    private async Task EnsureTargetIdentityCurrentAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _identityValidator.ValidateAsync(Process, cancellationToken).ConfigureAwait(false);
+        }
+        catch (DiagnosticsException exception) when (IsTargetIdentityFailure(exception))
+        {
+            await CompleteEndAfterTargetLossAsync().ConfigureAwait(false);
+            throw CreateExecutionProfileRangeUnavailableException();
+        }
+    }
+
+    private static bool IsTargetIdentityFailure(DiagnosticsException exception) =>
+        exception.ErrorCode is DiagnosticsErrorCode.TargetExited or DiagnosticsErrorCode.TargetChanged;
+
+    private async Task CompleteEndAfterTargetLossAsync() =>
         await EndAsync(CancellationToken.None).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
 
     private static DiagnosticsException CreateExecutionProfileRangeUnavailableException() =>

@@ -182,8 +182,7 @@ public sealed class RuntimeCapabilitiesResolverTests
                 new UnavailableProcessMemoryReader(),
                 memoryReader,
                 TimeProvider.System,
-                TimeSpan.Zero),
-            isProcessAlive: static _ => true);
+                TimeSpan.Zero));
 
     private static Exception CreateStartFailure(string failureKind) => failureKind switch
     {

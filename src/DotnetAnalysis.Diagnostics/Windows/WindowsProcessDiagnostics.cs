@@ -23,7 +23,6 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
     private readonly Func<IExecutionSamplingSession> _executionSamplingSessionFactory;
     private readonly Func<DateTimeOffset, IAllocationSamplingSessionResource> _allocationSamplingSessionFactory;
     private readonly Func<TargetProcess, ProcessMemorySampler> _processMemorySamplerFactory;
-    private readonly Func<int, bool> _isProcessAlive;
     private readonly IEventBus _eventBus;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<ProcessDiagnosticsSession> _sessionLogger;
@@ -55,8 +54,7 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
             importedSnapshots,
             snapshotLayout,
             allocationSamplingSessionFactory: null,
-            processMemorySamplerFactory: null,
-            isProcessAlive: null)
+            processMemorySamplerFactory: null)
     {
     }
 
@@ -72,8 +70,7 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
         ImportedSnapshotCatalog? importedSnapshots = null,
         SnapshotStorageLayout? snapshotLayout = null,
         Func<DateTimeOffset, IAllocationSamplingSessionResource>? allocationSamplingSessionFactory = null,
-        Func<TargetProcess, ProcessMemorySampler>? processMemorySamplerFactory = null,
-        Func<int, bool>? isProcessAlive = null)
+        Func<TargetProcess, ProcessMemorySampler>? processMemorySamplerFactory = null)
     {
         _eventBus = eventBus ?? throw new ArgumentNullException(nameof(eventBus));
         _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
@@ -89,7 +86,6 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
                 new AllocationSamplingSession(new AllocationProfileBuilder(startedAtUtc))));
         _processMemorySamplerFactory = processMemorySamplerFactory
             ?? (process => new ProcessMemorySampler(process, _processMemoryReader));
-        _isProcessAlive = isProcessAlive ?? ProcessMemoryReader.IsProcessAlive;
         _importedSnapshots = importedSnapshots ?? new ImportedSnapshotCatalog();
         _snapshotLayout = snapshotLayout ?? new SnapshotStorageLayout(
             SnapshotStorageLayout.GetDefaultRootDirectory());
@@ -175,7 +171,7 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
                 _eventBus,
                 _timeProvider,
                 _sessionLogger,
-                _isProcessAlive);
+                _identityValidator);
         }
         catch
         {

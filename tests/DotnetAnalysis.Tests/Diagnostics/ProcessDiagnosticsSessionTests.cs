@@ -163,7 +163,7 @@ public sealed class ProcessDiagnosticsSessionTests
             new RecordingEventBus(),
             TimeProvider.System,
             NullLogger<ProcessDiagnosticsSession>.Instance,
-            static _ => true);
+            CreateIdentityValidator(_process));
 
         var profileTask = session.GetExecutionProfileAsync(TimeRange(), CancellationToken.None);
         var snapshotTask = session.CaptureSnapshotAsync(CancellationToken.None);
@@ -231,7 +231,7 @@ public sealed class ProcessDiagnosticsSessionTests
             eventBus,
             TimeProvider.System,
             NullLogger<ProcessDiagnosticsSession>.Instance,
-            static _ => true);
+            CreateIdentityValidator(_process));
 
         var endTask = session.EndAsync(CancellationToken.None);
         try
@@ -289,7 +289,7 @@ public sealed class ProcessDiagnosticsSessionTests
             eventBus,
             TimeProvider.System,
             NullLogger<ProcessDiagnosticsSession>.Instance,
-            static _ => true);
+            CreateIdentityValidator(endedProcess));
 
         var activeQuery = session.GetExecutionProfileAsync(TimeRange(), CancellationToken.None);
         await executionSampling.QueryStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
@@ -317,7 +317,7 @@ public sealed class ProcessDiagnosticsSessionTests
     public async Task GetExecutionProfileAsync_WhenTargetExitedWithoutTimelineEnumeration_EndsSessionAndCancelsActiveQuery()
     {
         var disposalOrder = new List<string>();
-        var targetIsAlive = true;
+        var identitySource = new ControlledProcessIdentitySource(_process.StartedAtUtc);
         var managedHeapReader = new RecordingManagedHeapReader(disposalOrder);
         var sampler = new ProcessMemorySampler(
             _process,
@@ -341,11 +341,11 @@ public sealed class ProcessDiagnosticsSessionTests
             eventBus,
             TimeProvider.System,
             NullLogger<ProcessDiagnosticsSession>.Instance,
-            _ => targetIsAlive);
+            new ProcessIdentityValidator(identitySource));
 
         var activeQuery = session.GetExecutionProfileAsync(TimeRange(), CancellationToken.None);
         await executionSampling.QueryStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
-        targetIsAlive = false;
+        identitySource.Failure = new ArgumentException("Target exited.");
 
         try
         {
@@ -360,6 +360,168 @@ public sealed class ProcessDiagnosticsSessionTests
             await Assert.ThrowsAsync<OperationCanceledException>(
                 async () => await activeQuery.WaitAsync(TimeSpan.FromSeconds(1)));
             Assert.AreEqual(1, executionSampling.QueryCallCount);
+            AssertDisposalOrder(disposalOrder, "execution", "allocation", "memory");
+            Assert.AreEqual(1, eventBus.Events.OfType<ProcessDiagnosticsSessionEnded>().Count());
+        }
+        finally
+        {
+            await session.EndAsync(CancellationToken.None).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+            await session.DisposeAsync();
+        }
+    }
+
+    [TestMethod]
+    public async Task GetExecutionProfileAsync_WhenTargetExitsDuringUnavailableQuery_EndsSessionAndReturnsRangeUnavailable()
+    {
+        var disposalOrder = new List<string>();
+        var identitySource = new ControlledProcessIdentitySource(_process.StartedAtUtc);
+        var executionSampling = new ControlledExecutionSamplingSession
+        {
+            QueryGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously),
+            QueryFailure = new DiagnosticsException(
+                DiagnosticsErrorCode.ExecutionProfilingUnavailable,
+                "Execution stream ended."),
+            DisposalOrder = disposalOrder
+        };
+        var managedHeapReader = new RecordingManagedHeapReader(disposalOrder);
+        var eventBus = new ControlledTerminalEventBus();
+        var session = new ProcessDiagnosticsSession(
+            _process,
+            new ProcessMemorySampler(
+                _process,
+                new UnavailableProcessMemoryReader(),
+                managedHeapReader,
+                TimeProvider.System,
+                TimeSpan.Zero),
+            new ControlledAllocationSamplingSessionResource(disposalOrder),
+            executionSampling,
+            new ControlledCapture(),
+            eventBus,
+            TimeProvider.System,
+            NullLogger<ProcessDiagnosticsSession>.Instance,
+            new ProcessIdentityValidator(identitySource));
+
+        try
+        {
+            var query = session.GetExecutionProfileAsync(TimeRange(), CancellationToken.None);
+            await executionSampling.QueryStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+            identitySource.Failure = new ArgumentException("Target exited while querying.");
+            executionSampling.QueryGate.TrySetResult();
+
+            try
+            {
+                await eventBus.TerminalPublishStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+                Assert.IsFalse(query.IsCompleted);
+                Assert.AreEqual(ProcessDiagnosticsSessionState.Ended, session.State);
+                AssertDisposalOrder(disposalOrder, "execution", "allocation", "memory");
+            }
+            finally
+            {
+                eventBus.TerminalPublishGate.TrySetResult();
+            }
+
+            var exception = await Assert.ThrowsAsync<DiagnosticsException>(
+                async () => await query.WaitAsync(TimeSpan.FromSeconds(1)));
+
+            Assert.AreEqual(DiagnosticsErrorCode.ExecutionProfileRangeUnavailable, exception.ErrorCode);
+            Assert.AreEqual(1, executionSampling.QueryCallCount);
+            Assert.AreEqual(2, identitySource.ReadCallCount);
+            Assert.IsTrue(eventBus.TerminalPublishCompleted.Task.IsCompletedSuccessfully);
+            Assert.AreEqual(1, eventBus.Events.OfType<ProcessDiagnosticsSessionEnded>().Count());
+        }
+        finally
+        {
+            eventBus.TerminalPublishGate.TrySetResult();
+            await session.EndAsync(CancellationToken.None).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+            await session.DisposeAsync();
+        }
+    }
+
+    [TestMethod]
+    public async Task GetExecutionProfileAsync_WhenPidWasReused_EndsSessionWithoutQueryingSampler()
+    {
+        var disposalOrder = new List<string>();
+        var identitySource = new ControlledProcessIdentitySource(_process.StartedAtUtc.AddSeconds(1));
+        var executionSampling = new ControlledExecutionSamplingSession { DisposalOrder = disposalOrder };
+        var managedHeapReader = new RecordingManagedHeapReader(disposalOrder);
+        var eventBus = new RecordingEventBus();
+        var session = new ProcessDiagnosticsSession(
+            _process,
+            new ProcessMemorySampler(
+                _process,
+                new UnavailableProcessMemoryReader(),
+                managedHeapReader,
+                TimeProvider.System,
+                TimeSpan.Zero),
+            new ControlledAllocationSamplingSessionResource(disposalOrder),
+            executionSampling,
+            new ControlledCapture(),
+            eventBus,
+            TimeProvider.System,
+            NullLogger<ProcessDiagnosticsSession>.Instance,
+            new ProcessIdentityValidator(identitySource));
+
+        try
+        {
+            var exception = await Assert.ThrowsAsync<DiagnosticsException>(
+                async () => await session.GetExecutionProfileAsync(TimeRange(), CancellationToken.None));
+
+            Assert.AreEqual(DiagnosticsErrorCode.ExecutionProfileRangeUnavailable, exception.ErrorCode);
+            Assert.AreEqual(ProcessDiagnosticsSessionState.Ended, session.State);
+            Assert.AreEqual(0, executionSampling.QueryCallCount);
+            Assert.AreEqual(1, identitySource.ReadCallCount);
+            AssertDisposalOrder(disposalOrder, "execution", "allocation", "memory");
+            Assert.AreEqual(1, eventBus.Events.OfType<ProcessDiagnosticsSessionEnded>().Count());
+        }
+        finally
+        {
+            await session.EndAsync(CancellationToken.None).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+            await session.DisposeAsync();
+        }
+    }
+
+    [TestMethod]
+    public async Task GetExecutionProfileAsync_WhenTargetIdentityChangesAfterProfileBuild_DiscardsProfileAndEndsSession()
+    {
+        var disposalOrder = new List<string>();
+        var identitySource = new ControlledProcessIdentitySource(_process.StartedAtUtc);
+        var executionSampling = new ControlledExecutionSamplingSession
+        {
+            QueryGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously),
+            DisposalOrder = disposalOrder
+        };
+        var managedHeapReader = new RecordingManagedHeapReader(disposalOrder);
+        var eventBus = new RecordingEventBus();
+        var session = new ProcessDiagnosticsSession(
+            _process,
+            new ProcessMemorySampler(
+                _process,
+                new UnavailableProcessMemoryReader(),
+                managedHeapReader,
+                TimeProvider.System,
+                TimeSpan.Zero),
+            new ControlledAllocationSamplingSessionResource(disposalOrder),
+            executionSampling,
+            new ControlledCapture(),
+            eventBus,
+            TimeProvider.System,
+            NullLogger<ProcessDiagnosticsSession>.Instance,
+            new ProcessIdentityValidator(identitySource));
+
+        try
+        {
+            var query = session.GetExecutionProfileAsync(TimeRange(), CancellationToken.None);
+            await executionSampling.QueryStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+            identitySource.StartedAtUtc = _process.StartedAtUtc.AddSeconds(1);
+            executionSampling.QueryGate.TrySetResult();
+
+            var exception = await Assert.ThrowsAsync<DiagnosticsException>(
+                async () => await query.WaitAsync(TimeSpan.FromSeconds(1)));
+
+            Assert.AreEqual(DiagnosticsErrorCode.ExecutionProfileRangeUnavailable, exception.ErrorCode);
+            Assert.AreEqual(ProcessDiagnosticsSessionState.Ended, session.State);
+            Assert.AreEqual(1, executionSampling.QueryCallCount);
+            Assert.AreEqual(2, identitySource.ReadCallCount);
             AssertDisposalOrder(disposalOrder, "execution", "allocation", "memory");
             Assert.AreEqual(1, eventBus.Events.OfType<ProcessDiagnosticsSessionEnded>().Count());
         }
@@ -484,8 +646,11 @@ public sealed class ProcessDiagnosticsSessionTests
             eventBus ?? new RecordingEventBus(),
             TimeProvider.System,
             logger ?? NullLogger<ProcessDiagnosticsSession>.Instance,
-            static _ => true);
+            CreateIdentityValidator(_process));
     }
+
+    private static ProcessIdentityValidator CreateIdentityValidator(TargetProcess process) =>
+        new(new FixedProcessIdentitySource(process.StartedAtUtc));
 
     private static MemorySnapshot Snapshot() =>
         new(
@@ -648,6 +813,8 @@ public sealed class ProcessDiagnosticsSessionTests
 
         public bool IsUnavailable { get; init; }
 
+        public DiagnosticsException? QueryFailure { get; init; }
+
         public bool WaitForQueryCancellation { get; init; }
 
         public Exception? DisposeFailure { get; init; }
@@ -696,6 +863,11 @@ public sealed class ProcessDiagnosticsSessionTests
                 await QueryGate.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
             }
 
+            if (QueryFailure is not null)
+            {
+                throw QueryFailure;
+            }
+
             return new ExecutionProfile(timeRange, 0, 0, [], []);
         }
 
@@ -718,6 +890,45 @@ public sealed class ProcessDiagnosticsSessionTests
             {
                 throw DisposeFailure;
             }
+        }
+    }
+
+    private sealed class FixedProcessIdentitySource : IProcessIdentitySource
+    {
+        private readonly DateTimeOffset _startedAtUtc;
+
+        public FixedProcessIdentitySource(DateTimeOffset startedAtUtc)
+        {
+            _startedAtUtc = startedAtUtc;
+        }
+
+        public DateTimeOffset GetStartedAtUtc(int processId) => _startedAtUtc;
+    }
+
+    private sealed class ControlledProcessIdentitySource : IProcessIdentitySource
+    {
+        private int _readCallCount;
+
+        public ControlledProcessIdentitySource(DateTimeOffset startedAtUtc)
+        {
+            StartedAtUtc = startedAtUtc;
+        }
+
+        public DateTimeOffset StartedAtUtc { get; set; }
+
+        public Exception? Failure { get; set; }
+
+        public int ReadCallCount => Volatile.Read(ref _readCallCount);
+
+        public DateTimeOffset GetStartedAtUtc(int processId)
+        {
+            Interlocked.Increment(ref _readCallCount);
+            if (Failure is not null)
+            {
+                throw Failure;
+            }
+
+            return StartedAtUtc;
         }
     }
 
