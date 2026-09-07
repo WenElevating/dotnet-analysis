@@ -11,6 +11,8 @@ namespace DotnetAnalysis.Tests.Diagnostics;
 [SuppressMessage("Naming", "CA1707:Identifiers should not contain underscores", Justification = "Test names describe behavior.")]
 public sealed class ExecutionCaptureStoreTests
 {
+    private static readonly TimeSpan ConcurrentTestTimeout = TimeSpan.FromSeconds(15);
+
     [TestMethod]
     public async Task GetOrAddFrameAndStackAsync_DeduplicatesEquivalentDescriptors()
     {
@@ -110,7 +112,7 @@ public sealed class ExecutionCaptureStoreTests
             if (Interlocked.Increment(ref calls) == 2)
             {
                 entered.TrySetResult();
-                await release.Task;
+                await release.Task.WaitAsync(TimeSpan.FromSeconds(5));
             }
         });
         var store = temporaryStore.Store;
@@ -127,39 +129,71 @@ public sealed class ExecutionCaptureStoreTests
         finally
         {
             release.TrySetResult();
-            await pendingAppend;
+            await pendingAppend.WaitAsync(TimeSpan.FromSeconds(5));
         }
     }
 
     [TestMethod]
     public async Task AppendAndReadAsync_UnderConcurrentBoundaryPressure_PreservesEveryCompletedRecord()
     {
-        const int sampleCount = 300;
+        const int batchCount = 6;
+        const int samplesPerBatch = 50;
+        var expectedSamples = Enumerable.Range(0, batchCount * samplesPerBatch)
+            .Select(index => new ExecutionSampleRecord(
+                Sample("00:00:01").ObservedAtUtc.AddTicks(index),
+                ThreadId: 1_000 + index,
+                StackId: 2_000 + index))
+            .ToArray();
         await using var temporaryStore = CreateTemporaryStore(segmentDataLimitBytes: 12);
         var store = temporaryStore.Store;
+        using var cancellation = new CancellationTokenSource(ConcurrentTestTimeout);
+        var schedule = new ConcurrentBoundarySchedule(readerCount: 2, observationCount: batchCount - 1);
         var stopwatch = Stopwatch.StartNew();
-        var readerOne = Task.Run(async () => await ReadBoundariesUntilCompleteAsync(store, sampleCount));
-        var readerTwo = Task.Run(async () => await ReadBoundariesUntilCompleteAsync(store, sampleCount));
-
-        for (var index = 0; index < sampleCount; index++)
+        var readerOne = ReadControlledBoundariesAsync(store, schedule, readerIndex: 0, cancellation);
+        var readerTwo = ReadControlledBoundariesAsync(store, schedule, readerIndex: 1, cancellation);
+        var writer = AppendInControlledBatchesAsync(store, expectedSamples, samplesPerBatch, schedule, cancellation);
+        Task[] concurrentTasks = [readerOne, readerTwo, writer];
+        try
         {
-            await store.AppendAsync(new ExecutionSampleRecord(
-                Sample("00:00:01").ObservedAtUtc.AddTicks(index),
-                ThreadId: index % 17,
-                StackId: index % 11),
-                CancellationToken.None);
+            await Task.WhenAll(concurrentTasks).WaitAsync(cancellation.Token);
+            var observations = readerOne.GetAwaiter().GetResult()
+                .Concat(readerTwo.GetAwaiter().GetResult())
+                .OrderBy(observation => observation.ReaderIndex)
+                .ThenBy(observation => observation.ObservationIndex)
+                .ToArray();
+
+            Assert.HasCount(2 * (batchCount - 1), observations);
+            foreach (var observation in observations)
+            {
+                var expectedPrefixCount = (observation.ObservationIndex + 1) * samplesPerBatch;
+                Assert.AreEqual(
+                    expectedPrefixCount - 1,
+                    observation.Boundary.LastCompletedRecord,
+                    $"Reader {observation.ReaderIndex}, observation {observation.ObservationIndex} captured an unexpected boundary.");
+                AssertRecordPrefix(
+                    expectedSamples,
+                    expectedPrefixCount,
+                    observation.Records,
+                    $"Reader {observation.ReaderIndex}, observation {observation.ObservationIndex}");
+            }
+
+            var finalBoundary = store.CaptureReadBoundary();
+            var records = await store.ReadAsync(
+                Range("00:00:00", "00:01:00"),
+                finalBoundary,
+                cancellation.Token).ToListAsync().AsTask().WaitAsync(cancellation.Token);
+            stopwatch.Stop();
+
+            Assert.AreEqual(expectedSamples.Length - 1, finalBoundary.LastCompletedRecord);
+            AssertRecordPrefix(expectedSamples, expectedSamples.Length, records, "Final boundary");
+            Assert.IsTrue(stopwatch.Elapsed < ConcurrentTestTimeout, $"Elapsed: {stopwatch.Elapsed}.");
         }
-
-        await Task.WhenAll(readerOne, readerTwo);
-        var finalBoundary = store.CaptureReadBoundary();
-        var records = await store.ReadAsync(
-            new ExecutionTimeRange(Sample("00:00:00").ObservedAtUtc, Sample("00:01:00").ObservedAtUtc),
-            finalBoundary,
-            CancellationToken.None).ToListAsync();
-        stopwatch.Stop();
-
-        Assert.HasCount(sampleCount, records, $"Elapsed: {stopwatch.Elapsed}.");
-        Assert.IsTrue(stopwatch.Elapsed < TimeSpan.FromSeconds(15), $"Elapsed: {stopwatch.Elapsed}.");
+        finally
+        {
+            cancellation.Cancel();
+            schedule.ReleaseAll();
+            await Task.WhenAll(concurrentTasks).WaitAsync(TimeSpan.FromSeconds(5));
+        }
     }
 
     [TestMethod]
@@ -344,19 +378,188 @@ public sealed class ExecutionCaptureStoreTests
         }
     }
 
-    private static async Task ReadBoundariesUntilCompleteAsync(ExecutionCaptureStore store, int expectedCount)
+    private static async Task<IReadOnlyList<BoundaryObservation>> ReadControlledBoundariesAsync(
+        ExecutionCaptureStore store,
+        ConcurrentBoundarySchedule schedule,
+        int readerIndex,
+        CancellationTokenSource cancellation)
     {
-        var observedMaximum = 0;
-        while (observedMaximum < expectedCount)
+        var observations = new List<BoundaryObservation>(schedule.ObservationCount);
+        schedule.SignalReaderStarted(readerIndex);
+        try
         {
-            var boundary = store.CaptureReadBoundary();
-            var records = await store.ReadAsync(
-                new ExecutionTimeRange(Sample("00:00:00").ObservedAtUtc, Sample("00:01:00").ObservedAtUtc),
-                boundary,
-                CancellationToken.None).ToListAsync();
-            observedMaximum = Math.Max(observedMaximum, records.Count);
-            await Task.Yield();
+            for (var observationIndex = 0; observationIndex < schedule.ObservationCount; observationIndex++)
+            {
+                await schedule.WaitForCaptureRequestAsync(observationIndex, cancellation.Token);
+                var boundary = store.CaptureReadBoundary();
+                schedule.SignalBoundaryCaptured(readerIndex, observationIndex);
+                await schedule.WaitForAppendStartedAsync(observationIndex, cancellation.Token);
+                var records = await store.ReadAsync(
+                    Range("00:00:00", "00:01:00"),
+                    boundary,
+                    cancellation.Token).ToListAsync().AsTask().WaitAsync(cancellation.Token);
+                observations.Add(new BoundaryObservation(readerIndex, observationIndex, boundary, records));
+                schedule.SignalReadCompleted(readerIndex, observationIndex);
+            }
+
+            return observations;
         }
+        catch
+        {
+            cancellation.Cancel();
+            throw;
+        }
+    }
+
+    private static async Task AppendInControlledBatchesAsync(
+        ExecutionCaptureStore store,
+        IReadOnlyList<ExecutionSampleRecord> samples,
+        int samplesPerBatch,
+        ConcurrentBoundarySchedule schedule,
+        CancellationTokenSource cancellation)
+    {
+        try
+        {
+            await schedule.WaitForAllReadersStartedAsync(cancellation.Token);
+            await AppendBatchAsync(store, samples, startIndex: 0, samplesPerBatch, cancellation.Token);
+            for (var observationIndex = 0; observationIndex < schedule.ObservationCount; observationIndex++)
+            {
+                schedule.RequestBoundaryCapture(observationIndex);
+                await schedule.WaitForAllBoundariesCapturedAsync(observationIndex, cancellation.Token);
+                var batchStartIndex = (observationIndex + 1) * samplesPerBatch;
+                await AppendBatchAsync(
+                    store,
+                    samples,
+                    batchStartIndex,
+                    count: 1,
+                    cancellation.Token);
+                schedule.SignalAppendStarted(observationIndex);
+                await AppendBatchAsync(
+                    store,
+                    samples,
+                    startIndex: batchStartIndex + 1,
+                    count: samplesPerBatch - 1,
+                    cancellation.Token);
+                await schedule.WaitForAllReadsCompletedAsync(observationIndex, cancellation.Token);
+            }
+        }
+        catch
+        {
+            cancellation.Cancel();
+            throw;
+        }
+    }
+
+    private static async Task AppendBatchAsync(
+        ExecutionCaptureStore store,
+        IReadOnlyList<ExecutionSampleRecord> samples,
+        int startIndex,
+        int count,
+        CancellationToken cancellationToken)
+    {
+        for (var index = startIndex; index < startIndex + count; index++)
+        {
+            await store.AppendAsync(samples[index], cancellationToken).AsTask().WaitAsync(cancellationToken);
+        }
+    }
+
+    private static void AssertRecordPrefix(
+        ExecutionSampleRecord[] expected,
+        int expectedCount,
+        IReadOnlyList<ExecutionSampleRecord> actual,
+        string context)
+    {
+        Assert.HasCount(expectedCount, actual, $"{context} returned an unexpected record count.");
+        for (var index = 0; index < expectedCount; index++)
+        {
+            Assert.AreEqual(
+                expected[index].ObservedAtUtc,
+                actual[index].ObservedAtUtc,
+                $"{context}, record {index} changed ObservedAtUtc.");
+            Assert.AreEqual(
+                expected[index].ThreadId,
+                actual[index].ThreadId,
+                $"{context}, record {index} changed ThreadId.");
+            Assert.AreEqual(
+                expected[index].StackId,
+                actual[index].StackId,
+                $"{context}, record {index} changed StackId.");
+        }
+    }
+
+    private sealed record BoundaryObservation(
+        int ReaderIndex,
+        int ObservationIndex,
+        ExecutionCaptureReadBoundary Boundary,
+        IReadOnlyList<ExecutionSampleRecord> Records);
+
+    private sealed class ConcurrentBoundarySchedule
+    {
+        private readonly TaskCompletionSource[] _readersStarted;
+        private readonly TaskCompletionSource[] _captureRequests;
+        private readonly TaskCompletionSource[][] _boundariesCaptured;
+        private readonly TaskCompletionSource[] _appendStarted;
+        private readonly TaskCompletionSource[][] _readsCompleted;
+
+        public ConcurrentBoundarySchedule(int readerCount, int observationCount)
+        {
+            _readersStarted = CreateCompletionSources(readerCount);
+            _captureRequests = CreateCompletionSources(observationCount);
+            _boundariesCaptured = CreateCompletionSourceMatrix(observationCount, readerCount);
+            _appendStarted = CreateCompletionSources(observationCount);
+            _readsCompleted = CreateCompletionSourceMatrix(observationCount, readerCount);
+        }
+
+        public int ObservationCount => _captureRequests.Length;
+
+        public void SignalReaderStarted(int readerIndex) => _readersStarted[readerIndex].TrySetResult();
+
+        public Task WaitForAllReadersStartedAsync(CancellationToken cancellationToken) =>
+            Task.WhenAll(_readersStarted.Select(source => source.Task)).WaitAsync(cancellationToken);
+
+        public void RequestBoundaryCapture(int observationIndex) => _captureRequests[observationIndex].TrySetResult();
+
+        public Task WaitForCaptureRequestAsync(int observationIndex, CancellationToken cancellationToken) =>
+            _captureRequests[observationIndex].Task.WaitAsync(cancellationToken);
+
+        public void SignalBoundaryCaptured(int readerIndex, int observationIndex) =>
+            _boundariesCaptured[observationIndex][readerIndex].TrySetResult();
+
+        public Task WaitForAllBoundariesCapturedAsync(int observationIndex, CancellationToken cancellationToken) =>
+            Task.WhenAll(_boundariesCaptured[observationIndex].Select(source => source.Task)).WaitAsync(cancellationToken);
+
+        public void SignalAppendStarted(int observationIndex) => _appendStarted[observationIndex].TrySetResult();
+
+        public Task WaitForAppendStartedAsync(int observationIndex, CancellationToken cancellationToken) =>
+            _appendStarted[observationIndex].Task.WaitAsync(cancellationToken);
+
+        public void SignalReadCompleted(int readerIndex, int observationIndex) =>
+            _readsCompleted[observationIndex][readerIndex].TrySetResult();
+
+        public Task WaitForAllReadsCompletedAsync(int observationIndex, CancellationToken cancellationToken) =>
+            Task.WhenAll(_readsCompleted[observationIndex].Select(source => source.Task)).WaitAsync(cancellationToken);
+
+        public void ReleaseAll()
+        {
+            foreach (var source in _readersStarted
+                .Concat(_captureRequests)
+                .Concat(_boundariesCaptured.SelectMany(sources => sources))
+                .Concat(_appendStarted)
+                .Concat(_readsCompleted.SelectMany(sources => sources)))
+            {
+                source.TrySetResult();
+            }
+        }
+
+        private static TaskCompletionSource[] CreateCompletionSources(int count) =>
+            Enumerable.Range(0, count)
+                .Select(_ => new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously))
+                .ToArray();
+
+        private static TaskCompletionSource[][] CreateCompletionSourceMatrix(int rowCount, int columnCount) =>
+            Enumerable.Range(0, rowCount)
+                .Select(_ => CreateCompletionSources(columnCount))
+                .ToArray();
     }
 
     private sealed class TemporaryExecutionCaptureStore : IAsyncDisposable
