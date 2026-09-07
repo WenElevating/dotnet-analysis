@@ -5,6 +5,9 @@ namespace DotnetAnalysis.Core.Diagnostics;
 /// </summary>
 public sealed record ExecutionProfile
 {
+    private readonly ExecutionHotspot[] _hotspots;
+    private readonly ExecutionCallTreeNode[] _callTreeRoots;
+
     /// <summary>
     /// 创建执行采样分析结果。
     /// </summary>
@@ -31,8 +34,10 @@ public sealed record ExecutionProfile
         TimeRange = timeRange;
         ReceivedSampleCount = receivedSampleCount;
         LostEventCount = lostEventCount;
-        Hotspots = hotspots.ToArray();
-        CallTreeRoots = callTreeRoots.ToArray();
+        _hotspots = hotspots.ToArray();
+        _callTreeRoots = callTreeRoots.ToArray();
+        Hotspots = Array.AsReadOnly(_hotspots);
+        CallTreeRoots = Array.AsReadOnly(_callTreeRoots);
     }
 
     /// <summary>
@@ -51,12 +56,12 @@ public sealed record ExecutionProfile
     public long LostEventCount { get; }
 
     /// <summary>
-    /// 按方法聚合的热点。
+    /// 防御性复制后、不可变更的按方法聚合热点视图。
     /// </summary>
     public IReadOnlyList<ExecutionHotspot> Hotspots { get; }
 
     /// <summary>
-    /// 调用树根节点。
+    /// 防御性复制后、不可变更的调用树根节点视图。
     /// </summary>
     public IReadOnlyList<ExecutionCallTreeNode> CallTreeRoots { get; }
 

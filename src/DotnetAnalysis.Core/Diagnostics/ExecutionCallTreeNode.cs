@@ -5,6 +5,8 @@ namespace DotnetAnalysis.Core.Diagnostics;
 /// </summary>
 public sealed record ExecutionCallTreeNode
 {
+    private readonly ExecutionCallTreeNode[] _children;
+
     /// <summary>
     /// 创建执行调用树节点。
     /// </summary>
@@ -28,7 +30,8 @@ public sealed record ExecutionCallTreeNode
         Frame = frame;
         InclusiveSampleCount = inclusiveSampleCount;
         ExclusiveSampleCount = exclusiveSampleCount;
-        Children = children.ToArray();
+        _children = children.ToArray();
+        Children = Array.AsReadOnly(_children);
     }
 
     /// <summary>
@@ -47,7 +50,7 @@ public sealed record ExecutionCallTreeNode
     public long ExclusiveSampleCount { get; }
 
     /// <summary>
-    /// 防御性复制后的子调用节点。
+    /// 防御性复制后、不可变更的子调用节点视图。
     /// </summary>
     public IReadOnlyList<ExecutionCallTreeNode> Children { get; }
 

@@ -144,6 +144,15 @@ public sealed class DiagnosticsValueTests
     }
 
     [TestMethod]
+    public void ExecutionTimeRange_WhenEndIsEarlierThanStart_Throws()
+    {
+        var instant = DateTimeOffset.UnixEpoch;
+
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new ExecutionTimeRange(instant.AddMinutes(1), instant));
+    }
+
+    [TestMethod]
     public void SourceLocation_NormalizesPathAndRejectsInvalidValues()
     {
         var location = new SourceLocation(".\\source.cs", 12, 3);
@@ -152,6 +161,8 @@ public sealed class DiagnosticsValueTests
         Assert.Throws<ArgumentException>(() => new SourceLocation(" ", 1, null));
         Assert.Throws<ArgumentOutOfRangeException>(() => new SourceLocation("source.cs", 0, null));
         Assert.Throws<ArgumentOutOfRangeException>(() => new SourceLocation("source.cs", 1, 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new SourceLocation("source.cs", -1, null));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new SourceLocation("source.cs", 1, -1));
     }
 
     [TestMethod]
@@ -174,7 +185,7 @@ public sealed class DiagnosticsValueTests
     }
 
     [TestMethod]
-    public void ExecutionCallTreeNode_RejectsNegativeSampleCountsAndCopiesChildren()
+    public void ExecutionCallTreeNode_RejectsNegativeSampleCountsAndExposesReadOnlyChildren()
     {
         var frame = CreateExecutionFrame();
         var children = new List<ExecutionCallTreeNode>();
@@ -182,18 +193,25 @@ public sealed class DiagnosticsValueTests
         Assert.Throws<ArgumentOutOfRangeException>(() => new ExecutionCallTreeNode(frame, -1, 0, children));
         Assert.Throws<ArgumentOutOfRangeException>(() => new ExecutionCallTreeNode(frame, 0, -1, children));
 
+        var child = new ExecutionCallTreeNode(frame, 0, 0, Array.Empty<ExecutionCallTreeNode>());
+        children.Add(child);
         var node = new ExecutionCallTreeNode(frame, 0, 0, children);
-        children.Add(new ExecutionCallTreeNode(frame, 0, 0, Array.Empty<ExecutionCallTreeNode>()));
+        children.Clear();
 
-        Assert.IsEmpty(node.Children);
-        Assert.IsInstanceOfType<ExecutionCallTreeNode[]>(node.Children);
+        Assert.HasCount(1, node.Children);
+        Assert.IsFalse(node.Children is ExecutionCallTreeNode[]);
+        var exposedChildren = (IList<ExecutionCallTreeNode>)node.Children;
+        Assert.Throws<NotSupportedException>(() => exposedChildren[0] = CreateExecutionCallTreeNode());
+        Assert.AreSame(child, node.Children[0]);
     }
 
     [TestMethod]
-    public void ExecutionProfile_CopiesCollectionsAndAllowsEmptySamples()
+    public void ExecutionProfile_ExposesReadOnlyCollectionSnapshotsAndAllowsEmptySamples()
     {
-        var hotspots = new List<ExecutionHotspot>();
-        var roots = new List<ExecutionCallTreeNode>();
+        var hotspot = new ExecutionHotspot(CreateExecutionFrame(), 0, 0);
+        var root = CreateExecutionCallTreeNode();
+        var hotspots = new List<ExecutionHotspot> { hotspot };
+        var roots = new List<ExecutionCallTreeNode> { root };
         var profile = new ExecutionProfile(
             new ExecutionTimeRange(Instant("2026-09-02T10:00:00Z"), Instant("2026-09-02T10:01:00Z")),
             0,
@@ -201,13 +219,29 @@ public sealed class DiagnosticsValueTests
             hotspots,
             roots);
 
-        hotspots.Add(new ExecutionHotspot(CreateExecutionFrame(), 0, 0));
-        roots.Add(new ExecutionCallTreeNode(CreateExecutionFrame(), 0, 0, Array.Empty<ExecutionCallTreeNode>()));
+        hotspots.Clear();
+        roots.Clear();
 
-        Assert.IsEmpty(profile.Hotspots);
-        Assert.IsEmpty(profile.CallTreeRoots);
-        Assert.IsInstanceOfType<ExecutionHotspot[]>(profile.Hotspots);
-        Assert.IsInstanceOfType<ExecutionCallTreeNode[]>(profile.CallTreeRoots);
+        Assert.HasCount(1, profile.Hotspots);
+        Assert.HasCount(1, profile.CallTreeRoots);
+        Assert.IsFalse(profile.Hotspots is ExecutionHotspot[]);
+        Assert.IsFalse(profile.CallTreeRoots is ExecutionCallTreeNode[]);
+        var exposedHotspots = (IList<ExecutionHotspot>)profile.Hotspots;
+        var exposedRoots = (IList<ExecutionCallTreeNode>)profile.CallTreeRoots;
+        Assert.Throws<NotSupportedException>(() => exposedHotspots[0] = new ExecutionHotspot(CreateExecutionFrame(), 0, 0));
+        Assert.Throws<NotSupportedException>(() => exposedRoots[0] = CreateExecutionCallTreeNode());
+        Assert.AreSame(hotspot, profile.Hotspots[0]);
+        Assert.AreSame(root, profile.CallTreeRoots[0]);
+
+        var emptyProfile = new ExecutionProfile(
+            new ExecutionTimeRange(Instant("2026-09-02T10:00:00Z"), Instant("2026-09-02T10:01:00Z")),
+            0,
+            0,
+            Array.Empty<ExecutionHotspot>(),
+            Array.Empty<ExecutionCallTreeNode>());
+
+        Assert.IsEmpty(emptyProfile.Hotspots);
+        Assert.IsEmpty(emptyProfile.CallTreeRoots);
     }
 
     [TestMethod]
@@ -223,6 +257,9 @@ public sealed class DiagnosticsValueTests
 
     private static ExecutionFrame CreateExecutionFrame() =>
         new("Worker.Run", "Worker", new SourceLocation("source.cs", 1, null));
+
+    private static ExecutionCallTreeNode CreateExecutionCallTreeNode() =>
+        new(CreateExecutionFrame(), 0, 0, Array.Empty<ExecutionCallTreeNode>());
 
     private static DateTimeOffset Instant(string value) =>
         DateTimeOffset.Parse(value, CultureInfo.InvariantCulture);
