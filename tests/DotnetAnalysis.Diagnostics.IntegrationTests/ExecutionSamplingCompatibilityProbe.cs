@@ -54,16 +54,9 @@ internal static class ExecutionSamplingCompatibilityProbe
             using var source = TraceLog.CreateFromEventPipeSession(
                 session,
                 TraceLog.EventPipeRundownConfiguration.Enable(client));
-            source.Dynamic.All += data =>
+            var sampleProfiler = new SampleProfilerTraceEventParser(source);
+            sampleProfiler.ThreadSample += data =>
             {
-                if (!string.Equals(
-                        data.ProviderName,
-                        SampleProfilerTraceEventParser.ProviderName,
-                        StringComparison.Ordinal))
-                {
-                    return;
-                }
-
                 Interlocked.Increment(ref receivedSampleCount);
                 var stack = data.CallStack();
                 if (stack is null)
