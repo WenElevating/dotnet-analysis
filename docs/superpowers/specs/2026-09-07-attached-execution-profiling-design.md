@@ -216,13 +216,23 @@ $env:DOTNET_ANALYSIS_RUN_EXECUTION_PROFILE_STRESS = 'true'
 dotnet test .\tests\DotnetAnalysis.Diagnostics.IntegrationTests\DotnetAnalysis.Diagnostics.IntegrationTests.csproj --configuration Debug --no-build --filter "FullyQualifiedName~ExecutionSamplingStress"
 
 $env:DOTNET_ANALYSIS_RUN_REAL_APPLICATION_ACCEPTANCE = 'true'
-$env:DOTNET_ANALYSIS_REAL_APPLICATION_PATH = '.\src\DotnetAnalysis.Desktop\bin\x64\Debug\net10.0-windows\DotnetAnalysis.Desktop.exe'
+$mqttnetTestApp = Get-Process -Name 'MQTTnet.TestApp' -ErrorAction Stop
+if (@($mqttnetTestApp).Count -ne 1) { throw '真实应用验收要求恰好一个正在运行的 MQTTnet.TestApp 进程。' }
+$env:DOTNET_ANALYSIS_REAL_APPLICATION_PID = $mqttnetTestApp.Id
 dotnet test .\tests\DotnetAnalysis.Diagnostics.IntegrationTests\DotnetAnalysis.Diagnostics.IntegrationTests.csproj --configuration Debug --no-build --filter "FullyQualifiedName~ExecutionSamplingRealApplicationAcceptance"
 ```
 
 每次显式性能、压力或真实应用验收运行必须写入 `TestResults/ExecutionSampling-<timestamp>/`，至少包含：Git 提交、SDK/运行时、Windows 版本、逻辑处理器数、目标负载参数、采样频率、原始样本数、丢失事件数、诊断 CPU、目标吞吐、私有内存峰值、存储大小、查询耗时列表和分配列表。真实应用验收还必须保存第 9.1 节规定的目标身份、符号身份、三段查询原始结果和异常记录。结果文件是验收证据；只报告 P50/P95 摘要而不保留原始列表不算通过。
 
-真实应用验收至少使用本仓库编译出的 `DotnetAnalysis.Desktop` Debug x64 应用，或经记录的用户指定 Windows x64 .NET 8/9/10 CoreCLR 应用。目标必须在独立进程中正常运行，并且不是诊断测试目标。验收执行者使用独立诊断宿主附着该应用，在不少于 10 分钟的真实工作负载期间：
+真实应用验收固定使用 `D:\AIProject\MQTTnet\Source\MQTTnet.TestApp\MQTTnet.TestApp.csproj` 编译的 `MQTTnet.TestApp` Debug `net8.0` 程序；在 64 位 Windows 上运行时必须验证目标为 x64 CoreCLR 进程。该项目不是本仓库测试目标，也不是合成事件源，且其 Debug 输出已有可匹配 PDB，能够验证第三方真实应用模块的代码定位。
+
+验收前必须在独立的正常控制台启动目标，不能用输入重定向或 `echo b | ...` 启动：
+
+```powershell
+dotnet run --project 'D:\AIProject\MQTTnet\Source\MQTTnet.TestApp\MQTTnet.TestApp.csproj' --configuration Debug
+```
+
+在菜单出现后人工按一次 `b`。该入口执行 `PerformanceTest.RunQoS1Test`：进程内启动 MQTT server 和 client，并持续进行 QoS 1 消息发布。保持此工作负载不少于 10 分钟；验收者使用独立诊断宿主附着这个已经运行的 PID，在该时间内：
 
 1. 保留从附着成功到结束前的全部执行采样，并针对早期、中期和末期的三个时间范围查询调用树。
 2. 在目标应用自身模块中验证至少一个方法解析到匹配源码文件和行号；若使用用户指定应用，记录其可复现的二进制和 PDB 版本。
