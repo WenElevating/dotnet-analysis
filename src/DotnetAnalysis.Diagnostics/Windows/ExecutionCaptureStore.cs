@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Runtime.CompilerServices;
 using DotnetAnalysis.Application.Contracts.Diagnostics;
 using DotnetAnalysis.Core.Diagnostics;
+using Microsoft.Diagnostics.Tracing.Etlx;
 
 namespace DotnetAnalysis.Diagnostics.Windows;
 
@@ -15,6 +16,11 @@ internal sealed record ExecutionFrameDescriptor(
     string? ModuleName,
     string? ModulePath,
     string SymbolKey);
+
+internal sealed record ExecutionFrameReference(
+    int FrameId,
+    ExecutionFrameDescriptor Descriptor,
+    TraceCodeAddress? SymbolAddress);
 
 internal sealed record ExecutionCaptureReadBoundary(
     DateTimeOffset StartedAtUtc,
@@ -43,7 +49,7 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
     private readonly object _stateLock = new();
     private readonly Dictionary<ExecutionFrameDescriptor, int> _frameIds = [];
     private readonly Dictionary<ExecutionStackKey, int> _stackIds = [];
-    private readonly List<ExecutionFrameDescriptor> _framesById = [];
+    private readonly List<ExecutionFrameReference> _framesById = [];
     private readonly List<ExecutionStackKey> _stacksById = [];
     private readonly List<ExecutionCaptureSegment> _segments = [];
     private readonly DateTimeOffset _startedAtUtc = DateTimeOffset.UtcNow;
@@ -82,7 +88,18 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
     /// <summary>
     /// 获取或添加帧描述符的会话内标识。
     /// </summary>
-    public async ValueTask<int> GetOrAddFrameAsync(ExecutionFrameDescriptor frame, CancellationToken cancellationToken)
+    public ValueTask<int> GetOrAddFrameAsync(
+        ExecutionFrameDescriptor frame,
+        CancellationToken cancellationToken) =>
+        GetOrAddFrameAsync(frame, symbolAddress: null, cancellationToken);
+
+    /// <summary>
+    /// 获取或添加带运行时符号句柄的帧描述符，并返回会话内稳定标识。
+    /// </summary>
+    public async ValueTask<int> GetOrAddFrameAsync(
+        ExecutionFrameDescriptor frame,
+        TraceCodeAddress? symbolAddress,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(frame);
         ArgumentException.ThrowIfNullOrWhiteSpace(frame.MethodName);
@@ -97,12 +114,17 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
                 ThrowIfDisposingLocked();
                 if (_frameIds.TryGetValue(frame, out var existingId))
                 {
+                    if (_framesById[existingId].SymbolAddress is null && symbolAddress is not null)
+                    {
+                        _framesById[existingId] = _framesById[existingId] with { SymbolAddress = symbolAddress };
+                    }
+
                     return existingId;
                 }
 
                 var frameId = _frameIds.Count;
                 _frameIds.Add(frame, frameId);
-                _framesById.Add(frame);
+                _framesById.Add(new ExecutionFrameReference(frameId, frame, symbolAddress));
                 return frameId;
             }
         }
@@ -146,14 +168,14 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
     }
 
     /// <summary>
-    /// 获取指定调用栈从根到叶的帧描述符防御性副本。
+    /// 获取指定调用栈从根到叶、包含稳定帧标识的引用防御性副本。
     /// </summary>
     /// <param name="stackId">会话内调用栈标识。</param>
     /// <param name="cancellationToken">取消读取等待和调用链还原的令牌。</param>
-    /// <returns>从根帧到叶帧、不可修改的帧描述符集合。</returns>
+    /// <returns>从根帧到叶帧、不可修改的帧引用集合。</returns>
     /// <exception cref="ArgumentOutOfRangeException">调用栈标识无效时引发。</exception>
     /// <exception cref="OperationCanceledException">操作被取消时引发。</exception>
-    public async ValueTask<IReadOnlyList<ExecutionFrameDescriptor>> GetStackFramesAsync(
+    public async ValueTask<IReadOnlyList<ExecutionFrameReference>> GetStackFramesAsync(
         int stackId,
         CancellationToken cancellationToken)
     {
@@ -173,7 +195,7 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
                 throw new ArgumentOutOfRangeException(nameof(stackId), stackId, "Stack identifier is not known by this execution capture store.");
             }
 
-            var frames = new List<ExecutionFrameDescriptor>();
+            var frames = new List<ExecutionFrameReference>();
             var currentStackId = stackId;
             while (currentStackId >= 0)
             {

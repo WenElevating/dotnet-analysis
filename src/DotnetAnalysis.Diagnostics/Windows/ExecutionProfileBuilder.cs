@@ -10,6 +10,7 @@ internal sealed class ExecutionProfileBuilder
     private readonly ExecutionCaptureStore _store;
     private readonly Action? _beforeHotspotComparison;
     private readonly Action? _beforeCallTreeNodeMaterialization;
+    private readonly Func<ExecutionFrameReference, CancellationToken, Task<SourceLocation?>>? _sourceLocationResolver;
 
     /// <summary>
     /// 创建执行采样聚合器。
@@ -18,11 +19,13 @@ internal sealed class ExecutionProfileBuilder
     public ExecutionProfileBuilder(
         ExecutionCaptureStore store,
         Action? beforeHotspotComparison = null,
-        Action? beforeCallTreeNodeMaterialization = null)
+        Action? beforeCallTreeNodeMaterialization = null,
+        Func<ExecutionFrameReference, CancellationToken, Task<SourceLocation?>>? sourceLocationResolver = null)
     {
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _beforeHotspotComparison = beforeHotspotComparison;
         _beforeCallTreeNodeMaterialization = beforeCallTreeNodeMaterialization;
+        _sourceLocationResolver = sourceLocationResolver;
     }
 
     /// <summary>
@@ -44,10 +47,10 @@ internal sealed class ExecutionProfileBuilder
         ArgumentOutOfRangeException.ThrowIfNegative(lostEventCount);
         cancellationToken.ThrowIfCancellationRequested();
 
-        var framesByStackId = new Dictionary<int, IReadOnlyList<ExecutionFrameDescriptor>>();
-        var coreFramesByDescriptor = new Dictionary<ExecutionFrameDescriptor, ExecutionFrame>();
-        var hotspotsByDescriptor = new Dictionary<ExecutionFrameDescriptor, MutableHotspot>();
-        var callTreeRootsByDescriptor = new Dictionary<ExecutionFrameDescriptor, MutableCallTreeNode>();
+        var framesByStackId = new Dictionary<int, IReadOnlyList<ExecutionFrameReference>>();
+        var coreFramesById = new Dictionary<int, ExecutionFrame>();
+        var hotspotsByFrameId = new Dictionary<int, MutableHotspot>();
+        var callTreeRootsByFrameId = new Dictionary<int, MutableCallTreeNode>();
         var nextFirstSeenOrder = 0L;
         long receivedSampleCount = 0;
 
@@ -66,15 +69,29 @@ internal sealed class ExecutionProfileBuilder
 
             MutableCallTreeNode? currentTreeNode = null;
             MutableHotspot? leafHotspot = null;
-            foreach (var descriptor in stackFrames)
+            foreach (var frameReference in stackFrames)
             {
-                var frame = GetOrAddCoreFrame(coreFramesByDescriptor, descriptor);
-                var hotspot = GetOrAddHotspot(hotspotsByDescriptor, descriptor, frame, ref nextFirstSeenOrder);
+                var frame = await GetOrAddCoreFrameAsync(
+                    coreFramesById,
+                    frameReference,
+                    cancellationToken).ConfigureAwait(false);
+                var hotspot = GetOrAddHotspot(
+                    hotspotsByFrameId,
+                    frameReference.FrameId,
+                    frame,
+                    ref nextFirstSeenOrder);
                 hotspot.InclusiveSampleCount = checked(hotspot.InclusiveSampleCount + 1);
 
                 currentTreeNode = currentTreeNode is null
-                    ? GetOrAddRoot(callTreeRootsByDescriptor, descriptor, frame, ref nextFirstSeenOrder)
-                    : currentTreeNode.GetOrAddChild(descriptor, frame, ref nextFirstSeenOrder);
+                    ? GetOrAddRoot(
+                        callTreeRootsByFrameId,
+                        frameReference.FrameId,
+                        frame,
+                        ref nextFirstSeenOrder)
+                    : currentTreeNode.GetOrAddChild(
+                        frameReference.FrameId,
+                        frame,
+                        ref nextFirstSeenOrder);
                 currentTreeNode.InclusiveSampleCount = checked(currentTreeNode.InclusiveSampleCount + 1);
                 leafHotspot = hotspot;
             }
@@ -87,7 +104,7 @@ internal sealed class ExecutionProfileBuilder
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        var mutableHotspots = hotspotsByDescriptor.Values.ToList();
+        var mutableHotspots = hotspotsByFrameId.Values.ToList();
         SortMutableHotspots(mutableHotspots, _beforeHotspotComparison, cancellationToken);
         var hotspots = new ExecutionHotspot[mutableHotspots.Count];
         for (var index = 0; index < mutableHotspots.Count; index++)
@@ -100,7 +117,7 @@ internal sealed class ExecutionProfileBuilder
                 hotspot.ExclusiveSampleCount);
         }
 
-        var mutableCallTreeRoots = callTreeRootsByDescriptor.Values.ToList();
+        var mutableCallTreeRoots = callTreeRootsByFrameId.Values.ToList();
         SortCallTreeNodes(mutableCallTreeRoots, cancellationToken);
         var callTreeRoots = new ExecutionCallTreeNode[mutableCallTreeRoots.Count];
         for (var index = 0; index < mutableCallTreeRoots.Count; index++)
@@ -114,49 +131,55 @@ internal sealed class ExecutionProfileBuilder
         return new ExecutionProfile(range, receivedSampleCount, lostEventCount, hotspots, callTreeRoots);
     }
 
-    private static ExecutionFrame GetOrAddCoreFrame(
-        Dictionary<ExecutionFrameDescriptor, ExecutionFrame> framesByDescriptor,
-        ExecutionFrameDescriptor descriptor)
+    private async Task<ExecutionFrame> GetOrAddCoreFrameAsync(
+        Dictionary<int, ExecutionFrame> framesById,
+        ExecutionFrameReference frameReference,
+        CancellationToken cancellationToken)
     {
-        if (framesByDescriptor.TryGetValue(descriptor, out var existingFrame))
+        if (framesById.TryGetValue(frameReference.FrameId, out var existingFrame))
         {
             return existingFrame;
         }
 
-        var frame = new ExecutionFrame(descriptor.MethodName, descriptor.ModuleName, sourceLocation: null);
-        framesByDescriptor.Add(descriptor, frame);
+        var sourceLocation = _sourceLocationResolver is null
+            ? null
+            : await _sourceLocationResolver(frameReference, cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        var descriptor = frameReference.Descriptor;
+        var frame = new ExecutionFrame(descriptor.MethodName, descriptor.ModuleName, sourceLocation);
+        framesById.Add(frameReference.FrameId, frame);
         return frame;
     }
 
     private static MutableHotspot GetOrAddHotspot(
-        Dictionary<ExecutionFrameDescriptor, MutableHotspot> hotspotsByDescriptor,
-        ExecutionFrameDescriptor descriptor,
+        Dictionary<int, MutableHotspot> hotspotsByFrameId,
+        int frameId,
         ExecutionFrame frame,
         ref long nextFirstSeenOrder)
     {
-        if (hotspotsByDescriptor.TryGetValue(descriptor, out var existingHotspot))
+        if (hotspotsByFrameId.TryGetValue(frameId, out var existingHotspot))
         {
             return existingHotspot;
         }
 
         var hotspot = new MutableHotspot(frame, nextFirstSeenOrder++);
-        hotspotsByDescriptor.Add(descriptor, hotspot);
+        hotspotsByFrameId.Add(frameId, hotspot);
         return hotspot;
     }
 
     private static MutableCallTreeNode GetOrAddRoot(
-        Dictionary<ExecutionFrameDescriptor, MutableCallTreeNode> rootsByDescriptor,
-        ExecutionFrameDescriptor descriptor,
+        Dictionary<int, MutableCallTreeNode> rootsByFrameId,
+        int frameId,
         ExecutionFrame frame,
         ref long nextFirstSeenOrder)
     {
-        if (rootsByDescriptor.TryGetValue(descriptor, out var existingRoot))
+        if (rootsByFrameId.TryGetValue(frameId, out var existingRoot))
         {
             return existingRoot;
         }
 
         var root = new MutableCallTreeNode(frame, nextFirstSeenOrder++);
-        rootsByDescriptor.Add(descriptor, root);
+        rootsByFrameId.Add(frameId, root);
         return root;
     }
 
@@ -168,7 +191,7 @@ internal sealed class ExecutionProfileBuilder
         cancellationToken.ThrowIfCancellationRequested();
         beforeMaterialization?.Invoke();
         cancellationToken.ThrowIfCancellationRequested();
-        var mutableChildren = node.ChildrenByDescriptor.Values.ToList();
+        var mutableChildren = node.ChildrenByFrameId.Values.ToList();
         SortCallTreeNodes(mutableChildren, cancellationToken);
         var children = new ExecutionCallTreeNode[mutableChildren.Count];
         for (var index = 0; index < mutableChildren.Count; index++)
@@ -310,20 +333,20 @@ internal sealed class ExecutionProfileBuilder
 
         public long ExclusiveSampleCount { get; set; }
 
-        public Dictionary<ExecutionFrameDescriptor, MutableCallTreeNode> ChildrenByDescriptor { get; } = [];
+        public Dictionary<int, MutableCallTreeNode> ChildrenByFrameId { get; } = [];
 
         public MutableCallTreeNode GetOrAddChild(
-            ExecutionFrameDescriptor descriptor,
+            int frameId,
             ExecutionFrame frame,
             ref long nextFirstSeenOrder)
         {
-            if (ChildrenByDescriptor.TryGetValue(descriptor, out var existingChild))
+            if (ChildrenByFrameId.TryGetValue(frameId, out var existingChild))
             {
                 return existingChild;
             }
 
             var child = new MutableCallTreeNode(frame, nextFirstSeenOrder++);
-            ChildrenByDescriptor.Add(descriptor, child);
+            ChildrenByFrameId.Add(frameId, child);
             return child;
         }
     }

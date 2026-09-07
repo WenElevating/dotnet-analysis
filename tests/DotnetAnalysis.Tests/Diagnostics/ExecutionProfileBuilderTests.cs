@@ -303,6 +303,44 @@ public sealed class ExecutionProfileBuilderTests
     }
 
     [TestMethod]
+    public async Task BuildAsync_ResolvesSourceByStableFrameIdentity()
+    {
+        await using var temporaryStore = CreateTemporaryStore();
+        var store = temporaryStore.Store;
+        var firstFrameId = await AddFrameAsync(store, "Worker.Run", "Worker", "first-address");
+        var secondFrameId = await AddFrameAsync(store, "Worker.Run", "Worker", "second-address");
+        var firstStackId = await store.GetOrAddStackAsync(-1, firstFrameId, CancellationToken.None);
+        var secondStackId = await store.GetOrAddStackAsync(-1, secondFrameId, CancellationToken.None);
+        await AppendAsync(store, "00:00:01", firstStackId);
+        await AppendAsync(store, "00:00:02", secondStackId);
+        await AppendAsync(store, "00:00:03", secondStackId);
+        var boundary = store.CaptureReadBoundary();
+        var resolvedFrameIds = new List<int>();
+        var builder = new ExecutionProfileBuilder(
+            store,
+            sourceLocationResolver: (frame, _) =>
+            {
+                resolvedFrameIds.Add(frame.FrameId);
+                var lineNumber = frame.FrameId == firstFrameId ? 101 : 202;
+                return Task.FromResult<SourceLocation?>(new SourceLocation(
+                    $"C:\\source-{frame.FrameId}.cs",
+                    lineNumber,
+                    columnNumber: null));
+            });
+
+        var profile = await builder.BuildAsync(
+            Range("00:00:00", "00:00:03"),
+            boundary,
+            lostEventCount: 0,
+            CancellationToken.None);
+
+        Assert.HasCount(2, profile.Hotspots);
+        CollectionAssert.AreEqual(new[] { firstFrameId, secondFrameId }, resolvedFrameIds);
+        Assert.AreEqual(101, profile.Hotspots[0].Frame.SourceLocation?.LineNumber);
+        Assert.AreEqual(202, profile.Hotspots[1].Frame.SourceLocation?.LineNumber);
+    }
+
+    [TestMethod]
     public async Task GetStackFramesAsync_ReturnsDefensiveRootToLeafFrames()
     {
         await using var temporaryStore = CreateTemporaryStore();
@@ -314,9 +352,11 @@ public sealed class ExecutionProfileBuilderTests
 
         var frames = await store.GetStackFramesAsync(leafStackId, CancellationToken.None);
 
-        CollectionAssert.AreEqual(ExpectedRootToLeafFrameNames, frames.Select(frame => frame.MethodName).ToArray());
-        Assert.IsFalse(frames is ExecutionFrameDescriptor[]);
-        var mutableFrames = (IList<ExecutionFrameDescriptor>)frames;
+        CollectionAssert.AreEqual(
+            ExpectedRootToLeafFrameNames,
+            frames.Select(frame => frame.Descriptor.MethodName).ToArray());
+        Assert.IsFalse(frames is ExecutionFrameReference[]);
+        var mutableFrames = (IList<ExecutionFrameReference>)frames;
         Assert.ThrowsExactly<NotSupportedException>(() => mutableFrames[0] = frames[1]);
     }
 
