@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using Microsoft.Diagnostics.Symbols;
+using Microsoft.Diagnostics.Tracing.Etlx;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using CoreSourceLocation = DotnetAnalysis.Core.Diagnostics.SourceLocation;
@@ -26,6 +27,188 @@ internal interface IExecutionSourceLocationLookup
     ExecutionSourceLocationLookupResult Lookup(ExecutionFrameReference frame);
 }
 
+internal sealed record ExecutionModuleSymbolIdentity(
+    string? PdbName,
+    Guid PdbSignature,
+    int PdbAge,
+    string? FileVersion);
+
+internal sealed record ExecutionSourceLine(
+    string? BuildTimeFilePath,
+    int LineNumber,
+    int ColumnNumber);
+
+internal interface IExecutionSymbolAddressInspector
+{
+    ExecutionModuleSymbolIdentity? GetModuleIdentity(ExecutionFrameReference frame);
+}
+
+internal interface IExecutionLocalFileSystem
+{
+    DriveType GetDriveType(string pathRoot);
+
+    bool FileExists(string path);
+}
+
+internal interface IExecutionSymbolReaderFactory
+{
+    IExecutionSymbolReader Create(string moduleDirectory, Func<string, bool> securityCheck);
+}
+
+internal interface IExecutionSymbolReader : IDisposable
+{
+    string? FindSymbolFilePath(
+        string pdbFileName,
+        ExecutionModuleSymbolIdentity moduleIdentity,
+        string modulePath);
+
+    ExecutionSourceLine? GetSourceLine(ExecutionFrameReference frame);
+}
+
+internal sealed class TraceEventExecutionSymbolAddressInspector : IExecutionSymbolAddressInspector
+{
+    public ExecutionModuleSymbolIdentity? GetModuleIdentity(ExecutionFrameReference frame)
+    {
+        var moduleFile = frame.SymbolAddress?.ModuleFile;
+        return moduleFile is null
+            ? null
+            : new ExecutionModuleSymbolIdentity(
+                moduleFile.PdbName,
+                moduleFile.PdbSignature,
+                moduleFile.PdbAge,
+                moduleFile.FileVersion);
+    }
+}
+
+internal sealed class SystemExecutionLocalFileSystem : IExecutionLocalFileSystem
+{
+    public DriveType GetDriveType(string pathRoot) => new DriveInfo(pathRoot).DriveType;
+
+    public bool FileExists(string path) => File.Exists(path);
+}
+
+internal sealed class TraceEventExecutionSymbolReaderFactory : IExecutionSymbolReaderFactory
+{
+    public IExecutionSymbolReader Create(string moduleDirectory, Func<string, bool> securityCheck)
+    {
+        var reader = new SymbolReader(TextWriter.Null, moduleDirectory)
+        {
+            Options = SymbolReaderOptions.CacheOnly | SymbolReaderOptions.NoNGenSymbolCreation,
+            SourcePath = string.Empty,
+            SecurityCheck = securityCheck
+        };
+        return new TraceEventExecutionSymbolReader(reader);
+    }
+
+    private sealed class TraceEventExecutionSymbolReader : IExecutionSymbolReader
+    {
+        private readonly SymbolReader _reader;
+
+        public TraceEventExecutionSymbolReader(SymbolReader reader)
+        {
+            _reader = reader;
+        }
+
+        public string? FindSymbolFilePath(
+            string pdbFileName,
+            ExecutionModuleSymbolIdentity moduleIdentity,
+            string modulePath) =>
+            _reader.FindSymbolFilePath(
+                pdbFileName,
+                moduleIdentity.PdbSignature,
+                moduleIdentity.PdbAge,
+                modulePath,
+                moduleIdentity.FileVersion,
+                portablePdbMatch: true);
+
+        public ExecutionSourceLine? GetSourceLine(ExecutionFrameReference frame)
+        {
+            TraceCodeAddress? symbolAddress = frame.SymbolAddress;
+            var sourceLocation = symbolAddress?.GetSourceLine(_reader);
+            return sourceLocation is null
+                ? null
+                : new ExecutionSourceLine(
+                    sourceLocation.SourceFile.BuildTimeFilePath,
+                    sourceLocation.LineNumber,
+                    sourceLocation.ColumnNumber);
+        }
+
+        public void Dispose() => _reader.Dispose();
+    }
+}
+
+internal sealed class ExecutionLocalPathPolicy
+{
+    private readonly IExecutionLocalFileSystem _fileSystem;
+
+    public ExecutionLocalPathPolicy(IExecutionLocalFileSystem fileSystem)
+    {
+        _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
+    }
+
+    public bool TryGetLocalFullPath(string? path, out string fullPath)
+    {
+        fullPath = string.Empty;
+        if (string.IsNullOrWhiteSpace(path)
+            || !Path.IsPathFullyQualified(path)
+            || path.StartsWith("\\\\", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        try
+        {
+            var candidate = Path.GetFullPath(path);
+            if (candidate.StartsWith("\\\\", StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            var pathRoot = Path.GetPathRoot(candidate);
+            if (string.IsNullOrWhiteSpace(pathRoot)
+                || pathRoot.StartsWith("\\\\", StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            var driveType = _fileSystem.GetDriveType(pathRoot);
+            if (driveType is not (DriveType.Fixed or DriveType.Removable or DriveType.CDRom or DriveType.Ram))
+            {
+                return false;
+            }
+
+            fullPath = candidate;
+            return true;
+        }
+        catch (Exception exception) when (
+            exception is ArgumentException
+                or IOException
+                or NotSupportedException
+                or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    public bool TryGetExistingLocalFile(string? path, out string fullPath)
+    {
+        if (!TryGetLocalFullPath(path, out fullPath))
+        {
+            return false;
+        }
+
+        try
+        {
+            return _fileSystem.FileExists(fullPath);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            fullPath = string.Empty;
+            return false;
+        }
+    }
+}
+
 /// <summary>
 /// 按会话帧标识单飞解析本地匹配 PDB 中的源代码位置。
 /// </summary>
@@ -46,6 +229,7 @@ internal sealed class ExecutionSymbolResolver : IAsyncDisposable
     private readonly ConcurrentDictionary<int, Task<CoreSourceLocation?>> _sourceLocations = [];
     private readonly IExecutionSourceLocationLookup _lookup;
     private readonly ILogger<ExecutionSymbolResolver> _logger;
+    private readonly ExecutionLocalPathPolicy _localPathPolicy;
     private readonly object _lifecycleLock = new();
     private int _disposed;
 
@@ -54,9 +238,17 @@ internal sealed class ExecutionSymbolResolver : IAsyncDisposable
     /// </summary>
     internal ExecutionSymbolResolver(
         IExecutionSourceLocationLookup? lookup = null,
-        ILogger<ExecutionSymbolResolver>? logger = null)
+        ILogger<ExecutionSymbolResolver>? logger = null,
+        IExecutionLocalFileSystem? fileSystem = null,
+        IExecutionSymbolReaderFactory? symbolReaderFactory = null,
+        IExecutionSymbolAddressInspector? symbolAddressInspector = null)
     {
-        _lookup = lookup ?? new LocalPdbSourceLocationLookup();
+        _localPathPolicy = new ExecutionLocalPathPolicy(
+            fileSystem ?? new SystemExecutionLocalFileSystem());
+        _lookup = lookup ?? new LocalPdbSourceLocationLookup(
+            _localPathPolicy,
+            symbolReaderFactory ?? new TraceEventExecutionSymbolReaderFactory(),
+            symbolAddressInspector ?? new TraceEventExecutionSymbolAddressInspector());
         _logger = logger ?? NullLogger<ExecutionSymbolResolver>.Instance;
     }
 
@@ -116,10 +308,21 @@ internal sealed class ExecutionSymbolResolver : IAsyncDisposable
         ExecutionFrameReference frame,
         TaskCompletionSource<CoreSourceLocation?> completion)
     {
-        var sourceLocation = await Task.Run(
-            () => ResolveCore(frame),
-            CancellationToken.None).ConfigureAwait(false);
-        completion.TrySetResult(sourceLocation);
+        CoreSourceLocation? sourceLocation = null;
+        try
+        {
+            sourceLocation = await Task.Run(
+                () => ResolveCore(frame),
+                CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            LogResolutionFailure(frame.FrameId, exception);
+        }
+        finally
+        {
+            completion.TrySetResult(sourceLocation);
+        }
     }
 
     private CoreSourceLocation? ResolveCore(ExecutionFrameReference frame)
@@ -129,68 +332,105 @@ internal sealed class ExecutionSymbolResolver : IAsyncDisposable
             var result = _lookup.Lookup(frame);
             if (result.Status is not ExecutionSourceLocationLookupStatus.Found)
             {
-                s_sourceUnavailable(_logger, frame.FrameId, result.Status, null);
+                LogSourceUnavailable(frame.FrameId, result.Status);
                 return null;
             }
 
             if (string.IsNullOrWhiteSpace(result.BuildTimeFilePath)
                 || result.LineNumber <= 0
-                || !File.Exists(result.BuildTimeFilePath))
+                || !_localPathPolicy.TryGetExistingLocalFile(result.BuildTimeFilePath, out var sourcePath))
             {
-                s_sourceUnavailable(
-                    _logger,
-                    frame.FrameId,
-                    ExecutionSourceLocationLookupStatus.SourceUnavailable,
-                    null);
+                LogSourceUnavailable(frame.FrameId, ExecutionSourceLocationLookupStatus.SourceUnavailable);
                 return null;
             }
 
             int? columnNumber = result.ColumnNumber > 0 ? result.ColumnNumber : null;
-            return new CoreSourceLocation(result.BuildTimeFilePath, result.LineNumber, columnNumber);
+            return new CoreSourceLocation(sourcePath, result.LineNumber, columnNumber);
         }
         catch (Exception exception)
         {
-            s_sourceResolutionFailed(_logger, frame.FrameId, exception);
+            LogResolutionFailure(frame.FrameId, exception);
             return null;
+        }
+    }
+
+    private void LogSourceUnavailable(int frameId, ExecutionSourceLocationLookupStatus status)
+    {
+        try
+        {
+            s_sourceUnavailable(_logger, frameId, status, null);
+        }
+        catch (Exception)
+        {
+        }
+    }
+
+    private void LogResolutionFailure(int frameId, Exception exception)
+    {
+        try
+        {
+            s_sourceResolutionFailed(_logger, frameId, exception);
+        }
+        catch (Exception)
+        {
         }
     }
 
     private sealed class LocalPdbSourceLocationLookup : IExecutionSourceLocationLookup, IDisposable
     {
         private readonly object _readersLock = new();
+        private readonly ExecutionLocalPathPolicy _localPathPolicy;
+        private readonly IExecutionSymbolReaderFactory _symbolReaderFactory;
+        private readonly IExecutionSymbolAddressInspector _symbolAddressInspector;
         private readonly Dictionary<string, SymbolReaderLease> _readers = new(StringComparer.OrdinalIgnoreCase);
         private bool _disposed;
 
+        public LocalPdbSourceLocationLookup(
+            ExecutionLocalPathPolicy localPathPolicy,
+            IExecutionSymbolReaderFactory symbolReaderFactory,
+            IExecutionSymbolAddressInspector symbolAddressInspector)
+        {
+            _localPathPolicy = localPathPolicy;
+            _symbolReaderFactory = symbolReaderFactory;
+            _symbolAddressInspector = symbolAddressInspector;
+        }
+
         public ExecutionSourceLocationLookupResult Lookup(ExecutionFrameReference frame)
         {
-            var symbolAddress = frame.SymbolAddress;
             var modulePath = frame.Descriptor.ModulePath;
-            if (symbolAddress is null || string.IsNullOrWhiteSpace(modulePath))
+            if (string.IsNullOrWhiteSpace(modulePath)
+                || !_localPathPolicy.TryGetLocalFullPath(modulePath, out var fullModulePath))
             {
                 return Unavailable(ExecutionSourceLocationLookupStatus.DynamicModule);
             }
 
-            var moduleFile = symbolAddress.ModuleFile;
-            if (moduleFile is null || string.IsNullOrWhiteSpace(moduleFile.PdbName))
+            var moduleIdentity = _symbolAddressInspector.GetModuleIdentity(frame);
+            var pdbName = moduleIdentity?.PdbName;
+            if (moduleIdentity is null || string.IsNullOrWhiteSpace(pdbName))
             {
                 return Unavailable(ExecutionSourceLocationLookupStatus.PdbMissing);
             }
 
-            if (moduleFile.PdbSignature == Guid.Empty || moduleFile.PdbAge <= 0)
+            if (moduleIdentity.PdbSignature == Guid.Empty || moduleIdentity.PdbAge <= 0)
             {
                 return Unavailable(ExecutionSourceLocationLookupStatus.PdbMismatch);
             }
 
-            var fullModulePath = Path.GetFullPath(modulePath);
+            if (Path.IsPathFullyQualified(pdbName)
+                && !_localPathPolicy.TryGetLocalFullPath(pdbName, out _))
+            {
+                return Unavailable(ExecutionSourceLocationLookupStatus.PdbMissing);
+            }
+
             var moduleDirectory = Path.GetDirectoryName(fullModulePath);
-            var pdbFileName = Path.GetFileName(moduleFile.PdbName);
+            var pdbFileName = Path.GetFileName(pdbName);
             if (string.IsNullOrWhiteSpace(moduleDirectory) || string.IsNullOrWhiteSpace(pdbFileName))
             {
                 return Unavailable(ExecutionSourceLocationLookupStatus.PdbMissing);
             }
 
             var pdbPath = Path.Combine(moduleDirectory, pdbFileName);
-            if (!File.Exists(pdbPath))
+            if (!_localPathPolicy.TryGetExistingLocalFile(pdbPath, out var fullPdbPath))
             {
                 return Unavailable(ExecutionSourceLocationLookupStatus.PdbMissing);
             }
@@ -200,25 +440,20 @@ internal sealed class ExecutionSymbolResolver : IAsyncDisposable
             {
                 var matchedPdbPath = lease.Reader.FindSymbolFilePath(
                     pdbFileName,
-                    moduleFile.PdbSignature,
-                    moduleFile.PdbAge,
-                    fullModulePath,
-                    moduleFile.FileVersion,
-                    portablePdbMatch: true);
-                if (!string.Equals(
-                        Path.GetFullPath(matchedPdbPath ?? string.Empty),
-                        Path.GetFullPath(pdbPath),
-                        StringComparison.OrdinalIgnoreCase))
+                    moduleIdentity,
+                    fullModulePath);
+                if (!_localPathPolicy.TryGetLocalFullPath(matchedPdbPath, out var fullMatchedPdbPath)
+                    || !string.Equals(fullMatchedPdbPath, fullPdbPath, StringComparison.OrdinalIgnoreCase))
                 {
                     return Unavailable(ExecutionSourceLocationLookupStatus.PdbMismatch);
                 }
 
-                var sourceLocation = symbolAddress.GetSourceLine(lease.Reader);
+                var sourceLocation = lease.Reader.GetSourceLine(frame);
                 return sourceLocation is null
                     ? Unavailable(ExecutionSourceLocationLookupStatus.SourceUnavailable)
                     : new ExecutionSourceLocationLookupResult(
                         ExecutionSourceLocationLookupStatus.Found,
-                        sourceLocation.SourceFile.BuildTimeFilePath,
+                        sourceLocation.BuildTimeFilePath,
                         sourceLocation.LineNumber,
                         sourceLocation.ColumnNumber);
             }
@@ -255,21 +490,22 @@ internal sealed class ExecutionSymbolResolver : IAsyncDisposable
                     return existingReader;
                 }
 
-                var reader = new SymbolReader(TextWriter.Null, moduleDirectory)
-                {
-                    Options = SymbolReaderOptions.CacheOnly | SymbolReaderOptions.NoNGenSymbolCreation,
-                    SourcePath = string.Empty,
-                    SecurityCheck = path => IsFileInDirectory(path, moduleDirectory)
-                };
+                var reader = _symbolReaderFactory.Create(
+                    moduleDirectory,
+                    path => IsFileInDirectory(path, moduleDirectory));
                 var lease = new SymbolReaderLease(reader);
                 _readers.Add(moduleDirectory, lease);
                 return lease;
             }
         }
 
-        private static bool IsFileInDirectory(string path, string directory)
+        private bool IsFileInDirectory(string path, string directory)
         {
-            var fullPath = Path.GetFullPath(path);
+            if (!_localPathPolicy.TryGetLocalFullPath(path, out var fullPath))
+            {
+                return false;
+            }
+
             var containingDirectory = Path.GetDirectoryName(fullPath);
             return string.Equals(containingDirectory, directory, StringComparison.OrdinalIgnoreCase);
         }
@@ -278,7 +514,7 @@ internal sealed class ExecutionSymbolResolver : IAsyncDisposable
             ExecutionSourceLocationLookupStatus status) =>
             new(status, null, LineNumber: 0, ColumnNumber: 0);
 
-        private sealed record SymbolReaderLease(SymbolReader Reader)
+        private sealed record SymbolReaderLease(IExecutionSymbolReader Reader)
         {
             public object SyncRoot { get; } = new();
         }

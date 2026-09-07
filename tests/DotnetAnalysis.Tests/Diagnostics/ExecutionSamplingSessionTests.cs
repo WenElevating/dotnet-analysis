@@ -66,6 +66,36 @@ public sealed class ExecutionSamplingSessionTests
     }
 
     [TestMethod]
+    public async Task StartAsync_WhenNestedAggregateWrapsTransientFailures_RetriesOnceAndPreservesWrapper()
+    {
+        var firstFailure = new AggregateException(
+            "first wrapper",
+            new AggregateException(new DiagnosticsClientException("first attempt")));
+        var secondFailure = new AggregateException(
+            "second wrapper",
+            new AggregateException(new IOException("second attempt")));
+        var sampler = new ControlledEventPipeExecutionSampler([firstFailure, secondFailure]);
+        var delays = new List<TimeSpan>();
+        await using var fixture = CreateFixture(sampler, (delay, cancellationToken) =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            delays.Add(delay);
+            return Task.CompletedTask;
+        });
+
+        await fixture.Session.StartAsync(fixture.Target, CancellationToken.None);
+        var exception = await Assert.ThrowsExactlyAsync<DiagnosticsException>(async () =>
+            await fixture.Session.GetExecutionProfileAsync(
+                new ExecutionTimeRange(fixture.StartedAtUtc, fixture.StartedAtUtc.AddSeconds(1)),
+                CancellationToken.None));
+
+        Assert.AreEqual(DiagnosticsErrorCode.ExecutionProfilingUnavailable, exception.ErrorCode);
+        Assert.AreSame(secondFailure, exception.InnerException);
+        Assert.AreEqual(2, sampler.StartCallCount);
+        CollectionAssert.AreEqual(new[] { TimeSpan.FromSeconds(1) }, delays);
+    }
+
+    [TestMethod]
     public async Task StartAsync_WhenRetryWaitIsCancelled_AllowsLaterStart()
     {
         var sampler = new ControlledEventPipeExecutionSampler([new IOException("first attempt")]);

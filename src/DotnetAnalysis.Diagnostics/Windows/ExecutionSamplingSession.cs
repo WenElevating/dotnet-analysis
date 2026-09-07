@@ -314,10 +314,26 @@ internal sealed class ExecutionSamplingSession : IExecutionSamplingSession
     }
 
     private static bool IsTransientStartFailure(Exception exception) =>
-        exception is DiagnosticsClientException or IOException;
+        ContainsStartFailure(
+            exception,
+            static candidate => candidate is DiagnosticsClientException or IOException);
 
     private static bool IsMappedStartFailure(Exception exception) =>
-        exception is DiagnosticsClientException or IOException or UnauthorizedAccessException;
+        ContainsStartFailure(
+            exception,
+            static candidate => candidate is DiagnosticsClientException or IOException or UnauthorizedAccessException);
+
+    private static bool ContainsStartFailure(Exception exception, Func<Exception, bool> predicate)
+    {
+        if (predicate(exception))
+        {
+            return true;
+        }
+
+        return exception is AggregateException aggregateException
+            && aggregateException.InnerExceptions.Any(innerException =>
+                ContainsStartFailure(innerException, predicate));
+    }
 
     private static DiagnosticsException CreateRangeUnavailableException() =>
         new(

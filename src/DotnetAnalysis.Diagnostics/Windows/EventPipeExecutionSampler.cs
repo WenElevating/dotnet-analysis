@@ -1,5 +1,6 @@
 using System.Diagnostics.Tracing;
 using System.Globalization;
+using System.Runtime.ExceptionServices;
 using DotnetAnalysis.Application.Contracts.Diagnostics;
 using DotnetAnalysis.Core.Diagnostics;
 using Microsoft.Diagnostics.NETCore.Client;
@@ -24,21 +25,177 @@ internal interface IEventPipeExecutionSampler : IAsyncDisposable
     Task StopAsync(CancellationToken cancellationToken);
 }
 
+internal sealed record EventPipeExecutionFrame(
+    string? MethodName,
+    string? ModuleName,
+    string? ModulePath,
+    string SymbolKey,
+    TraceCodeAddress? SymbolAddress);
+
+internal sealed record EventPipeExecutionSample(
+    DateTimeOffset ObservedAtUtc,
+    int ThreadId,
+    IReadOnlyList<EventPipeExecutionFrame> LeafToRootFrames);
+
+internal interface IEventPipeExecutionRuntime
+{
+    IEventPipeExecutionSession StartSession(
+        int processId,
+        IReadOnlyCollection<EventPipeProvider> providers,
+        bool requestRundown,
+        int circularBufferMegabytes);
+
+    IEventPipeExecutionTraceSource CreateTraceSource(IEventPipeExecutionSession session);
+}
+
+internal interface IEventPipeExecutionSession : IDisposable
+{
+    void Stop();
+}
+
+internal interface IEventPipeExecutionTraceSource : IDisposable
+{
+    long EventsLost { get; }
+
+    void SubscribeSampleProfilerThreadSample(Action<EventPipeExecutionSample> sampleObserved);
+
+    void Process();
+
+    void StopProcessing();
+}
+
+internal sealed class DiagnosticsClientExecutionSamplingRuntime : IEventPipeExecutionRuntime
+{
+    public IEventPipeExecutionSession StartSession(
+        int processId,
+        IReadOnlyCollection<EventPipeProvider> providers,
+        bool requestRundown,
+        int circularBufferMegabytes)
+    {
+        var client = new DiagnosticsClient(processId);
+        var session = client.StartEventPipeSession(
+            providers,
+            requestRundown,
+            circularBufferMegabytes);
+        return new DiagnosticsClientExecutionSamplingSession(client, session);
+    }
+
+    public IEventPipeExecutionTraceSource CreateTraceSource(IEventPipeExecutionSession session)
+    {
+        if (session is not DiagnosticsClientExecutionSamplingSession diagnosticsSession)
+        {
+            throw new ArgumentException("The execution session was not created by this runtime.", nameof(session));
+        }
+
+        var source = TraceLog.CreateFromEventPipeSession(
+            diagnosticsSession.Session,
+            TraceLog.EventPipeRundownConfiguration.Enable(diagnosticsSession.Client));
+        return new TraceEventExecutionTraceSource(source);
+    }
+
+    private sealed class DiagnosticsClientExecutionSamplingSession : IEventPipeExecutionSession
+    {
+        public DiagnosticsClientExecutionSamplingSession(DiagnosticsClient client, EventPipeSession session)
+        {
+            Client = client;
+            Session = session;
+        }
+
+        public DiagnosticsClient Client { get; }
+
+        public EventPipeSession Session { get; }
+
+        public void Stop() => Session.Stop();
+
+        public void Dispose() => Session.Dispose();
+    }
+
+    private sealed class TraceEventExecutionTraceSource : IEventPipeExecutionTraceSource
+    {
+        private readonly TraceLogEventSource _source;
+        private SampleProfilerTraceEventParser? _sampleProfiler;
+        private Action<EventPipeExecutionSample>? _sampleObserved;
+
+        public TraceEventExecutionTraceSource(TraceLogEventSource source)
+        {
+            _source = source;
+        }
+
+        public long EventsLost => _source.EventsLost;
+
+        public void SubscribeSampleProfilerThreadSample(Action<EventPipeExecutionSample> sampleObserved)
+        {
+            ArgumentNullException.ThrowIfNull(sampleObserved);
+            if (_sampleProfiler is not null)
+            {
+                throw new InvalidOperationException("The Sample Profiler callback is already registered.");
+            }
+
+            _sampleObserved = sampleObserved;
+            _sampleProfiler = new SampleProfilerTraceEventParser(_source);
+            _sampleProfiler.ThreadSample += OnThreadSample;
+        }
+
+        public void Process() => _source.Process();
+
+        public void StopProcessing() => _source.StopProcessing();
+
+        public void Dispose()
+        {
+            if (_sampleProfiler is not null)
+            {
+                _sampleProfiler.ThreadSample -= OnThreadSample;
+            }
+
+            _sampleObserved = null;
+            _sampleProfiler = null;
+            _source.Dispose();
+        }
+
+        private void OnThreadSample(ClrThreadSampleTraceData data)
+        {
+            var leafToRootFrames = new List<EventPipeExecutionFrame>();
+            for (TraceCallStack? stack = data.CallStack(); stack is not null; stack = stack.Caller)
+            {
+                var address = stack.CodeAddress;
+                if (address.Method is null || string.IsNullOrWhiteSpace(address.FullMethodName))
+                {
+                    continue;
+                }
+
+                leafToRootFrames.Add(new EventPipeExecutionFrame(
+                    address.FullMethodName,
+                    address.ModuleName,
+                    address.ModuleFilePath,
+                    ((int)address.CodeAddressIndex).ToString(CultureInfo.InvariantCulture),
+                    address));
+            }
+
+            _sampleObserved?.Invoke(new EventPipeExecutionSample(
+                new DateTimeOffset(data.TimeStamp.ToUniversalTime()),
+                data.ThreadID,
+                leafToRootFrames));
+        }
+    }
+}
+
 /// <summary>
 /// 从单个 EventPipe Sample Profiler 会话顺序读取并持久化托管执行栈。
 /// </summary>
 internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
 {
-    private static readonly TimeSpan ProcessorDrainTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan DefaultProcessorDrainTimeout = TimeSpan.FromSeconds(5);
 
     private readonly object _syncRoot = new();
     private readonly ExecutionCaptureStore _store;
+    private readonly IEventPipeExecutionRuntime _runtime;
+    private readonly TimeSpan _processorDrainTimeout;
 
-    private EventPipeSession? _session;
-    private TraceLogEventSource? _source;
-    private SampleProfilerTraceEventParser? _sampleProfiler;
+    private IEventPipeExecutionSession? _session;
+    private IEventPipeExecutionTraceSource? _source;
     private Task? _processing;
     private Task? _stopTask;
+    private Task? _disposeTask;
     private DiagnosticsException? _terminalFailure;
     private long _successfulSampleCount;
     private long _completedLostEventCount;
@@ -49,8 +206,26 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
     /// 创建将已规范化样本写入指定会话存储的采样器。
     /// </summary>
     public EventPipeExecutionSampler(ExecutionCaptureStore store)
+        : this(store, new DiagnosticsClientExecutionSamplingRuntime(), DefaultProcessorDrainTimeout)
+    {
+    }
+
+    internal EventPipeExecutionSampler(
+        ExecutionCaptureStore store,
+        IEventPipeExecutionRuntime runtime,
+        TimeSpan processorDrainTimeout)
     {
         _store = store ?? throw new ArgumentNullException(nameof(store));
+        _runtime = runtime ?? throw new ArgumentNullException(nameof(runtime));
+        if (processorDrainTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(processorDrainTimeout),
+                processorDrainTimeout,
+                "The processor drain timeout must be positive.");
+        }
+
+        _processorDrainTimeout = processorDrainTimeout;
     }
 
     /// <summary>
@@ -101,7 +276,6 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
 
             try
             {
-                var client = new DiagnosticsClient(target.ProcessId);
                 var providers = new[]
                 {
                     new EventPipeProvider(
@@ -112,21 +286,26 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
                         EventLevel.Informational,
                         (long)ClrTraceEventParser.Keywords.Default)
                 };
-                _session = client.StartEventPipeSession(
+                _session = _runtime.StartSession(
+                    target.ProcessId,
                     providers,
                     requestRundown: true,
-                    circularBufferMB: 32);
-                _source = TraceLog.CreateFromEventPipeSession(
-                    _session,
-                    TraceLog.EventPipeRundownConfiguration.Enable(client));
-                _sampleProfiler = new SampleProfilerTraceEventParser(_source);
-                _sampleProfiler.ThreadSample += OnThreadSample;
+                    circularBufferMegabytes: 32);
+                _source = _runtime.CreateTraceSource(_session);
+                _source.SubscribeSampleProfilerThreadSample(OnThreadSample);
                 var source = _source;
                 _processing = Task.Run(() => ProcessEvents(source), CancellationToken.None);
             }
             catch
             {
-                CleanupSessionLocked();
+                try
+                {
+                    CleanupSessionLocked();
+                }
+                catch (Exception)
+                {
+                }
+
                 throw;
             }
         }
@@ -154,25 +333,88 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
     }
 
     /// <inheritdoc />
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0)
-        {
-            return;
-        }
-
-        await StopAsync(CancellationToken.None).ConfigureAwait(false);
         lock (_syncRoot)
         {
-            CleanupSessionLocked();
+            if (_disposeTask is not null)
+            {
+                return new ValueTask(_disposeTask);
+            }
+
+            Interlocked.Exchange(ref _disposed, 1);
+            _disposeTask = DisposeCoreAsync();
+            return new ValueTask(_disposeTask);
         }
+    }
+
+    private async Task DisposeCoreAsync()
+    {
+        await Task.Yield();
+        ExceptionDispatchInfo? failure = null;
+        try
+        {
+            await StopAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            failure = ExceptionDispatchInfo.Capture(exception);
+        }
+
+        Task? processing;
+        IEventPipeExecutionTraceSource? source;
+        lock (_syncRoot)
+        {
+            processing = _processing;
+            source = _source;
+        }
+
+        try
+        {
+            try
+            {
+                source?.StopProcessing();
+            }
+            catch (Exception exception)
+            {
+                failure ??= ExceptionDispatchInfo.Capture(exception);
+            }
+
+            if (processing is not null)
+            {
+                try
+                {
+                    await processing.ConfigureAwait(false);
+                }
+                catch (Exception exception)
+                {
+                    failure ??= ExceptionDispatchInfo.Capture(exception);
+                }
+            }
+        }
+        finally
+        {
+            lock (_syncRoot)
+            {
+                try
+                {
+                    CleanupSessionLocked();
+                }
+                catch (Exception exception)
+                {
+                    failure ??= ExceptionDispatchInfo.Capture(exception);
+                }
+            }
+        }
+
+        failure?.Throw();
     }
 
     private async Task StopCoreAsync()
     {
         Task? processing;
-        EventPipeSession? session;
-        TraceLogEventSource? source;
+        IEventPipeExecutionSession? session;
+        IEventPipeExecutionTraceSource? source;
         lock (_syncRoot)
         {
             processing = _processing;
@@ -201,7 +443,7 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
 
         try
         {
-            await processing.WaitAsync(ProcessorDrainTimeout, CancellationToken.None).ConfigureAwait(false);
+            await processing.WaitAsync(_processorDrainTimeout, CancellationToken.None).ConfigureAwait(false);
         }
         catch (TimeoutException exception)
         {
@@ -217,9 +459,9 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
         }
     }
 
-    private void OnThreadSample(ClrThreadSampleTraceData data)
+    private void OnThreadSample(EventPipeExecutionSample data)
     {
-        if (TerminalFailure is not null || data.ThreadID < 0)
+        if (TerminalFailure is not null || data.ThreadId < 0)
         {
             return;
         }
@@ -254,35 +496,25 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
         }
     }
 
-    private async ValueTask StoreSampleAsync(ClrThreadSampleTraceData data)
+    private async ValueTask StoreSampleAsync(EventPipeExecutionSample data)
     {
-        var leafToRoot = new List<TraceCodeAddress>();
-        for (TraceCallStack? stack = data.CallStack(); stack is not null; stack = stack.Caller)
-        {
-            var address = stack.CodeAddress;
-            if (address.Method is not null && !string.IsNullOrWhiteSpace(address.FullMethodName))
-            {
-                leafToRoot.Add(address);
-            }
-        }
-
-        if (leafToRoot.Count == 0)
-        {
-            return;
-        }
-
         var parentStackId = -1;
-        for (var index = leafToRoot.Count - 1; index >= 0; index--)
+        for (var index = data.LeafToRootFrames.Count - 1; index >= 0; index--)
         {
-            var address = leafToRoot[index];
+            var frame = data.LeafToRootFrames[index];
+            if (string.IsNullOrWhiteSpace(frame.MethodName))
+            {
+                continue;
+            }
+
             var descriptor = new ExecutionFrameDescriptor(
-                address.FullMethodName,
-                NullIfWhiteSpace(address.ModuleName),
-                NullIfWhiteSpace(address.ModuleFilePath),
-                ((int)address.CodeAddressIndex).ToString(CultureInfo.InvariantCulture));
+                frame.MethodName,
+                NullIfWhiteSpace(frame.ModuleName),
+                NullIfWhiteSpace(frame.ModulePath),
+                frame.SymbolKey);
             var frameId = await _store.GetOrAddFrameAsync(
                 descriptor,
-                address,
+                frame.SymbolAddress,
                 CancellationToken.None).ConfigureAwait(false);
             parentStackId = await _store.GetOrAddStackAsync(
                 parentStackId,
@@ -290,14 +522,18 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
                 CancellationToken.None).ConfigureAwait(false);
         }
 
-        var observedAtUtc = new DateTimeOffset(data.TimeStamp.ToUniversalTime());
+        if (parentStackId < 0)
+        {
+            return;
+        }
+
         await _store.AppendAsync(
-            new ExecutionSampleRecord(observedAtUtc, data.ThreadID, parentStackId),
+            new ExecutionSampleRecord(data.ObservedAtUtc.ToUniversalTime(), data.ThreadId, parentStackId),
             CancellationToken.None).ConfigureAwait(false);
         Interlocked.Increment(ref _successfulSampleCount);
     }
 
-    private void ProcessEvents(TraceLogEventSource source)
+    private void ProcessEvents(IEventPipeExecutionTraceSource source)
     {
         try
         {
@@ -346,17 +582,19 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
 
     private void CleanupSessionLocked()
     {
-        if (_sampleProfiler is not null)
-        {
-            _sampleProfiler.ThreadSample -= OnThreadSample;
-        }
-
-        _source?.Dispose();
-        _session?.Dispose();
-        _sampleProfiler = null;
+        var source = _source;
+        var session = _session;
         _source = null;
         _session = null;
         _processing = null;
+        try
+        {
+            source?.Dispose();
+        }
+        finally
+        {
+            session?.Dispose();
+        }
     }
 
     private static DiagnosticsException CreateUnavailableException(string message, Exception exception) =>

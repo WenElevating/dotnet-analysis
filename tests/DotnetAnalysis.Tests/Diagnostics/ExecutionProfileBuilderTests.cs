@@ -341,6 +341,51 @@ public sealed class ExecutionProfileBuilderTests
     }
 
     [TestMethod]
+    [DoNotParallelize]
+    public async Task BuildAsync_RepeatedFrameCacheHits_DoNotAllocatePerObservedFrame()
+    {
+        await using var temporaryStore = CreateTemporaryStore();
+        var store = temporaryStore.Store;
+        const int sampleCount = 4_096;
+        const int deepStackDepth = 24;
+        var shallowFrameId = await AddFrameAsync(store, "Shallow", "App", "shallow");
+        var shallowStackId = await store.GetOrAddStackAsync(-1, shallowFrameId, CancellationToken.None);
+        var deepStackId = -1;
+        for (var index = 0; index < deepStackDepth; index++)
+        {
+            var frameId = await AddFrameAsync(store, $"Deep{index:D2}", "App", $"deep-{index}");
+            deepStackId = await store.GetOrAddStackAsync(deepStackId, frameId, CancellationToken.None);
+        }
+
+        var shallowObservedAtUtc = Instant("00:00:01");
+        var deepObservedAtUtc = Instant("00:00:03");
+        for (var index = 0; index < sampleCount; index++)
+        {
+            await store.AppendAsync(
+                new ExecutionSampleRecord(shallowObservedAtUtc, ThreadId: 7, shallowStackId),
+                CancellationToken.None);
+            await store.AppendAsync(
+                new ExecutionSampleRecord(deepObservedAtUtc, ThreadId: 7, deepStackId),
+                CancellationToken.None);
+        }
+
+        var boundary = store.CaptureReadBoundary();
+        var shallowRange = Range("00:00:00", "00:00:02");
+        var deepRange = Range("00:00:02", "00:00:04");
+        var builder = new ExecutionProfileBuilder(store);
+        _ = await builder.BuildAsync(shallowRange, boundary, lostEventCount: 0, CancellationToken.None);
+        _ = await builder.BuildAsync(deepRange, boundary, lostEventCount: 0, CancellationToken.None);
+
+        var shallowAllocatedBytes = await MeasureBuildAllocatedBytesAsync(builder, shallowRange, boundary);
+        var deepAllocatedBytes = await MeasureBuildAllocatedBytesAsync(builder, deepRange, boundary);
+        var additionalAllocatedBytes = deepAllocatedBytes - shallowAllocatedBytes;
+        Console.WriteLine(
+            $"shallow={shallowAllocatedBytes}; deep={deepAllocatedBytes}; additional={additionalAllocatedBytes}");
+
+        Assert.IsLessThan(1_000_000L, additionalAllocatedBytes);
+    }
+
+    [TestMethod]
     public async Task GetStackFramesAsync_ReturnsDefensiveRootToLeafFrames()
     {
         await using var temporaryStore = CreateTemporaryStore();
@@ -388,6 +433,19 @@ public sealed class ExecutionProfileBuilderTests
             "yyyy-MM-dd'T'HH:mm:ss'Z'",
             CultureInfo.InvariantCulture,
             DateTimeStyles.AssumeUniversal);
+
+    private static async Task<long> MeasureBuildAllocatedBytesAsync(
+        ExecutionProfileBuilder builder,
+        ExecutionTimeRange range,
+        ExecutionCaptureReadBoundary boundary)
+    {
+        GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true, compacting: true);
+        var before = GC.GetTotalAllocatedBytes(precise: true);
+        var profile = await builder.BuildAsync(range, boundary, lostEventCount: 0, CancellationToken.None);
+        var allocatedBytes = GC.GetTotalAllocatedBytes(precise: true) - before;
+        GC.KeepAlive(profile);
+        return allocatedBytes;
+    }
 
     private static async Task IgnoreExpectedCancellationAsync(Task task)
     {

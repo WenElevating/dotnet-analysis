@@ -71,10 +71,12 @@ internal sealed class ExecutionProfileBuilder
             MutableHotspot? leafHotspot = null;
             foreach (var frameReference in stackFrames)
             {
-                var frame = await GetOrAddCoreFrameAsync(
-                    coreFramesById,
-                    frameReference,
-                    cancellationToken).ConfigureAwait(false);
+                if (!coreFramesById.TryGetValue(frameReference.FrameId, out var frame))
+                {
+                    frame = await CreateCoreFrameAsync(frameReference, cancellationToken).ConfigureAwait(false);
+                    coreFramesById.Add(frameReference.FrameId, frame);
+                }
+
                 var hotspot = GetOrAddHotspot(
                     hotspotsByFrameId,
                     frameReference.FrameId,
@@ -131,24 +133,16 @@ internal sealed class ExecutionProfileBuilder
         return new ExecutionProfile(range, receivedSampleCount, lostEventCount, hotspots, callTreeRoots);
     }
 
-    private async Task<ExecutionFrame> GetOrAddCoreFrameAsync(
-        Dictionary<int, ExecutionFrame> framesById,
+    private async Task<ExecutionFrame> CreateCoreFrameAsync(
         ExecutionFrameReference frameReference,
         CancellationToken cancellationToken)
     {
-        if (framesById.TryGetValue(frameReference.FrameId, out var existingFrame))
-        {
-            return existingFrame;
-        }
-
         var sourceLocation = _sourceLocationResolver is null
             ? null
             : await _sourceLocationResolver(frameReference, cancellationToken).ConfigureAwait(false);
         cancellationToken.ThrowIfCancellationRequested();
         var descriptor = frameReference.Descriptor;
-        var frame = new ExecutionFrame(descriptor.MethodName, descriptor.ModuleName, sourceLocation);
-        framesById.Add(frameReference.FrameId, frame);
-        return frame;
+        return new ExecutionFrame(descriptor.MethodName, descriptor.ModuleName, sourceLocation);
     }
 
     private static MutableHotspot GetOrAddHotspot(
