@@ -1,6 +1,7 @@
 using DotnetAnalysis.Application.Contracts.Diagnostics;
 using DotnetAnalysis.Core.Diagnostics;
 using DotnetAnalysis.Diagnostics.Windows;
+using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 
@@ -115,14 +116,50 @@ public sealed class ExecutionCaptureStoreTests
         var store = temporaryStore.Store;
         await store.AppendAsync(Sample("00:00:01"), CancellationToken.None);
         var pendingAppend = store.AppendAsync(Sample("00:00:02"), CancellationToken.None).AsTask();
-        await entered.Task;
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var boundary = store.CaptureReadBoundary();
+            var records = await store.ReadAsync(Range("00:00:00", "00:00:03"), boundary, CancellationToken.None).ToListAsync();
 
-        var boundary = store.CaptureReadBoundary();
-        var records = await store.ReadAsync(Range("00:00:00", "00:00:03"), boundary, CancellationToken.None).ToListAsync();
+            Assert.HasCount(1, records);
+        }
+        finally
+        {
+            release.TrySetResult();
+            await pendingAppend;
+        }
+    }
 
-        Assert.HasCount(1, records);
-        release.TrySetResult();
-        await pendingAppend;
+    [TestMethod]
+    public async Task AppendAndReadAsync_UnderConcurrentBoundaryPressure_PreservesEveryCompletedRecord()
+    {
+        const int sampleCount = 300;
+        await using var temporaryStore = CreateTemporaryStore(segmentDataLimitBytes: 12);
+        var store = temporaryStore.Store;
+        var stopwatch = Stopwatch.StartNew();
+        var readerOne = Task.Run(async () => await ReadBoundariesUntilCompleteAsync(store, sampleCount));
+        var readerTwo = Task.Run(async () => await ReadBoundariesUntilCompleteAsync(store, sampleCount));
+
+        for (var index = 0; index < sampleCount; index++)
+        {
+            await store.AppendAsync(new ExecutionSampleRecord(
+                Sample("00:00:01").ObservedAtUtc.AddTicks(index),
+                ThreadId: index % 17,
+                StackId: index % 11),
+                CancellationToken.None);
+        }
+
+        await Task.WhenAll(readerOne, readerTwo);
+        var finalBoundary = store.CaptureReadBoundary();
+        var records = await store.ReadAsync(
+            new ExecutionTimeRange(Sample("00:00:00").ObservedAtUtc, Sample("00:01:00").ObservedAtUtc),
+            finalBoundary,
+            CancellationToken.None).ToListAsync();
+        stopwatch.Stop();
+
+        Assert.HasCount(sampleCount, records, $"Elapsed: {stopwatch.Elapsed}.");
+        Assert.IsTrue(stopwatch.Elapsed < TimeSpan.FromSeconds(15), $"Elapsed: {stopwatch.Elapsed}.");
     }
 
     [TestMethod]
@@ -304,6 +341,21 @@ public sealed class ExecutionCaptureStoreTests
         if (Directory.Exists(path))
         {
             Directory.Delete(path, recursive: true);
+        }
+    }
+
+    private static async Task ReadBoundariesUntilCompleteAsync(ExecutionCaptureStore store, int expectedCount)
+    {
+        var observedMaximum = 0;
+        while (observedMaximum < expectedCount)
+        {
+            var boundary = store.CaptureReadBoundary();
+            var records = await store.ReadAsync(
+                new ExecutionTimeRange(Sample("00:00:00").ObservedAtUtc, Sample("00:01:00").ObservedAtUtc),
+                boundary,
+                CancellationToken.None).ToListAsync();
+            observedMaximum = Math.Max(observedMaximum, records.Count);
+            await Task.Yield();
         }
     }
 
