@@ -46,7 +46,7 @@ public sealed class EventPipeExecutionSamplerTests
                 provider => provider.Name == ClrTraceEventParser.ProviderName);
             Assert.AreEqual(EventLevel.Informational, sampleProvider.EventLevel);
             Assert.AreEqual(EventLevel.Informational, runtimeProvider.EventLevel);
-            Assert.AreEqual((long)ClrTraceEventParser.Keywords.Default, runtimeProvider.Keywords);
+            Assert.AreEqual((long)ClrTraceEventParser.Keywords.JITSymbols, runtimeProvider.Keywords);
             Assert.IsTrue(runtime.RequestRundown);
             Assert.AreEqual(32, runtime.CircularBufferMegabytes);
             Assert.AreEqual(1, source.SampleProfilerThreadSampleSubscriptionCount);
@@ -99,6 +99,25 @@ public sealed class EventPipeExecutionSamplerTests
             await DisposeSamplerIgnoringFailureAsync(sampler);
             await fixture.DisposeAsync();
         }
+    }
+
+    [TestMethod]
+    [DoNotParallelize]
+    public async Task ProcessEvents_WhenSampleCountGrows_DoesNotAllocatePerSample()
+    {
+        _ = await MeasureSamplingAllocatedBytesAsync(sampleCount: 1);
+
+        var smallMeasurement = await MeasureSamplingAllocatedBytesAsync(sampleCount: 4_096);
+        var largeMeasurement = await MeasureSamplingAllocatedBytesAsync(sampleCount: 32_768);
+        var additionalAllocatedBytes = largeMeasurement.AllocatedBytes - smallMeasurement.AllocatedBytes;
+        var additionalProcessorMilliseconds =
+            largeMeasurement.ProcessorMilliseconds - smallMeasurement.ProcessorMilliseconds;
+        Console.WriteLine(
+            $"small={smallMeasurement}; large={largeMeasurement}; "
+            + $"additionalAllocated={additionalAllocatedBytes}; additionalCpuMs={additionalProcessorMilliseconds}");
+
+        Assert.IsLessThan(1024 * 1024L, additionalAllocatedBytes);
+        Assert.IsLessThan(100d, additionalProcessorMilliseconds);
     }
 
     [TestMethod]
@@ -203,6 +222,41 @@ public sealed class EventPipeExecutionSamplerTests
 
     private static TargetProcess Target(DateTimeOffset startedAtUtc) =>
         new(processId: 1234, startedAtUtc.AddMinutes(-1), "target", "C:\\target.exe");
+
+    private static async Task<SamplingResourceMeasurement> MeasureSamplingAllocatedBytesAsync(int sampleCount)
+    {
+        var fixture = CreateFixture();
+        var source = new ControlledEventPipeExecutionTraceSource(
+            Sample(fixture.StartedAtUtc.AddSeconds(1), Frame("Worker", "worker")),
+            sampleRepeatCount: sampleCount);
+        var runtime = new ControlledEventPipeExecutionRuntime(source);
+        var sampler = new EventPipeExecutionSampler(fixture.Store, runtime, TimeSpan.FromSeconds(5));
+        try
+        {
+            GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true, compacting: true);
+            using var process = Process.GetCurrentProcess();
+            process.Refresh();
+            var processorBefore = process.TotalProcessorTime;
+            var allocatedBefore = GC.GetTotalAllocatedBytes(precise: true);
+            await sampler.StartAsync(Target(fixture.StartedAtUtc), CancellationToken.None);
+            await source.SampleDispatchCompleted.Task.WaitAsync(TimeSpan.FromSeconds(15));
+            var allocatedBytes = GC.GetTotalAllocatedBytes(precise: true) - allocatedBefore;
+            process.Refresh();
+            var processorMilliseconds = (process.TotalProcessorTime - processorBefore).TotalMilliseconds;
+
+            Assert.AreEqual(sampleCount, sampler.SuccessfulSampleCount);
+            return new SamplingResourceMeasurement(allocatedBytes, processorMilliseconds);
+        }
+        finally
+        {
+            await DisposeSamplerIgnoringFailureAsync(sampler);
+            await fixture.DisposeAsync();
+        }
+    }
+
+    private readonly record struct SamplingResourceMeasurement(
+        long AllocatedBytes,
+        double ProcessorMilliseconds);
 
     private static async Task<List<ExecutionSampleRecord>> ReadAllAsync(
         ExecutionCaptureStore store,
@@ -317,10 +371,13 @@ public sealed class EventPipeExecutionSamplerTests
 
         public ControlledEventPipeExecutionTraceSource(
             EventPipeExecutionSample? sample,
-            long eventsLost = 0)
+            long eventsLost = 0,
+            int sampleRepeatCount = 1)
         {
             _sample = sample;
             EventsLost = eventsLost;
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(sampleRepeatCount);
+            SampleRepeatCount = sampleRepeatCount;
         }
 
         public TaskCompletionSource ProcessingStarted { get; } =
@@ -333,6 +390,8 @@ public sealed class EventPipeExecutionSamplerTests
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public long EventsLost { get; }
+
+        public int SampleRepeatCount { get; }
 
         public int SampleProfilerThreadSampleSubscriptionCount { get; private set; }
 
@@ -355,7 +414,10 @@ public sealed class EventPipeExecutionSamplerTests
             {
                 if (_sample is not null)
                 {
-                    _sampleObserved!(_sample);
+                    for (var index = 0; index < SampleRepeatCount; index++)
+                    {
+                        _sampleObserved!(_sample.Value);
+                    }
                 }
 
                 SampleDispatchCompleted.TrySetResult();

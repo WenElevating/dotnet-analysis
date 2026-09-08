@@ -386,6 +386,31 @@ public sealed class ExecutionProfileBuilderTests
     }
 
     [TestMethod]
+    [DoNotParallelize]
+    public async Task BuildAsync_WhenSampleCountGrows_DoesNotAllocatePerSample()
+    {
+        const int smallSampleCount = 4_096;
+        const int largeSampleCount = 32_768;
+        await using var smallStore = await CreateSingleStackStoreAsync(smallSampleCount);
+        await using var largeStore = await CreateSingleStackStoreAsync(largeSampleCount);
+        var range = Range("00:00:00", "00:00:02");
+        var smallBuilder = new ExecutionProfileBuilder(smallStore.Store);
+        var largeBuilder = new ExecutionProfileBuilder(largeStore.Store);
+        var smallBoundary = smallStore.Store.CaptureReadBoundary();
+        var largeBoundary = largeStore.Store.CaptureReadBoundary();
+        _ = await smallBuilder.BuildAsync(range, smallBoundary, lostEventCount: 0, CancellationToken.None);
+        _ = await largeBuilder.BuildAsync(range, largeBoundary, lostEventCount: 0, CancellationToken.None);
+
+        var smallAllocatedBytes = await MeasureBuildAllocatedBytesAsync(smallBuilder, range, smallBoundary);
+        var largeAllocatedBytes = await MeasureBuildAllocatedBytesAsync(largeBuilder, range, largeBoundary);
+        var additionalAllocatedBytes = largeAllocatedBytes - smallAllocatedBytes;
+        Console.WriteLine(
+            $"small={smallAllocatedBytes}; large={largeAllocatedBytes}; additional={additionalAllocatedBytes}");
+
+        Assert.IsLessThan(256 * 1024L, additionalAllocatedBytes);
+    }
+
+    [TestMethod]
     public async Task GetStackFramesAsync_ReturnsDefensiveRootToLeafFrames()
     {
         await using var temporaryStore = CreateTemporaryStore();
@@ -445,6 +470,31 @@ public sealed class ExecutionProfileBuilderTests
         var allocatedBytes = GC.GetTotalAllocatedBytes(precise: true) - before;
         GC.KeepAlive(profile);
         return allocatedBytes;
+    }
+
+    private static async Task<TemporaryExecutionCaptureStore> CreateSingleStackStoreAsync(int sampleCount)
+    {
+        var temporaryStore = CreateTemporaryStore();
+        try
+        {
+            var store = temporaryStore.Store;
+            var frameId = await AddFrameAsync(store, "Worker", "App", "worker");
+            var stackId = await store.GetOrAddStackAsync(-1, frameId, CancellationToken.None);
+            var observedAtUtc = Instant("00:00:01");
+            for (var index = 0; index < sampleCount; index++)
+            {
+                await store.AppendAsync(
+                    new ExecutionSampleRecord(observedAtUtc, ThreadId: 7, stackId),
+                    CancellationToken.None);
+            }
+
+            return temporaryStore;
+        }
+        catch
+        {
+            await temporaryStore.DisposeAsync();
+            throw;
+        }
     }
 
     private static async Task IgnoreExpectedCancellationAsync(Task task)

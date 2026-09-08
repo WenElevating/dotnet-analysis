@@ -47,30 +47,26 @@ internal sealed class ExecutionProfileBuilder
         ArgumentOutOfRangeException.ThrowIfNegative(lostEventCount);
         cancellationToken.ThrowIfCancellationRequested();
 
-        var framesByStackId = new Dictionary<int, IReadOnlyList<ExecutionFrameReference>>();
         var coreFramesById = new Dictionary<int, ExecutionFrame>();
         var hotspotsByFrameId = new Dictionary<int, MutableHotspot>();
         var callTreeRootsByFrameId = new Dictionary<int, MutableCallTreeNode>();
         var nextFirstSeenOrder = 0L;
-        long receivedSampleCount = 0;
-
-        await foreach (var sample in _store.ReadAsync(range, boundary, cancellationToken)
-            .WithCancellation(cancellationToken)
-            .ConfigureAwait(false))
+        var stackSampleCounts = await _store.ReadStackSampleCountsAsync(
+            range,
+            boundary,
+            cancellationToken).ConfigureAwait(false);
+        foreach (var stackSampleCount in stackSampleCounts.Stacks)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            receivedSampleCount = checked(receivedSampleCount + 1);
-
-            if (!framesByStackId.TryGetValue(sample.StackId, out var stackFrames))
-            {
-                stackFrames = await _store.GetStackFramesAsync(sample.StackId, cancellationToken).ConfigureAwait(false);
-                framesByStackId.Add(sample.StackId, stackFrames);
-            }
+            var stackFrames = await _store.GetStackFramesAsync(
+                stackSampleCount.StackId,
+                cancellationToken).ConfigureAwait(false);
 
             MutableCallTreeNode? currentTreeNode = null;
             MutableHotspot? leafHotspot = null;
-            foreach (var frameReference in stackFrames)
+            for (var frameIndex = 0; frameIndex < stackFrames.Count; frameIndex++)
             {
+                var frameReference = stackFrames[frameIndex];
                 if (!coreFramesById.TryGetValue(frameReference.FrameId, out var frame))
                 {
                     frame = await CreateCoreFrameAsync(frameReference, cancellationToken).ConfigureAwait(false);
@@ -82,7 +78,8 @@ internal sealed class ExecutionProfileBuilder
                     frameReference.FrameId,
                     frame,
                     ref nextFirstSeenOrder);
-                hotspot.InclusiveSampleCount = checked(hotspot.InclusiveSampleCount + 1);
+                hotspot.InclusiveSampleCount = checked(
+                    hotspot.InclusiveSampleCount + stackSampleCount.SampleCount);
 
                 currentTreeNode = currentTreeNode is null
                     ? GetOrAddRoot(
@@ -94,14 +91,17 @@ internal sealed class ExecutionProfileBuilder
                         frameReference.FrameId,
                         frame,
                         ref nextFirstSeenOrder);
-                currentTreeNode.InclusiveSampleCount = checked(currentTreeNode.InclusiveSampleCount + 1);
+                currentTreeNode.InclusiveSampleCount = checked(
+                    currentTreeNode.InclusiveSampleCount + stackSampleCount.SampleCount);
                 leafHotspot = hotspot;
             }
 
             if (currentTreeNode is not null && leafHotspot is not null)
             {
-                currentTreeNode.ExclusiveSampleCount = checked(currentTreeNode.ExclusiveSampleCount + 1);
-                leafHotspot.ExclusiveSampleCount = checked(leafHotspot.ExclusiveSampleCount + 1);
+                currentTreeNode.ExclusiveSampleCount = checked(
+                    currentTreeNode.ExclusiveSampleCount + stackSampleCount.SampleCount);
+                leafHotspot.ExclusiveSampleCount = checked(
+                    leafHotspot.ExclusiveSampleCount + stackSampleCount.SampleCount);
             }
         }
 
@@ -130,7 +130,12 @@ internal sealed class ExecutionProfileBuilder
                 cancellationToken);
         }
 
-        return new ExecutionProfile(range, receivedSampleCount, lostEventCount, hotspots, callTreeRoots);
+        return new ExecutionProfile(
+            range,
+            stackSampleCounts.ReceivedSampleCount,
+            lostEventCount,
+            hotspots,
+            callTreeRoots);
     }
 
     private async Task<ExecutionFrame> CreateCoreFrameAsync(

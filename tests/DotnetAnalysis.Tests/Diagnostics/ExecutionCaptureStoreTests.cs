@@ -68,6 +68,59 @@ public sealed class ExecutionCaptureStoreTests
     }
 
     [TestMethod]
+    public async Task ReadStackSampleCountsAsync_AggregatesRangeInFirstSeenStackOrder()
+    {
+        await using var temporaryStore = CreateTemporaryStore();
+        var store = temporaryStore.Store;
+        await store.AppendAsync(Sample("00:00:01") with { StackId = 7 }, CancellationToken.None);
+        await store.AppendAsync(Sample("00:00:02") with { StackId = 3 }, CancellationToken.None);
+        await store.AppendAsync(Sample("00:00:03") with { StackId = 7 }, CancellationToken.None);
+        await store.AppendAsync(Sample("00:00:04") with { StackId = 9 }, CancellationToken.None);
+        var boundary = store.CaptureReadBoundary();
+
+        var counts = await store.ReadStackSampleCountsAsync(
+            Range("00:00:01", "00:00:04"),
+            boundary,
+            CancellationToken.None);
+
+        Assert.AreEqual(3L, counts.ReceivedSampleCount);
+        Assert.HasCount(2, counts.Stacks);
+        Assert.AreEqual(new ExecutionStackSampleCount(StackId: 7, SampleCount: 2), counts.Stacks[0]);
+        Assert.AreEqual(new ExecutionStackSampleCount(StackId: 3, SampleCount: 1), counts.Stacks[1]);
+    }
+
+    [TestMethod]
+    public async Task AppendAsync_WhenSamplesHaveRegularCadence_UsesIncrementalTimestamps()
+    {
+        const int sampleCount = 10_000;
+        const long expectedMaximumBytesPerSample = 5;
+        await using var temporaryStore = CreateTemporaryStore();
+        var store = temporaryStore.Store;
+        var firstObservedAtUtc = Sample("00:00:01").ObservedAtUtc;
+        for (var index = 0; index < sampleCount; index++)
+        {
+            await store.AppendAsync(
+                new ExecutionSampleRecord(
+                    firstObservedAtUtc.AddTicks(index * 2_000L),
+                    ThreadId: 20_000,
+                    StackId: 300),
+                CancellationToken.None);
+        }
+
+        var boundary = store.CaptureReadBoundary();
+        var dataLength = boundary.SegmentReadLimits.Sum(static segment => segment.DataLength);
+        var records = await store.ReadAsync(
+            new ExecutionTimeRange(firstObservedAtUtc, firstObservedAtUtc.AddSeconds(3)),
+            boundary,
+            CancellationToken.None).ToListAsync();
+
+        Assert.IsLessThanOrEqualTo(sampleCount * expectedMaximumBytesPerSample, dataLength);
+        Assert.HasCount(sampleCount, records);
+        Assert.AreEqual(firstObservedAtUtc, records[0].ObservedAtUtc);
+        Assert.AreEqual(firstObservedAtUtc.AddTicks((sampleCount - 1) * 2_000L), records[^1].ObservedAtUtc);
+    }
+
+    [TestMethod]
     public async Task ReadAsync_UsesCapturedBoundaryAndExcludesConcurrentAppend()
     {
         await using var temporaryStore = CreateTemporaryStore();
@@ -122,7 +175,7 @@ public sealed class ExecutionCaptureStoreTests
         });
         var store = temporaryStore.Store;
         var committedSample = Sample("00:00:01");
-        var pendingSample = Sample("00:00:02");
+        var pendingSample = Sample("00:00:02") with { ThreadId = 20_000 };
         ExecutionSampleRecord[] committedPrefix = [committedSample];
         await store.AppendAsync(committedSample, CancellationToken.None);
         var pendingAppend = store.AppendAsync(pendingSample, CancellationToken.None).AsTask();
@@ -298,6 +351,49 @@ public sealed class ExecutionCaptureStoreTests
         Assert.IsInstanceOfType<IOException>(firstFailure.InnerException);
         Assert.AreSame(firstFailure, repeatedFailure);
         Assert.HasCount(1, records);
+    }
+
+    [TestMethod]
+    public async Task CaptureReadBoundary_WhenFlushFails_PoisonsLaterAppend()
+    {
+        var root = CreateTemporaryRoot();
+        var failNextFlush = 0;
+        var store = new ExecutionCaptureStore(
+            new ExecutionCaptureStorageLayout(root),
+            beforeSegmentFlush: () =>
+            {
+                if (Interlocked.Exchange(ref failNextFlush, 0) != 0)
+                {
+                    throw new IOException("controlled flush failure");
+                }
+            });
+        try
+        {
+            var committedSample = Sample("00:00:01");
+            await store.AppendAsync(committedSample, CancellationToken.None);
+            var readableBoundary = store.CaptureReadBoundary();
+            Volatile.Write(ref failNextFlush, 1);
+
+            var firstFailure = Assert.ThrowsExactly<DiagnosticsException>(store.CaptureReadBoundary);
+            var repeatedBoundaryFailure = Assert.ThrowsExactly<DiagnosticsException>(store.CaptureReadBoundary);
+            var repeatedFailure = await Assert.ThrowsExactlyAsync<DiagnosticsException>(async () =>
+                await store.AppendAsync(Sample("00:00:02"), CancellationToken.None));
+            var readableRecords = await store.ReadAsync(
+                Range("00:00:00", "00:00:02"),
+                readableBoundary,
+                CancellationToken.None).ToListAsync();
+
+            Assert.AreEqual(DiagnosticsErrorCode.ExecutionProfileStorageFailed, firstFailure.ErrorCode);
+            Assert.IsInstanceOfType<IOException>(firstFailure.InnerException);
+            Assert.AreSame(firstFailure, repeatedBoundaryFailure);
+            Assert.AreSame(firstFailure, repeatedFailure);
+            CollectionAssert.AreEqual(new[] { committedSample }, readableRecords.ToArray());
+        }
+        finally
+        {
+            await store.DisposeAsync();
+            DeleteDirectoryIfPresent(root);
+        }
     }
 
     [TestMethod]

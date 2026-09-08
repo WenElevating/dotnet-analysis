@@ -25,14 +25,14 @@ internal interface IEventPipeExecutionSampler : IAsyncDisposable
     Task StopAsync(CancellationToken cancellationToken);
 }
 
-internal sealed record EventPipeExecutionFrame(
+internal readonly record struct EventPipeExecutionFrame(
     string? MethodName,
     string? ModuleName,
     string? ModulePath,
     string SymbolKey,
     TraceCodeAddress? SymbolAddress);
 
-internal sealed record EventPipeExecutionSample(
+internal readonly record struct EventPipeExecutionSample(
     DateTimeOffset ObservedAtUtc,
     int ThreadId,
     IReadOnlyList<EventPipeExecutionFrame> LeafToRootFrames);
@@ -113,6 +113,7 @@ internal sealed class DiagnosticsClientExecutionSamplingRuntime : IEventPipeExec
     internal sealed class TraceEventExecutionTraceSource : IEventPipeExecutionTraceSource
     {
         private readonly TraceLogEventSource _source;
+        private readonly List<EventPipeExecutionFrame> _leafToRootFrames = new(capacity: 32);
         private SampleProfilerTraceEventParser? _sampleProfiler;
         private Action<EventPipeExecutionSample>? _sampleObserved;
 
@@ -154,7 +155,7 @@ internal sealed class DiagnosticsClientExecutionSamplingRuntime : IEventPipeExec
 
         private void OnThreadSample(ClrThreadSampleTraceData data)
         {
-            var leafToRootFrames = new List<EventPipeExecutionFrame>();
+            _leafToRootFrames.Clear();
             for (TraceCallStack? stack = data.CallStack(); stack is not null; stack = stack.Caller)
             {
                 var address = stack.CodeAddress;
@@ -163,7 +164,7 @@ internal sealed class DiagnosticsClientExecutionSamplingRuntime : IEventPipeExec
                     continue;
                 }
 
-                leafToRootFrames.Add(new EventPipeExecutionFrame(
+                _leafToRootFrames.Add(new EventPipeExecutionFrame(
                     address.FullMethodName,
                     address.ModuleName,
                     address.ModuleFilePath,
@@ -174,7 +175,7 @@ internal sealed class DiagnosticsClientExecutionSamplingRuntime : IEventPipeExec
             _sampleObserved?.Invoke(new EventPipeExecutionSample(
                 new DateTimeOffset(data.TimeStamp.ToUniversalTime()),
                 data.ThreadID,
-                leafToRootFrames));
+                _leafToRootFrames));
         }
     }
 }
@@ -184,6 +185,8 @@ internal sealed class DiagnosticsClientExecutionSamplingRuntime : IEventPipeExec
 /// </summary>
 internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
 {
+    internal const bool DefaultRequestRundown = true;
+    internal const int DefaultCircularBufferMegabytes = 32;
     private static readonly TimeSpan DefaultProcessorDrainTimeout = TimeSpan.FromSeconds(5);
 
     private readonly object _syncRoot = new();
@@ -276,21 +279,12 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
 
             try
             {
-                var providers = new[]
-                {
-                    new EventPipeProvider(
-                        SampleProfilerTraceEventParser.ProviderName,
-                        EventLevel.Informational),
-                    new EventPipeProvider(
-                        ClrTraceEventParser.ProviderName,
-                        EventLevel.Informational,
-                        (long)ClrTraceEventParser.Keywords.Default)
-                };
+                var providers = CreateDefaultProviders();
                 _session = _runtime.StartSession(
                     target.ProcessId,
                     providers,
-                    requestRundown: true,
-                    circularBufferMegabytes: 32);
+                    DefaultRequestRundown,
+                    DefaultCircularBufferMegabytes);
                 _source = _runtime.CreateTraceSource(_session);
                 _source.SubscribeSampleProfilerThreadSample(OnThreadSample);
                 var source = _source;
@@ -312,6 +306,17 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
 
         return Task.CompletedTask;
     }
+
+    internal static EventPipeProvider[] CreateDefaultProviders() =>
+    [
+        new EventPipeProvider(
+            SampleProfilerTraceEventParser.ProviderName,
+            EventLevel.Informational),
+        new EventPipeProvider(
+            ClrTraceEventParser.ProviderName,
+            EventLevel.Informational,
+            (long)ClrTraceEventParser.Keywords.JITSymbols)
+    ];
 
     /// <summary>
     /// 停止 EventPipe 输入并最多等待五秒排空已启动的处理器。
@@ -468,7 +473,7 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
 
         try
         {
-            StoreSampleAsync(data).AsTask().GetAwaiter().GetResult();
+            StoreSample(data);
         }
         catch (DiagnosticsException exception)
             when (exception.ErrorCode is DiagnosticsErrorCode.ExecutionProfileStorageFailed)
@@ -496,7 +501,7 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
         }
     }
 
-    private async ValueTask StoreSampleAsync(EventPipeExecutionSample data)
+    private void StoreSample(EventPipeExecutionSample data)
     {
         var parentStackId = -1;
         for (var index = data.LeafToRootFrames.Count - 1; index >= 0; index--)
@@ -512,14 +517,14 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
                 NullIfWhiteSpace(frame.ModuleName),
                 NullIfWhiteSpace(frame.ModulePath),
                 frame.SymbolKey);
-            var frameId = await _store.GetOrAddFrameAsync(
+            var frameId = GetValueTaskResult(_store.GetOrAddFrameAsync(
                 descriptor,
                 frame.SymbolAddress,
-                CancellationToken.None).ConfigureAwait(false);
-            parentStackId = await _store.GetOrAddStackAsync(
+                CancellationToken.None));
+            parentStackId = GetValueTaskResult(_store.GetOrAddStackAsync(
                 parentStackId,
                 frameId,
-                CancellationToken.None).ConfigureAwait(false);
+                CancellationToken.None));
         }
 
         if (parentStackId < 0)
@@ -527,10 +532,31 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
             return;
         }
 
-        await _store.AppendAsync(
+        CompleteValueTask(_store.AppendAsync(
             new ExecutionSampleRecord(data.ObservedAtUtc.ToUniversalTime(), data.ThreadId, parentStackId),
-            CancellationToken.None).ConfigureAwait(false);
+            CancellationToken.None));
         Interlocked.Increment(ref _successfulSampleCount);
+    }
+
+    private static T GetValueTaskResult<T>(ValueTask<T> operation)
+    {
+        if (operation.IsCompletedSuccessfully)
+        {
+            return operation.Result;
+        }
+
+        return operation.AsTask().GetAwaiter().GetResult();
+    }
+
+    private static void CompleteValueTask(ValueTask operation)
+    {
+        if (operation.IsCompletedSuccessfully)
+        {
+            operation.GetAwaiter().GetResult();
+            return;
+        }
+
+        operation.AsTask().GetAwaiter().GetResult();
     }
 
     private void ProcessEvents(IEventPipeExecutionTraceSource source)
