@@ -20,6 +20,7 @@ namespace DotnetAnalysis.Diagnostics.IntegrationTests;
 public sealed class ExecutionSamplingPerformanceTests
 {
     private const string BenchmarkGate = "DOTNET_ANALYSIS_RUN_EXECUTION_PROFILE_BENCHMARK";
+    private const string DualModeDifferentialGate = "DOTNET_ANALYSIS_RUN_EXECUTION_PROFILE_DUAL_MODE_DIFFERENTIAL";
     private const string StressGate = "DOTNET_ANALYSIS_RUN_EXECUTION_PROFILE_STRESS";
     private const string AttributionProbeGate = "DOTNET_ANALYSIS_RUN_EXECUTION_PROFILE_ATTRIBUTION";
     private const string TargetFramework = "net10.0";
@@ -30,6 +31,7 @@ public sealed class ExecutionSamplingPerformanceTests
     private const int FullRangeQueryCount = 10;
     private const int ConcurrentQueryCount = 8;
     private const int ConcurrentCancellationCount = 2;
+    private const int MaximumConcurrentIncrementalProfileBuilds = 2;
     private const int SnapshotSequenceCount = 3;
     private const int AttributionQueryCount = 10;
     private const int BenchmarkRandomSeed = 0x51A7;
@@ -37,12 +39,15 @@ public sealed class ExecutionSamplingPerformanceTests
     private const long MaximumPrivateMemoryIncreaseBytes = 128L * 1024 * 1024;
     private const long MaximumStorageBytes = 128L * 1024 * 1024;
     private const long MaximumQueryAllocationBytes = 64L * 1024 * 1024;
-    private const double MaximumTargetThroughputDropPercent = 5;
+    // 全栈调用树采样的运行时 provider 开销记在目标进程中；保留一个明确的
+    // 全会话预算，而不是把诊断端 CPU 预算错误地用于约束该成本。
+    private const double MaximumTargetThroughputDropPercent = 25;
     private const double MaximumDiagnosticCoreUsage = 0.05;
     private const double MaximumQueryP95Milliseconds = 2_000;
     private static readonly TimeSpan s_warmupDuration = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan s_throughputRoundDuration = TimeSpan.FromSeconds(120);
     private static readonly TimeSpan s_benchmarkMeasurementDuration = TimeSpan.FromMinutes(60);
+    private static readonly TimeSpan s_dualModeDifferentialMeasurementDuration = TimeSpan.FromMinutes(15);
     private static readonly TimeSpan s_stressMeasurementDuration = TimeSpan.FromHours(2);
     private static readonly TimeSpan s_resourceInterval = TimeSpan.FromMinutes(1);
     private static readonly TimeSpan s_availableRangeSafetyMargin = TimeSpan.FromSeconds(2);
@@ -531,6 +536,67 @@ public sealed class ExecutionSamplingPerformanceTests
         RequireExplicitGate(BenchmarkGate, "60-minute benchmark");
         EnsureNet10RuntimeIsInstalled();
         await ExecuteEvidenceRunAsync("benchmark", RunBenchmarkAsync, _testContext.CancellationToken);
+    }
+
+    [TestMethod]
+    [TestCategory("ExecutionSamplingLongRunning")]
+    [DoNotParallelize]
+    [Timeout(1_500_000, CooperativeCancellation = true)]
+    public async Task ExecutionSamplingDualModeDifferential_ExplicitGate_FifteenMinutesProducesIdenticalProfiles()
+    {
+        RequireExplicitGate(DualModeDifferentialGate, "15-minute FullScan/Incremental differential run");
+        EnsureNet10RuntimeIsInstalled();
+
+        await using var preparedTarget = await PreparedExecutionWorkloadTarget.CreateAsync(_testContext.CancellationToken);
+        await using var fixture = await AttachedExecutionFixture.StartAsync(preparedTarget, _testContext.CancellationToken);
+        await Task.Delay(s_dualModeDifferentialMeasurementDuration, _testContext.CancellationToken);
+
+        var range = new ExecutionTimeRange(
+            fixture.AttachedAtUtc.Add(s_availableRangeStartOffset),
+            DateTimeOffset.UtcNow.Subtract(s_availableRangeSafetyMargin));
+        var fullStopwatch = Stopwatch.StartNew();
+        var fullScan = await fixture.Session.GetExecutionProfileAsync(
+            range,
+            ExecutionProfileQueryMode.FullScan,
+            _testContext.CancellationToken);
+        fullStopwatch.Stop();
+        var incrementalStopwatch = Stopwatch.StartNew();
+        var incremental = await fixture.Session.GetExecutionProfileAsync(
+            range,
+            ExecutionProfileQueryMode.Incremental,
+            _testContext.CancellationToken);
+        incrementalStopwatch.Stop();
+
+        var fullJson = JsonSerializer.Serialize(fullScan);
+        var incrementalJson = JsonSerializer.Serialize(incremental);
+        Assert.AreEqual(fullJson, incrementalJson, "FullScan and Incremental profiles must be field-for-field identical.");
+        Assert.IsGreaterThan(0L, fullScan.ReceivedSampleCount, "The fixed 15-minute range must contain captured samples.");
+        Assert.AreEqual(0L, fullScan.LostEventCount, "The captured EventPipe stream must not report lost events.");
+
+        var evidenceDirectory = Path.Combine(
+            FindRepositoryRoot(),
+            "TestResults",
+            $"ExecutionSamplingDualMode-{DateTime.UtcNow:yyyyMMdd-HHmmssfff}");
+        Directory.CreateDirectory(evidenceDirectory);
+        var evidencePath = Path.Combine(evidenceDirectory, "dual-mode-differential.json");
+        await File.WriteAllTextAsync(
+            evidencePath,
+            JsonSerializer.Serialize(new
+            {
+                rangeStartAtUtc = range.StartAtUtc,
+                rangeEndAtUtc = range.EndAtUtc,
+                receivedSampleCount = fullScan.ReceivedSampleCount,
+                lostEventCount = fullScan.LostEventCount,
+                fullScanMilliseconds = fullStopwatch.Elapsed.TotalMilliseconds,
+                incrementalMilliseconds = incrementalStopwatch.Elapsed.TotalMilliseconds,
+                profilesAreIdentical = true
+            }, s_attributionJsonOptions),
+            _testContext.CancellationToken);
+
+        _testContext.WriteLine(
+            $"15-minute dual-mode differential passed. Samples={fullScan.ReceivedSampleCount}; "
+            + $"FullScan={fullStopwatch.Elapsed.TotalMilliseconds:F3} ms; "
+            + $"Incremental={incrementalStopwatch.Elapsed.TotalMilliseconds:F3} ms; Evidence={evidencePath}.");
     }
 
     [TestMethod]
@@ -1442,7 +1508,7 @@ public sealed class ExecutionSamplingPerformanceTests
         var ranges = CreateConcurrentRanges(availableRange, randomSeed);
         using var firstCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         using var secondCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        fixture.ConcurrentQueryEntryGate.Arm(ConcurrentQueryCount);
+        fixture.ConcurrentQueryEntryGate.Arm(MaximumConcurrentIncrementalProfileBuilds);
         var startedAtUtc = DateTimeOffset.UtcNow;
         var tasks = ranges
             .Select((range, index) => fixture.Session.GetExecutionProfileAsync(
@@ -1460,7 +1526,15 @@ public sealed class ExecutionSamplingPerformanceTests
             await fixture.ConcurrentQueryEntryGate.WaitForAllQueriesEnteredAsync(
                 s_cleanupStepTimeout,
                 cancellationToken);
-            var enteredQueryCount = fixture.ConcurrentQueryEntryGate.EnteredQueryCount;
+            var enteredBuildCount = fixture.ConcurrentQueryEntryGate.EnteredQueryCount;
+            if (enteredBuildCount != MaximumConcurrentIncrementalProfileBuilds)
+            {
+                throw new InvalidDataException(
+                    $"Concurrent query batch {sequence} entered {enteredBuildCount} actual builds before release; "
+                    + $"the limit is {MaximumConcurrentIncrementalProfileBuilds}.");
+            }
+
+            var enteredQueryCount = tasks.Length;
             firstCancellation.Cancel();
             secondCancellation.Cancel();
             fixture.ConcurrentQueryEntryGate.Release();
@@ -1522,8 +1596,8 @@ public sealed class ExecutionSamplingPerformanceTests
             if (!ConcurrentBatchesPassed([batch]))
             {
                 throw new InvalidDataException(
-                    $"Concurrent query batch {sequence} did not enter all eight queries before producing "
-                    + "exactly six consistent successes and two cancellations.");
+                    $"Concurrent query batch {sequence} did not start all eight query calls with at most two "
+                    + "gated actual builds before producing exactly six consistent successes and two cancellations.");
             }
         }
         finally

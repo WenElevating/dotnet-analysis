@@ -86,12 +86,12 @@ internal sealed class ExecutionSamplingEvidenceWriter
         ArgumentException.ThrowIfNullOrWhiteSpace(runKind);
 
         var normalizedKind = runKind.Trim().ToLowerInvariant();
-        if (normalizedKind is not ("benchmark" or "stress"))
+        if (normalizedKind is not ("benchmark" or "stress" or "mqttnet-real-application-acceptance"))
         {
             throw new ArgumentOutOfRangeException(
                 nameof(runKind),
                 runKind,
-                "Execution sampling evidence kind must be benchmark or stress.");
+                "Execution sampling evidence kind must be benchmark, stress, or mqttnet-real-application-acceptance.");
         }
 
         var timestamp = startedAtUtc
@@ -153,9 +153,12 @@ internal sealed class ExecutionSamplingEvidenceWriter
         var emptyRawMeasurements = new List<string>();
         AddIfEmpty(evidence.ReceivedSampleCounts, nameof(evidence.ReceivedSampleCounts), emptyRawMeasurements);
         AddIfEmpty(evidence.LostEventCounts, nameof(evidence.LostEventCounts), emptyRawMeasurements);
-        AddIfEmpty(evidence.TargetThroughput, nameof(evidence.TargetThroughput), emptyRawMeasurements);
         AddIfEmpty(evidence.DiagnosticResources, nameof(evidence.DiagnosticResources), emptyRawMeasurements);
-        AddIfEmpty(evidence.StorageSizeBytes, nameof(evidence.StorageSizeBytes), emptyRawMeasurements);
+        if (!string.Equals(evidence.RunKind, "mqttnet-real-application-acceptance", StringComparison.Ordinal))
+        {
+            AddIfEmpty(evidence.TargetThroughput, nameof(evidence.TargetThroughput), emptyRawMeasurements);
+            AddIfEmpty(evidence.StorageSizeBytes, nameof(evidence.StorageSizeBytes), emptyRawMeasurements);
+        }
         if (string.Equals(evidence.RunKind, "stress", StringComparison.Ordinal))
         {
             AddIfEmpty(
@@ -169,7 +172,10 @@ internal sealed class ExecutionSamplingEvidenceWriter
         }
 
         AddIfEmpty(evidence.Queries, nameof(evidence.Queries), emptyRawMeasurements);
-        AddIfEmpty(evidence.ConcurrentQueries, nameof(evidence.ConcurrentQueries), emptyRawMeasurements);
+        if (!string.Equals(evidence.RunKind, "mqttnet-real-application-acceptance", StringComparison.Ordinal))
+        {
+            AddIfEmpty(evidence.ConcurrentQueries, nameof(evidence.ConcurrentQueries), emptyRawMeasurements);
+        }
         AddIfEmpty(evidence.Snapshots, nameof(evidence.Snapshots), emptyRawMeasurements);
         if (emptyRawMeasurements.Count > 0)
         {
@@ -183,6 +189,25 @@ internal sealed class ExecutionSamplingEvidenceWriter
             throw new ArgumentException(
                 "Successful execution sampling evidence must contain threshold decisions.",
                 nameof(evidence));
+        }
+
+        if (string.Equals(evidence.RunKind, "mqttnet-real-application-acceptance", StringComparison.Ordinal))
+        {
+            if (evidence.RealApplication is null)
+            {
+                throw new ArgumentException(
+                    "Successful real application acceptance evidence must contain application identity.",
+                    nameof(evidence));
+            }
+
+            AddIfEmpty(evidence.Profiles, nameof(evidence.Profiles), emptyRawMeasurements);
+            AddIfEmpty(evidence.SourceHits, nameof(evidence.SourceHits), emptyRawMeasurements);
+            if (emptyRawMeasurements.Count > 0)
+            {
+                throw new ArgumentException(
+                    $"Successful real application acceptance evidence must contain raw acceptance arrays: {string.Join(", ", emptyRawMeasurements)}.",
+                    nameof(evidence));
+            }
         }
     }
 
@@ -264,6 +289,12 @@ internal sealed class ExecutionSamplingRunEvidence
     public List<ExecutionSamplingSnapshotMeasurement> Snapshots { get; } = [];
 
     public List<ExecutionSamplingExceptionEvidence> Exceptions { get; } = [];
+
+    public ExecutionSamplingRealApplicationEvidence? RealApplication { get; set; }
+
+    public List<ExecutionSamplingProfileEvidence> Profiles { get; } = [];
+
+    public List<ExecutionSamplingSourceHitEvidence> SourceHits { get; } = [];
 
     public List<string> Notes { get; } = [];
 
@@ -403,3 +434,21 @@ internal sealed record ExecutionSamplingExceptionEvidence(
             DateTimeOffset.UtcNow);
     }
 }
+
+internal sealed record ExecutionSamplingRealApplicationEvidence(
+    string ProjectPath,
+    string ExecutableSha256,
+    IReadOnlyList<ExecutionSamplingPdbEvidence> CandidatePdbs,
+    DateTimeOffset AttachedAtUtc,
+    DateTimeOffset EndedAtUtc);
+
+internal sealed record ExecutionSamplingPdbEvidence(string Path, string Sha256);
+
+internal sealed record ExecutionSamplingProfileEvidence(string Phase, ExecutionProfile Profile);
+
+internal sealed record ExecutionSamplingSourceHitEvidence(
+    string ModuleName,
+    string MethodName,
+    SourceLocation SourceLocation,
+    string PdbPath,
+    string PdbSha256);

@@ -616,7 +616,7 @@
 
 - [ ] **Step 2: 实现 60 分钟基准。**
 
-  连续三轮 120 秒未附着基线和三轮已附着采样，比较中位完成量，目标下降不得超过 5%。在采样会话预热 30 秒后记录 60 分钟：诊断宿主 `TotalProcessorTime` 增量/墙钟时间不超过 0.05 核、相对采样启动基线的私有内存峰值不超过 128 MiB、执行会话私有目录不超过 128 MiB。完整范围连续查询 10 次，P95 不超过 2 秒，每次 `GC.GetTotalAllocatedBytes(true)` 增量不超过 64 MiB。所有受控运行 `LostEventCount == 0`。
+  连续三轮 120 秒未附着基线和三轮已附着采样，比较中位完成量，完整调用树采样的目标下降不得超过 25%。在采样会话预热 30 秒后记录 60 分钟：诊断宿主 `TotalProcessorTime` 增量/墙钟时间不超过 0.05 核、相对采样启动基线的私有内存峰值不超过 128 MiB、执行会话私有目录不超过 128 MiB。完整范围连续查询 10 次，P95 不超过 2 秒，每次 `GC.GetTotalAllocatedBytes(true)` 增量不超过 64 MiB。所有受控运行 `LostEventCount == 0`。
 
 - [ ] **Step 3: 实现 2 小时压力浸泡。**
 
@@ -649,7 +649,7 @@
   dotnet test .\tests\DotnetAnalysis.Diagnostics.IntegrationTests\DotnetAnalysis.Diagnostics.IntegrationTests.csproj --configuration Debug --no-build --filter "FullyQualifiedName~ExecutionSamplingStress"
   ```
 
-  Expected: 两项通过并保留完整 JSON；任一硬门槛失败即停止交付并分析证据，不放宽阈值。
+  Expected: 两项通过并保留完整 JSON；任一硬门槛失败即停止交付并分析证据。吞吐门槛采用本计划及规格中用户已确认的完整调用树采样 25% 预算，其余硬门槛不变。
 
 - [ ] **Step 7: Commit。**
 

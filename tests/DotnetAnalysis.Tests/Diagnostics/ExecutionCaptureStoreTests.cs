@@ -90,6 +90,116 @@ public sealed class ExecutionCaptureStoreTests
     }
 
     [TestMethod]
+    public async Task ReadIncrementalStackSampleCountsAsync_MatchesFullScanAcrossSealedAndActiveSegments()
+    {
+        await using var temporaryStore = CreateTemporaryStore(segmentDataLimitBytes: 3);
+        var store = temporaryStore.Store;
+        await store.AppendAsync(Sample("00:00:03") with { StackId = 7 }, CancellationToken.None);
+        await store.AppendAsync(Sample("00:00:01") with { StackId = 3 }, CancellationToken.None);
+        await store.AppendAsync(Sample("00:00:04") with { StackId = 7 }, CancellationToken.None);
+        await store.AppendAsync(Sample("00:00:02") with { StackId = 9 }, CancellationToken.None);
+        var boundary = store.CaptureReadBoundary();
+        var range = Range("00:00:01", "00:00:05");
+
+        var fullScan = await store.ReadStackSampleCountsAsync(range, boundary, CancellationToken.None);
+        var incremental = await store.ReadIncrementalStackSampleCountsAsync(range, boundary, CancellationToken.None);
+
+        Assert.AreEqual(fullScan.ReceivedSampleCount, incremental.ReceivedSampleCount);
+        CollectionAssert.AreEqual(fullScan.Stacks.ToArray(), incremental.Stacks.ToArray());
+    }
+
+    [TestMethod]
+    public async Task ReadIncrementalStackSampleCountsAsync_WhenSealedSummaryIsCorrupt_ThrowsStorageFailureWithoutFallingBack()
+    {
+        await using var temporaryStore = CreateTemporaryStore(segmentDataLimitBytes: 3);
+        var store = temporaryStore.Store;
+        await store.AppendAsync(Sample("00:00:01") with { StackId = 3 }, CancellationToken.None);
+        await store.AppendAsync(Sample("00:00:02") with { StackId = 7 }, CancellationToken.None);
+        var boundary = store.CaptureReadBoundary();
+        var sealedSegment = boundary.SegmentReadLimits.First(segment => segment.IsSealed);
+        File.WriteAllBytes(sealedSegment.SummaryPath, [0x00]);
+        var range = Range("00:00:00", "00:00:03");
+
+        var failure = await Assert.ThrowsExactlyAsync<DiagnosticsException>(async () =>
+            await store.ReadIncrementalStackSampleCountsAsync(range, boundary, CancellationToken.None));
+        var fullScan = await store.ReadStackSampleCountsAsync(range, boundary, CancellationToken.None);
+
+        Assert.AreEqual(DiagnosticsErrorCode.ExecutionProfileStorageFailed, failure.ErrorCode);
+        Assert.AreEqual(2, fullScan.ReceivedSampleCount);
+    }
+
+    [TestMethod]
+    public async Task ReadIncrementalStackSampleCountsAsync_WhenSummaryEntryCountExceedsFileLength_ThrowsStorageFailure()
+    {
+        await using var temporaryStore = CreateTemporaryStore(segmentDataLimitBytes: 3);
+        var store = temporaryStore.Store;
+        await store.AppendAsync(Sample("00:00:01") with { StackId = 3 }, CancellationToken.None);
+        await store.AppendAsync(Sample("00:00:02") with { StackId = 7 }, CancellationToken.None);
+        var boundary = store.CaptureReadBoundary();
+        var sealedSegment = boundary.SegmentReadLimits.First(segment => segment.IsSealed);
+        await using (var summary = new FileStream(
+            sealedSegment.SummaryPath,
+            FileMode.Open,
+            FileAccess.Write,
+            FileShare.None))
+        {
+            summary.Position = 8;
+            await summary.WriteAsync(BitConverter.GetBytes(int.MaxValue));
+        }
+
+        var failure = await Assert.ThrowsExactlyAsync<DiagnosticsException>(async () =>
+            await store.ReadIncrementalStackSampleCountsAsync(
+                Range("00:00:00", "00:00:03"),
+                boundary,
+                CancellationToken.None));
+
+        Assert.AreEqual(DiagnosticsErrorCode.ExecutionProfileStorageFailed, failure.ErrorCode);
+    }
+
+    [TestMethod]
+    public async Task AppendAsync_WhenSegmentSealed_ReleasesInMemorySummaryAfterPersisting()
+    {
+        await using var temporaryStore = CreateTemporaryStore(segmentDataLimitBytes: 3);
+        var store = temporaryStore.Store;
+        await store.AppendAsync(Sample("00:00:01") with { StackId = 3 }, CancellationToken.None);
+        await store.AppendAsync(Sample("00:00:02") with { StackId = 7 }, CancellationToken.None);
+        var boundary = store.CaptureReadBoundary();
+
+        Assert.AreEqual(0, GetSealedSegmentSummaryCollectionCount(store, "StackSampleCounts"));
+        Assert.AreEqual(0, GetSealedSegmentSummaryCollectionCount(store, "StackIdsInFirstSeenOrder"));
+
+        var counts = await store.ReadIncrementalStackSampleCountsAsync(
+            Range("00:00:00", "00:00:03"),
+            boundary,
+            CancellationToken.None);
+
+        Assert.AreEqual(2, counts.ReceivedSampleCount);
+    }
+
+    [TestMethod]
+    public async Task AppendAsync_WhenSealedSummaryCannotBePersisted_ThrowsStorageFailure()
+    {
+        var root = CreateTemporaryRoot();
+        var layout = new ExecutionCaptureStorageLayout(root);
+        var store = new ExecutionCaptureStore(layout, segmentDataLimitBytes: 3);
+        try
+        {
+            await store.AppendAsync(Sample("00:00:01"), CancellationToken.None);
+            File.WriteAllBytes(layout.GetSegmentSummaryPath(0), [0x00]);
+
+            var failure = await Assert.ThrowsExactlyAsync<DiagnosticsException>(async () =>
+                await store.AppendAsync(Sample("00:00:02"), CancellationToken.None));
+
+            Assert.AreEqual(DiagnosticsErrorCode.ExecutionProfileStorageFailed, failure.ErrorCode);
+        }
+        finally
+        {
+            await store.DisposeAsync();
+            DeleteDirectoryIfPresent(root);
+        }
+    }
+
+    [TestMethod]
     public async Task AppendAsync_WhenSamplesHaveRegularCadence_UsesIncrementalTimestamps()
     {
         const int sampleCount = 10_000;
@@ -531,6 +641,25 @@ public sealed class ExecutionCaptureStoreTests
         var root = Path.Combine(Path.GetTempPath(), "DotnetAnalysis.Tests", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
         return root;
+    }
+
+    private static int GetSealedSegmentSummaryCollectionCount(
+        ExecutionCaptureStore store,
+        string collectionPropertyName)
+    {
+        var segmentsField = typeof(ExecutionCaptureStore).GetField(
+            "_segments",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("Execution capture store segment collection is unavailable.");
+        var segments = (System.Collections.IList)(segmentsField.GetValue(store)
+            ?? throw new InvalidOperationException("Execution capture store segments are unavailable."));
+        var sealedSegment = segments.Cast<object>().Single(segment =>
+            (bool)(segment.GetType().GetProperty("IsSealed")?.GetValue(segment)
+                ?? throw new InvalidOperationException("Execution capture segment seal state is unavailable.")));
+        var collection = sealedSegment.GetType().GetProperty(collectionPropertyName)?.GetValue(sealedSegment)
+            ?? throw new InvalidOperationException($"Execution capture segment {collectionPropertyName} is unavailable.");
+        return (int)(collection.GetType().GetProperty("Count")?.GetValue(collection)
+            ?? throw new InvalidOperationException($"Execution capture segment {collectionPropertyName} count is unavailable."));
     }
 
     private static ExecutionSampleRecord Sample(string time) => new(

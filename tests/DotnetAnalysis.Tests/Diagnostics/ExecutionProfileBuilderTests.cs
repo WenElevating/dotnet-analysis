@@ -137,6 +137,47 @@ public sealed class ExecutionProfileBuilderTests
     }
 
     [TestMethod]
+    public async Task BuildIncrementalAsync_MatchesFullScanForMultiSegmentBoundaryAndOutOfOrderSamples()
+    {
+        await using var temporaryStore = CreateTemporaryStore(segmentDataLimitBytes: 3);
+        var store = temporaryStore.Store;
+        var stackIds = new int[32];
+        for (var index = 0; index < stackIds.Length; index++)
+        {
+            var frameId = await AddFrameAsync(store, $"Worker{index:D2}", "App", $"worker-{index:D2}");
+            stackIds[index] = await store.GetOrAddStackAsync(-1, frameId, CancellationToken.None);
+        }
+
+        var random = new Random(20260908);
+        for (var index = 0; index < 160; index++)
+        {
+            var observedAtUtc = Instant("00:00:01").AddSeconds(random.Next(0, 8));
+            await store.AppendAsync(
+                new ExecutionSampleRecord(observedAtUtc, ThreadId: 7, stackIds[random.Next(stackIds.Length)]),
+                CancellationToken.None);
+        }
+
+        var boundary = store.CaptureReadBoundary();
+        var builder = new ExecutionProfileBuilder(store);
+        var ranges = new[]
+        {
+            Range("00:00:00", "00:00:10"),
+            Range("00:00:01", "00:00:02"),
+            Range("00:00:02", "00:00:06"),
+            Range("00:00:08", "00:00:09"),
+            Range("00:00:09", "00:00:10")
+        };
+
+        foreach (var range in ranges)
+        {
+            var fullScan = await builder.BuildAsync(range, boundary, lostEventCount: 17, CancellationToken.None);
+            var incremental = await builder.BuildIncrementalAsync(range, boundary, lostEventCount: 17, CancellationToken.None);
+
+            AssertProfilesEqual(fullScan, incremental);
+        }
+    }
+
+    [TestMethod]
     public async Task BuildAsync_WhenCancelled_SubsequentQueryRemainsUsable()
     {
         await using var temporaryStore = CreateTemporaryStore();
@@ -472,6 +513,42 @@ public sealed class ExecutionProfileBuilderTests
         return allocatedBytes;
     }
 
+    private static void AssertProfilesEqual(ExecutionProfile expected, ExecutionProfile actual)
+    {
+        Assert.AreEqual(expected.TimeRange, actual.TimeRange);
+        Assert.AreEqual(expected.ReceivedSampleCount, actual.ReceivedSampleCount);
+        Assert.AreEqual(expected.LostEventCount, actual.LostEventCount);
+        AssertHotspotsEqual(expected.Hotspots, actual.Hotspots);
+        AssertCallTreeNodesEqual(expected.CallTreeRoots, actual.CallTreeRoots);
+    }
+
+    private static void AssertHotspotsEqual(
+        IReadOnlyList<ExecutionHotspot> expected,
+        IReadOnlyList<ExecutionHotspot> actual)
+    {
+        Assert.HasCount(expected.Count, actual);
+        for (var index = 0; index < expected.Count; index++)
+        {
+            Assert.AreEqual(expected[index].Frame, actual[index].Frame);
+            Assert.AreEqual(expected[index].InclusiveSampleCount, actual[index].InclusiveSampleCount);
+            Assert.AreEqual(expected[index].ExclusiveSampleCount, actual[index].ExclusiveSampleCount);
+        }
+    }
+
+    private static void AssertCallTreeNodesEqual(
+        IReadOnlyList<ExecutionCallTreeNode> expected,
+        IReadOnlyList<ExecutionCallTreeNode> actual)
+    {
+        Assert.HasCount(expected.Count, actual);
+        for (var index = 0; index < expected.Count; index++)
+        {
+            Assert.AreEqual(expected[index].Frame, actual[index].Frame);
+            Assert.AreEqual(expected[index].InclusiveSampleCount, actual[index].InclusiveSampleCount);
+            Assert.AreEqual(expected[index].ExclusiveSampleCount, actual[index].ExclusiveSampleCount);
+            AssertCallTreeNodesEqual(expected[index].Children, actual[index].Children);
+        }
+    }
+
     private static async Task<TemporaryExecutionCaptureStore> CreateSingleStackStoreAsync(int sampleCount)
     {
         var temporaryStore = CreateTemporaryStore();
@@ -510,7 +587,8 @@ public sealed class ExecutionProfileBuilderTests
 
     private static TemporaryExecutionCaptureStore CreateTemporaryStore(
         Func<Task>? beforeStackFramesReadAsync = null,
-        Func<Task>? afterDisposeWriterAcquiredAsync = null)
+        Func<Task>? afterDisposeWriterAcquiredAsync = null,
+        int? segmentDataLimitBytes = null)
     {
         var root = Path.Combine(Path.GetTempPath(), "DotnetAnalysis.Tests", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
@@ -518,6 +596,7 @@ public sealed class ExecutionProfileBuilderTests
             root,
             new ExecutionCaptureStore(
                 new ExecutionCaptureStorageLayout(root),
+                segmentDataLimitBytes ?? (4 * 1024 * 1024),
                 beforeStackFramesReadAsync: beforeStackFramesReadAsync,
                 afterDisposeWriterAcquiredAsync: afterDisposeWriterAcquiredAsync));
     }

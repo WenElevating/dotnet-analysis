@@ -40,6 +40,37 @@ internal sealed class ExecutionProfileBuilder
         ExecutionTimeRange range,
         ExecutionCaptureReadBoundary boundary,
         long lostEventCount,
+        CancellationToken cancellationToken) => await BuildCoreAsync(
+            range,
+            boundary,
+            lostEventCount,
+            useIncrementalSummaries: false,
+            cancellationToken).ConfigureAwait(false);
+
+    /// <summary>
+    /// 在固定读取边界内合并封存段摘要并按时间范围构建执行采样分析结果。
+    /// </summary>
+    /// <param name="range">要聚合的半开 UTC 时间范围。</param>
+    /// <param name="boundary">调用方已固定的读取边界。</param>
+    /// <param name="lostEventCount">同一查询边界内累计的丢失事件数。</param>
+    /// <param name="cancellationToken">取消流式读取和聚合的令牌。</param>
+    /// <returns>按稳定顺序排列热点且包含调用树的执行分析结果。</returns>
+    public async Task<ExecutionProfile> BuildIncrementalAsync(
+        ExecutionTimeRange range,
+        ExecutionCaptureReadBoundary boundary,
+        long lostEventCount,
+        CancellationToken cancellationToken) => await BuildCoreAsync(
+            range,
+            boundary,
+            lostEventCount,
+            useIncrementalSummaries: true,
+            cancellationToken).ConfigureAwait(false);
+
+    private async Task<ExecutionProfile> BuildCoreAsync(
+        ExecutionTimeRange range,
+        ExecutionCaptureReadBoundary boundary,
+        long lostEventCount,
+        bool useIncrementalSummaries,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(range);
@@ -51,10 +82,15 @@ internal sealed class ExecutionProfileBuilder
         var hotspotsByFrameId = new Dictionary<int, MutableHotspot>();
         var callTreeRootsByFrameId = new Dictionary<int, MutableCallTreeNode>();
         var nextFirstSeenOrder = 0L;
-        var stackSampleCounts = await _store.ReadStackSampleCountsAsync(
-            range,
-            boundary,
-            cancellationToken).ConfigureAwait(false);
+        var stackSampleCounts = useIncrementalSummaries
+            ? await _store.ReadIncrementalStackSampleCountsAsync(
+                range,
+                boundary,
+                cancellationToken).ConfigureAwait(false)
+            : await _store.ReadStackSampleCountsAsync(
+                range,
+                boundary,
+                cancellationToken).ConfigureAwait(false);
         foreach (var stackSampleCount in stackSampleCounts.Stacks)
         {
             cancellationToken.ThrowIfCancellationRequested();

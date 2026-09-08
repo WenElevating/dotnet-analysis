@@ -63,6 +63,18 @@ internal sealed class ExecutionCaptureStorageLayout
     }
 
     /// <summary>
+    /// 获取指定序号封存样本段的增量摘要文件路径。
+    /// </summary>
+    /// <param name="segmentNumber">从零开始的样本段序号。</param>
+    /// <returns>当前会话目录内的增量摘要路径。</returns>
+    public string GetSegmentSummaryPath(int segmentNumber)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(segmentNumber);
+
+        return Path.Combine(SessionDirectory, $"samples-{segmentNumber:D8}.summary");
+    }
+
+    /// <summary>
     /// 创建统一的执行采样存储失败异常。
     /// </summary>
     internal static DiagnosticsException CreateStorageException(string message, Exception innerException) =>

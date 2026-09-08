@@ -13,6 +13,11 @@ internal interface IExecutionSamplingSession : IAsyncDisposable
     Task<ExecutionProfile> GetExecutionProfileAsync(
         ExecutionTimeRange timeRange,
         CancellationToken cancellationToken);
+
+    Task<ExecutionProfile> GetExecutionProfileAsync(
+        ExecutionTimeRange timeRange,
+        ExecutionProfileQueryMode queryMode,
+        CancellationToken cancellationToken) => GetExecutionProfileAsync(timeRange, cancellationToken);
 }
 
 /// <summary>
@@ -21,6 +26,8 @@ internal interface IExecutionSamplingSession : IAsyncDisposable
 internal sealed class ExecutionSamplingSession : IExecutionSamplingSession
 {
     private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(1);
+    private const int CompletedIncrementalProfileCacheCapacity = 64;
+    private const int MaximumConcurrentIncrementalProfileBuilds = 2;
 
     private readonly object _stateLock = new();
     private readonly ExecutionCaptureStore _store;
@@ -29,6 +36,10 @@ internal sealed class ExecutionSamplingSession : IExecutionSamplingSession
     private readonly ExecutionProfileBuilder _profileBuilder;
     private readonly TimeProvider _timeProvider;
     private readonly Func<TimeSpan, CancellationToken, Task> _retryDelayAsync;
+    private readonly CancellationTokenSource _sessionLifetimeCancellation = new();
+    private readonly SemaphoreSlim _incrementalProfileBuildGate = new(
+        MaximumConcurrentIncrementalProfileBuilds,
+        MaximumConcurrentIncrementalProfileBuilds);
 
     private ExecutionSamplingSessionState _state;
     private DateTimeOffset _samplingStartedAtUtc;
@@ -37,6 +48,10 @@ internal sealed class ExecutionSamplingSession : IExecutionSamplingSession
     private Task? _disposeTask;
     private int _activeQueryCount;
     private TaskCompletionSource? _queriesDrained;
+    private readonly Dictionary<ExecutionProfileQueryCacheKey, Task<ExecutionProfile>> _incrementalProfileCache = [];
+    private readonly LinkedList<ExecutionProfileQueryCacheKey> _completedIncrementalProfileCacheLru = [];
+    private readonly Dictionary<ExecutionProfileQueryCacheKey, LinkedListNode<ExecutionProfileQueryCacheKey>>
+        _completedIncrementalProfileCacheLruNodes = [];
 
     /// <summary>
     /// 使用默认会话存储、EventPipe 读取器和本地符号解析器创建执行采样会话。
@@ -101,13 +116,29 @@ internal sealed class ExecutionSamplingSession : IExecutionSamplingSession
     /// </summary>
     public async Task<ExecutionProfile> GetExecutionProfileAsync(
         ExecutionTimeRange timeRange,
+        CancellationToken cancellationToken) => await GetExecutionProfileAsync(
+            timeRange,
+            ExecutionProfileQueryMode.Incremental,
+            cancellationToken).ConfigureAwait(false);
+
+    /// <inheritdoc />
+    public async Task<ExecutionProfile> GetExecutionProfileAsync(
+        ExecutionTimeRange timeRange,
+        ExecutionProfileQueryMode queryMode,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(timeRange);
         cancellationToken.ThrowIfCancellationRequested();
+        if (!Enum.IsDefined(queryMode))
+        {
+            throw new ArgumentOutOfRangeException(nameof(queryMode), queryMode, "Execution profile query mode is not supported.");
+        }
 
         ExecutionCaptureReadBoundary boundary;
         long lostEventCount;
+        Task<ExecutionProfile>? incrementalProfileTask = null;
+        ExecutionProfileQueryCacheKey? incrementalProfileCacheKeyToBuild = null;
+        TaskCompletionSource<ExecutionProfile>? incrementalProfileCompletionToBuild = null;
         lock (_stateLock)
         {
             if (_state is ExecutionSamplingSessionState.Unavailable)
@@ -134,7 +165,48 @@ internal sealed class ExecutionSamplingSession : IExecutionSamplingSession
             }
 
             lostEventCount = _sampler.LostEventCount;
-            _activeQueryCount++;
+            if (queryMode is ExecutionProfileQueryMode.FullScan)
+            {
+                _activeQueryCount++;
+            }
+            else
+            {
+                var rangeDependency = ExecutionCaptureStore.GetRangeDependency(timeRange, boundary);
+                var cacheKey = new ExecutionProfileQueryCacheKey(
+                    timeRange,
+                    boundary,
+                    rangeDependency,
+                    lostEventCount);
+                if (_incrementalProfileCache.TryGetValue(cacheKey, out incrementalProfileTask))
+                {
+                    RefreshCompletedIncrementalProfileRecency(cacheKey);
+                }
+                else
+                {
+                    var completion = new TaskCompletionSource<ExecutionProfile>(
+                        TaskCreationOptions.RunContinuationsAsynchronously);
+                    incrementalProfileTask = completion.Task;
+                    _incrementalProfileCache.Add(cacheKey, incrementalProfileTask);
+                    _activeQueryCount++;
+                    incrementalProfileCacheKeyToBuild = cacheKey;
+                    incrementalProfileCompletionToBuild = completion;
+                }
+            }
+        }
+
+        if (incrementalProfileCompletionToBuild is not null)
+        {
+            _ = CompleteIncrementalProfileBuildAsync(
+                incrementalProfileCacheKeyToBuild!,
+                incrementalProfileCompletionToBuild,
+                timeRange,
+                boundary,
+                lostEventCount);
+        }
+
+        if (incrementalProfileTask is not null)
+        {
+            return await incrementalProfileTask.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
 
         try
@@ -162,6 +234,7 @@ internal sealed class ExecutionSamplingSession : IExecutionSamplingSession
             }
 
             _state = ExecutionSamplingSessionState.Disposing;
+            _sessionLifetimeCancellation.Cancel();
             _queriesDrained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             if (_activeQueryCount == 0)
             {
@@ -250,6 +323,16 @@ internal sealed class ExecutionSamplingSession : IExecutionSamplingSession
 
         await queriesDrained.ConfigureAwait(false);
 
+        lock (_stateLock)
+        {
+            _incrementalProfileCache.Clear();
+            _completedIncrementalProfileCacheLru.Clear();
+            _completedIncrementalProfileCacheLruNodes.Clear();
+        }
+
+        _incrementalProfileBuildGate.Dispose();
+        _sessionLifetimeCancellation.Dispose();
+
         try
         {
             await _symbolResolver.DisposeAsync().ConfigureAwait(false);
@@ -300,6 +383,116 @@ internal sealed class ExecutionSamplingSession : IExecutionSamplingSession
         queriesDrained?.TrySetResult();
     }
 
+    private async Task CompleteIncrementalProfileBuildAsync(
+        ExecutionProfileQueryCacheKey cacheKey,
+        TaskCompletionSource<ExecutionProfile> completion,
+        ExecutionTimeRange timeRange,
+        ExecutionCaptureReadBoundary boundary,
+        long lostEventCount)
+    {
+        var enteredBuildGate = false;
+        try
+        {
+            await _incrementalProfileBuildGate.WaitAsync(_sessionLifetimeCancellation.Token).ConfigureAwait(false);
+            enteredBuildGate = true;
+            var profile = await _profileBuilder.BuildIncrementalAsync(
+                timeRange,
+                boundary,
+                lostEventCount,
+                _sessionLifetimeCancellation.Token).ConfigureAwait(false);
+            lock (_stateLock)
+            {
+                _sessionLifetimeCancellation.Token.ThrowIfCancellationRequested();
+                if (IsCachedIncrementalProfileTask(cacheKey, completion.Task))
+                {
+                    TrackCompletedIncrementalProfile(cacheKey);
+                }
+
+                completion.TrySetResult(profile);
+            }
+        }
+        catch (OperationCanceledException) when (_sessionLifetimeCancellation.IsCancellationRequested)
+        {
+            lock (_stateLock)
+            {
+                RemoveCachedIncrementalProfile(cacheKey, completion.Task);
+            }
+
+            completion.TrySetCanceled(_sessionLifetimeCancellation.Token);
+        }
+        catch (Exception exception)
+        {
+            lock (_stateLock)
+            {
+                RemoveCachedIncrementalProfile(cacheKey, completion.Task);
+            }
+
+            completion.TrySetException(exception);
+        }
+        finally
+        {
+            if (enteredBuildGate)
+            {
+                _incrementalProfileBuildGate.Release();
+            }
+
+            ExitQuery();
+        }
+    }
+
+    private bool IsCachedIncrementalProfileTask(
+        ExecutionProfileQueryCacheKey cacheKey,
+        Task<ExecutionProfile> task) => _incrementalProfileCache.TryGetValue(cacheKey, out var cachedTask)
+            && ReferenceEquals(cachedTask, task);
+
+    private void RefreshCompletedIncrementalProfileRecency(ExecutionProfileQueryCacheKey cacheKey)
+    {
+        if (!_completedIncrementalProfileCacheLruNodes.TryGetValue(cacheKey, out var existingNode))
+        {
+            return;
+        }
+
+        _completedIncrementalProfileCacheLru.Remove(existingNode);
+        _completedIncrementalProfileCacheLru.AddLast(existingNode);
+    }
+
+    private void TrackCompletedIncrementalProfile(ExecutionProfileQueryCacheKey cacheKey)
+    {
+        if (_completedIncrementalProfileCacheLruNodes.ContainsKey(cacheKey))
+        {
+            RefreshCompletedIncrementalProfileRecency(cacheKey);
+            return;
+        }
+
+        var addedNode = _completedIncrementalProfileCacheLru.AddLast(cacheKey);
+        _completedIncrementalProfileCacheLruNodes.Add(cacheKey, addedNode);
+        if (_completedIncrementalProfileCacheLruNodes.Count <= CompletedIncrementalProfileCacheCapacity)
+        {
+            return;
+        }
+
+        var leastRecentlyUsedNode = _completedIncrementalProfileCacheLru.First!;
+        _completedIncrementalProfileCacheLru.RemoveFirst();
+        _completedIncrementalProfileCacheLruNodes.Remove(leastRecentlyUsedNode.Value);
+        _incrementalProfileCache.Remove(leastRecentlyUsedNode.Value);
+    }
+
+    private void RemoveCachedIncrementalProfile(
+        ExecutionProfileQueryCacheKey cacheKey,
+        Task<ExecutionProfile> task)
+    {
+        if (!IsCachedIncrementalProfileTask(cacheKey, task))
+        {
+            return;
+        }
+
+        _incrementalProfileCache.Remove(cacheKey);
+        if (_completedIncrementalProfileCacheLruNodes.Remove(cacheKey, out var completedNode))
+        {
+            _completedIncrementalProfileCacheLru.Remove(completedNode);
+        }
+    }
+
     private static ExecutionSamplingComponents CreateComponents(
         string? storageRootDirectory,
         ILogger<ExecutionSymbolResolver>? symbolLogger)
@@ -344,6 +537,96 @@ internal sealed class ExecutionSamplingSession : IExecutionSamplingSession
         ExecutionCaptureStore Store,
         IEventPipeExecutionSampler Sampler,
         ExecutionSymbolResolver SymbolResolver);
+
+    private sealed class ExecutionProfileQueryCacheKey : IEquatable<ExecutionProfileQueryCacheKey>
+    {
+        private readonly ExecutionCaptureSealedSegmentVersion[]? _sealedSegmentVersions;
+
+        public ExecutionProfileQueryCacheKey(
+            ExecutionTimeRange timeRange,
+            ExecutionCaptureReadBoundary boundary,
+            ExecutionCaptureRangeDependency rangeDependency,
+            long lostEventCount)
+        {
+            ArgumentNullException.ThrowIfNull(timeRange);
+            ArgumentNullException.ThrowIfNull(boundary);
+            ArgumentNullException.ThrowIfNull(rangeDependency);
+            ArgumentOutOfRangeException.ThrowIfNegative(lostEventCount);
+
+            TimeRange = timeRange;
+            LostEventCount = lostEventCount;
+            if (rangeDependency.IsSealedHistoryOnly)
+            {
+                _sealedSegmentVersions = rangeDependency.SealedSegmentVersions.ToArray();
+            }
+            else
+            {
+                StartedAtUtc = boundary.StartedAtUtc;
+                WrittenThroughUtc = boundary.WrittenThroughUtc;
+                LastCompletedRecord = boundary.LastCompletedRecord;
+            }
+        }
+
+        private ExecutionTimeRange TimeRange { get; }
+
+        private DateTimeOffset StartedAtUtc { get; }
+
+        private DateTimeOffset WrittenThroughUtc { get; }
+
+        private long LastCompletedRecord { get; }
+
+        private long LostEventCount { get; }
+
+        public bool Equals(ExecutionProfileQueryCacheKey? other)
+        {
+            if (ReferenceEquals(this, other))
+            {
+                return true;
+            }
+
+            if (other is null
+                || !TimeRange.Equals(other.TimeRange)
+                || LostEventCount != other.LostEventCount
+                || (_sealedSegmentVersions is null) != (other._sealedSegmentVersions is null))
+            {
+                return false;
+            }
+
+            if (_sealedSegmentVersions is null)
+            {
+                return StartedAtUtc == other.StartedAtUtc
+                    && WrittenThroughUtc == other.WrittenThroughUtc
+                    && LastCompletedRecord == other.LastCompletedRecord;
+            }
+
+            return _sealedSegmentVersions.AsSpan().SequenceEqual(other._sealedSegmentVersions);
+        }
+
+        public override bool Equals(object? obj) => Equals(obj as ExecutionProfileQueryCacheKey);
+
+        public override int GetHashCode()
+        {
+            var hash = new HashCode();
+            hash.Add(TimeRange);
+            hash.Add(LostEventCount);
+            hash.Add(_sealedSegmentVersions is not null);
+            if (_sealedSegmentVersions is null)
+            {
+                hash.Add(StartedAtUtc);
+                hash.Add(WrittenThroughUtc);
+                hash.Add(LastCompletedRecord);
+            }
+            else
+            {
+                foreach (var segmentVersion in _sealedSegmentVersions)
+                {
+                    hash.Add(segmentVersion);
+                }
+            }
+
+            return hash.ToHashCode();
+        }
+    }
 
     private enum ExecutionSamplingSessionState
     {

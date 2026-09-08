@@ -225,6 +225,15 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
     /// <exception cref="DiagnosticsException">执行采样不可用、区间不可查询或读取失败时引发。</exception>
     public async Task<ExecutionProfile> GetExecutionProfileAsync(
         ExecutionTimeRange timeRange,
+        CancellationToken cancellationToken) => await GetExecutionProfileAsync(
+            timeRange,
+            ExecutionProfileQueryMode.Incremental,
+            cancellationToken).ConfigureAwait(false);
+
+    /// <inheritdoc />
+    public async Task<ExecutionProfile> GetExecutionProfileAsync(
+        ExecutionTimeRange timeRange,
+        ExecutionProfileQueryMode queryMode,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(timeRange);
@@ -250,7 +259,7 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
             try
             {
                 profile = await _executionSampling
-                    .GetExecutionProfileAsync(timeRange, queryCancellation.Token)
+                    .GetExecutionProfileAsync(timeRange, queryMode, queryCancellation.Token)
                     .ConfigureAwait(false);
             }
             catch (DiagnosticsException exception)

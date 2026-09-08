@@ -39,21 +39,37 @@ internal sealed record ExecutionCaptureReadBoundary(
     internal IReadOnlyList<ExecutionCaptureSegmentReadLimit> SegmentReadLimits { get; init; } = [];
 }
 
+internal readonly record struct ExecutionCaptureSealedSegmentVersion(
+    int SegmentNumber,
+    long CompletedRecordCount);
+
+internal sealed record ExecutionCaptureRangeDependency(
+    bool HasActiveSegment,
+    IReadOnlyList<ExecutionCaptureSealedSegmentVersion> SealedSegmentVersions)
+{
+    internal bool IsSealedHistoryOnly => !HasActiveSegment && SealedSegmentVersions.Count > 0;
+}
+
 /// <summary>
 /// 为单个诊断会话追加、读取并在销毁时清理执行采样数据。
 /// </summary>
 internal sealed class ExecutionCaptureStore : IAsyncDisposable
 {
     private const int SegmentHeaderLength = 48;
+    private const int SummaryHeaderLength = 16;
+    private const int SummaryEntryLength = sizeof(int) + sizeof(long);
     private const int DefaultSegmentDataLimitBytes = 4 * 1024 * 1024;
     private const int MaximumEncodedRecordLength = 30;
     private const int SegmentFormatVersion = 3;
+    private const int SummaryFormatVersion = 1;
     private static ReadOnlySpan<byte> SegmentMagic => "ECS1"u8;
+    private static ReadOnlySpan<byte> SummaryMagic => "ECSU"u8;
 
     private readonly ExecutionCaptureStorageLayout _layout;
     private readonly int _segmentDataLimitBytes;
     private readonly Func<Task>? _beforeBoundaryPublishAsync;
     private readonly Func<Task>? _beforeStackFramesReadAsync;
+    private readonly Func<CancellationToken, Task>? _beforeStackFramesReadWithCancellationAsync;
     private readonly Func<Task>? _afterDisposeWriterAcquiredAsync;
     private readonly Action? _beforeSegmentFlush;
     private readonly SemaphoreSlim _writer = new(1, 1);
@@ -86,6 +102,7 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         int segmentDataLimitBytes = DefaultSegmentDataLimitBytes,
         Func<Task>? beforeBoundaryPublishAsync = null,
         Func<Task>? beforeStackFramesReadAsync = null,
+        Func<CancellationToken, Task>? beforeStackFramesReadWithCancellationAsync = null,
         Func<Task>? afterDisposeWriterAcquiredAsync = null,
         Action? beforeSegmentFlush = null)
     {
@@ -95,6 +112,7 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         _segmentDataLimitBytes = segmentDataLimitBytes;
         _beforeBoundaryPublishAsync = beforeBoundaryPublishAsync;
         _beforeStackFramesReadAsync = beforeStackFramesReadAsync;
+        _beforeStackFramesReadWithCancellationAsync = beforeStackFramesReadWithCancellationAsync;
         _afterDisposeWriterAcquiredAsync = afterDisposeWriterAcquiredAsync;
         _beforeSegmentFlush = beforeSegmentFlush;
         _writtenThroughUtc = _startedAtUtc;
@@ -199,6 +217,11 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         if (_beforeStackFramesReadAsync is not null)
         {
             await _beforeStackFramesReadAsync().ConfigureAwait(false);
+        }
+
+        if (_beforeStackFramesReadWithCancellationAsync is not null)
+        {
+            await _beforeStackFramesReadWithCancellationAsync(cancellationToken).ConfigureAwait(false);
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -353,6 +376,16 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
             segment.StartedAtUtc = Min(segment.StartedAtUtc, sample.ObservedAtUtc);
             segment.EndedAtUtc = Max(segment.EndedAtUtc, sample.ObservedAtUtc);
             segment.LastObservedAtUtc = sample.ObservedAtUtc;
+            ref var summarySampleCount = ref CollectionsMarshal.GetValueRefOrAddDefault(
+                segment.StackSampleCounts,
+                sample.StackId,
+                out var stackAlreadyObserved);
+            if (!stackAlreadyObserved)
+            {
+                segment.StackIdsInFirstSeenOrder.Add(sample.StackId);
+            }
+
+            summarySampleCount = checked(summarySampleCount + 1);
             _writtenThroughUtc = Max(_writtenThroughUtc, sample.ObservedAtUtc);
             _lastCompletedRecord++;
         }
@@ -400,14 +433,49 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
                 SegmentReadLimits = _segments
                     .Where(segment => segment.RecordCount > 0)
                     .Select(segment => new ExecutionCaptureSegmentReadLimit(
+                        segment.Number,
                         segment.Path,
+                        segment.SummaryPath,
                         segment.StartedAtUtc,
                         segment.EndedAtUtc,
                         segment.DataLength,
-                        segment.RecordCount))
+                        segment.RecordCount,
+                        segment.IsSealed))
                     .ToArray()
             };
         }
+    }
+
+    /// <summary>
+    /// 获取指定读取边界和时间范围所依赖的封存段版本及活动段状态。
+    /// </summary>
+    /// <param name="range">要查询的半开 UTC 时间范围。</param>
+    /// <param name="boundary">调用方已固定的读取边界。</param>
+    /// <returns>可用于会话内缓存有效性判断的范围依赖。</returns>
+    internal static ExecutionCaptureRangeDependency GetRangeDependency(
+        ExecutionTimeRange range,
+        ExecutionCaptureReadBoundary boundary)
+    {
+        ArgumentNullException.ThrowIfNull(range);
+        ArgumentNullException.ThrowIfNull(boundary);
+
+        var sealedSegmentVersions = new List<ExecutionCaptureSealedSegmentVersion>();
+        var hasActiveSegment = false;
+        foreach (var segment in GetIntersectingSegments(range, boundary))
+        {
+            if (segment.IsSealed)
+            {
+                sealedSegmentVersions.Add(new ExecutionCaptureSealedSegmentVersion(
+                    segment.SegmentNumber,
+                    segment.RecordCount));
+            }
+            else
+            {
+                hasActiveSegment = true;
+            }
+        }
+
+        return new ExecutionCaptureRangeDependency(hasActiveSegment, sealedSegmentVersions);
     }
 
     /// <summary>
@@ -459,12 +527,94 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
+    private static bool IsFullyContainedSealedSegment(
+        ExecutionCaptureSegmentReadLimit segment,
+        ExecutionTimeRange range) =>
+        segment.IsSealed
+        && segment.StartedAtUtc >= range.StartAtUtc
+        && segment.EndedAtUtc < range.EndAtUtc;
+
+    private static void MergeStackSampleCounts(
+        ExecutionStackSampleCounts source,
+        Dictionary<int, long> countsByStackId,
+        List<int> stackIdsInFirstSeenOrder,
+        ref long receivedSampleCount)
+    {
+        foreach (var stack in source.Stacks)
+        {
+            MergeStackSampleCount(
+                stack,
+                countsByStackId,
+                stackIdsInFirstSeenOrder,
+                ref receivedSampleCount);
+        }
+
+        if (source.ReceivedSampleCount != source.Stacks.Sum(static stack => stack.SampleCount))
+        {
+            throw ExecutionCaptureStorageLayout.CreateStorageException(
+                "Execution capture segment summary count is invalid.",
+                new InvalidDataException("Summary total sample count does not match its stack counts."));
+        }
+    }
+
+    private static void MergeStackSampleCount(
+        ExecutionStackSampleCount source,
+        Dictionary<int, long> countsByStackId,
+        List<int> stackIdsInFirstSeenOrder,
+        ref long receivedSampleCount)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(source.StackId);
+        ArgumentOutOfRangeException.ThrowIfNegative(source.SampleCount);
+        if (source.SampleCount == 0)
+        {
+            return;
+        }
+
+        receivedSampleCount = checked(receivedSampleCount + source.SampleCount);
+        ref var stackSampleCount = ref CollectionsMarshal.GetValueRefOrAddDefault(
+            countsByStackId,
+            source.StackId,
+            out var exists);
+        if (!exists)
+        {
+            stackIdsInFirstSeenOrder.Add(source.StackId);
+        }
+
+        stackSampleCount = checked(stackSampleCount + source.SampleCount);
+    }
+
     /// <summary>
     /// 按首次出现顺序读取指定边界内各调用栈的样本计数。
     /// </summary>
     public async Task<ExecutionStackSampleCounts> ReadStackSampleCountsAsync(
         ExecutionTimeRange range,
         ExecutionCaptureReadBoundary boundary,
+        CancellationToken cancellationToken) => await ReadStackSampleCountsCoreAsync(
+            range,
+            boundary,
+            useIncrementalSummaries: false,
+            cancellationToken).ConfigureAwait(false);
+
+    /// <summary>
+    /// 合并完整封存段的持久化摘要，并逐条读取边界或活动段内各调用栈的样本计数。
+    /// </summary>
+    /// <param name="range">要读取的半开 UTC 时间范围。</param>
+    /// <param name="boundary">调用方已固定的读取边界。</param>
+    /// <param name="cancellationToken">取消读取和摘要校验的令牌。</param>
+    /// <returns>按首次出现顺序排列的调用栈样本计数。</returns>
+    public async Task<ExecutionStackSampleCounts> ReadIncrementalStackSampleCountsAsync(
+        ExecutionTimeRange range,
+        ExecutionCaptureReadBoundary boundary,
+        CancellationToken cancellationToken) => await ReadStackSampleCountsCoreAsync(
+            range,
+            boundary,
+            useIncrementalSummaries: true,
+            cancellationToken).ConfigureAwait(false);
+
+    private async Task<ExecutionStackSampleCounts> ReadStackSampleCountsCoreAsync(
+        ExecutionTimeRange range,
+        ExecutionCaptureReadBoundary boundary,
+        bool useIncrementalSummaries,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(range);
@@ -478,6 +628,20 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
             long receivedSampleCount = 0;
             foreach (var segment in GetIntersectingSegments(range, boundary))
             {
+                if (useIncrementalSummaries && IsFullyContainedSealedSegment(segment, range))
+                {
+                    var summary = await ReadSegmentSummaryAsync(
+                        segment.SummaryPath,
+                        segment.RecordCount,
+                        cancellationToken).ConfigureAwait(false);
+                    MergeStackSampleCounts(
+                        summary,
+                        countsByStackId,
+                        stackIdsInFirstSeenOrder,
+                        ref receivedSampleCount);
+                    continue;
+                }
+
                 await using var stream = OpenSegmentForRead(segment.Path);
                 var header = await ReadSegmentHeaderAsync(stream, cancellationToken).ConfigureAwait(false);
                 var reader = new ExecutionCaptureSegmentReader(stream, segment.DataLength);
@@ -496,17 +660,11 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
                         continue;
                     }
 
-                    receivedSampleCount = checked(receivedSampleCount + 1);
-                    ref var stackSampleCount = ref CollectionsMarshal.GetValueRefOrAddDefault(
+                    MergeStackSampleCount(
+                        new ExecutionStackSampleCount(sample.StackId, 1),
                         countsByStackId,
-                        sample.StackId,
-                        out var exists);
-                    if (!exists)
-                    {
-                        stackIdsInFirstSeenOrder.Add(sample.StackId);
-                    }
-
-                    stackSampleCount = checked(stackSampleCount + 1);
+                        stackIdsInFirstSeenOrder,
+                        ref receivedSampleCount);
                 }
 
                 if (reader.RemainingBytes != 0)
@@ -569,7 +727,7 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
                 }
 
                 await readersDrained.ConfigureAwait(false);
-                if (_currentSegment is not null)
+                if (_currentSegment is not null && _writeFailure is null)
                 {
                     SealSegment(_currentSegment);
                 }
@@ -607,6 +765,7 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
             var segment = new ExecutionCaptureSegment(
                 _segments.Count,
                 _layout.GetSegmentPath(_segments.Count),
+                _layout.GetSegmentSummaryPath(_segments.Count),
                 anchorUtc.ToUniversalTime());
             segment.Stream = new FileStream(
                 segment.Path,
@@ -639,7 +798,114 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
 
         FlushSegment(segment);
+        WriteSegmentSummary(segment);
+        segment.StackSampleCounts.Clear();
+        segment.StackIdsInFirstSeenOrder.Clear();
         segment.IsSealed = true;
+    }
+
+    private static void WriteSegmentSummary(ExecutionCaptureSegment segment)
+    {
+        try
+        {
+            using var stream = new FileStream(
+                segment.SummaryPath,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.Read,
+                bufferSize: 64 * 1024,
+                options: FileOptions.SequentialScan);
+            Span<byte> header = stackalloc byte[SummaryHeaderLength];
+            SummaryMagic.CopyTo(header);
+            BitConverter.TryWriteBytes(header.Slice(4, sizeof(int)), SummaryFormatVersion);
+            BitConverter.TryWriteBytes(header.Slice(8, sizeof(int)), segment.StackIdsInFirstSeenOrder.Count);
+            BitConverter.TryWriteBytes(header.Slice(12, sizeof(int)), 0);
+            stream.Write(header);
+
+            Span<byte> entry = stackalloc byte[SummaryEntryLength];
+            foreach (var stackId in segment.StackIdsInFirstSeenOrder)
+            {
+                BitConverter.TryWriteBytes(entry.Slice(0, sizeof(int)), stackId);
+                BitConverter.TryWriteBytes(entry.Slice(sizeof(int), sizeof(long)), segment.StackSampleCounts[stackId]);
+                stream.Write(entry);
+            }
+
+            stream.Flush(flushToDisk: true);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            throw ExecutionCaptureStorageLayout.CreateStorageException(
+                "Execution capture segment summary could not be persisted.",
+                exception);
+        }
+    }
+
+    private static async Task<ExecutionStackSampleCounts> ReadSegmentSummaryAsync(
+        string summaryPath,
+        long expectedRecordCount,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var stream = new FileStream(
+                summaryPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                bufferSize: 64 * 1024,
+                options: FileOptions.Asynchronous | FileOptions.SequentialScan);
+            var header = new byte[SummaryHeaderLength];
+            await stream.ReadExactlyAsync(header, cancellationToken).ConfigureAwait(false);
+            if (!header.AsSpan(0, SummaryMagic.Length).SequenceEqual(SummaryMagic)
+                || BitConverter.ToInt32(header, 4) != SummaryFormatVersion)
+            {
+                throw new InvalidDataException("Execution capture segment summary header is invalid.");
+            }
+
+            var entryCount = BitConverter.ToInt32(header, 8);
+            if (entryCount < 0 || BitConverter.ToInt32(header, 12) != 0)
+            {
+                throw new InvalidDataException("Execution capture segment summary metadata is invalid.");
+            }
+
+            var expectedEntryBytes = checked((long)entryCount * SummaryEntryLength);
+            if (stream.Length - stream.Position != expectedEntryBytes)
+            {
+                throw new InvalidDataException("Execution capture segment summary length is invalid.");
+            }
+
+            var stacks = new ExecutionStackSampleCount[entryCount];
+            var seenStackIds = new HashSet<int>();
+            long receivedSampleCount = 0;
+            var entry = new byte[SummaryEntryLength];
+            for (var index = 0; index < stacks.Length; index++)
+            {
+                await stream.ReadExactlyAsync(entry, cancellationToken).ConfigureAwait(false);
+                var stackId = BitConverter.ToInt32(entry, 0);
+                var sampleCount = BitConverter.ToInt64(entry, sizeof(int));
+                if (stackId < 0 || sampleCount <= 0 || !seenStackIds.Add(stackId))
+                {
+                    throw new InvalidDataException("Execution capture segment summary entries are invalid.");
+                }
+
+                stacks[index] = new ExecutionStackSampleCount(stackId, sampleCount);
+                receivedSampleCount = checked(receivedSampleCount + sampleCount);
+            }
+
+            if (receivedSampleCount != expectedRecordCount)
+            {
+                throw new InvalidDataException("Execution capture segment summary does not match its segment boundary.");
+            }
+
+            return new ExecutionStackSampleCounts(receivedSampleCount, stacks);
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or InvalidDataException or EndOfStreamException or OverflowException)
+        {
+            throw ExecutionCaptureStorageLayout.CreateStorageException(
+                "Execution capture segment summary is invalid.",
+                exception);
+        }
     }
 
     private static void WriteRecord(FileStream stream, ReadOnlySpan<byte> record)
@@ -947,10 +1213,15 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
 
     private sealed class ExecutionCaptureSegment
     {
-        public ExecutionCaptureSegment(int number, string path, DateTimeOffset anchorUtc)
+        public ExecutionCaptureSegment(
+            int number,
+            string path,
+            string summaryPath,
+            DateTimeOffset anchorUtc)
         {
             Number = number;
             Path = path;
+            SummaryPath = summaryPath;
             AnchorUtc = anchorUtc;
             StartedAtUtc = anchorUtc;
             EndedAtUtc = anchorUtc;
@@ -960,6 +1231,8 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         public int Number { get; }
 
         public string Path { get; }
+
+        public string SummaryPath { get; }
 
         public DateTimeOffset AnchorUtc { get; }
 
@@ -974,6 +1247,10 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         public long DataLength { get; set; }
 
         public bool IsSealed { get; set; }
+
+        public Dictionary<int, long> StackSampleCounts { get; } = [];
+
+        public List<int> StackIdsInFirstSeenOrder { get; } = [];
 
         public FileStream Stream { get; set; } = null!;
     }
@@ -1065,11 +1342,14 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
 }
 
 internal sealed record ExecutionCaptureSegmentReadLimit(
+    int SegmentNumber,
     string Path,
+    string SummaryPath,
     DateTimeOffset StartedAtUtc,
     DateTimeOffset EndedAtUtc,
     long DataLength,
-    long RecordCount);
+    long RecordCount,
+    bool IsSealed);
 
 internal sealed record ExecutionCaptureSegmentHeader(
     DateTimeOffset AnchorUtc,

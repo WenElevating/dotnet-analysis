@@ -12,6 +12,8 @@ namespace DotnetAnalysis.Tests.Architecture;
     Justification = "Test names describe the required project boundaries.")]
 public sealed class DiagnosticsBoundaryTests
 {
+    private static readonly string[] ExpectedExecutionProfileQueryModeNames = ["FullScan", "Incremental"];
+
     [TestMethod]
     public void Application_ContainsOnlyDiagnosticsContractsAndSharedEvents()
     {
@@ -109,6 +111,26 @@ public sealed class DiagnosticsBoundaryTests
         var method = typeof(IProcessDiagnosticsSession).GetMethod(
             "GetExecutionProfileAsync",
             [typeof(ExecutionTimeRange), typeof(CancellationToken)]);
+
+        Assert.IsNotNull(method);
+        Assert.AreEqual(typeof(Task<ExecutionProfile>), method.ReturnType);
+    }
+
+    [TestMethod]
+    public void ProcessDiagnosticsSession_ExposesExplicitExecutionProfileQueryModes()
+    {
+        var modeType = typeof(ExecutionProfile).Assembly.GetType(
+            "DotnetAnalysis.Core.Diagnostics.ExecutionProfileQueryMode");
+
+        Assert.IsNotNull(modeType);
+        Assert.IsTrue(modeType.IsEnum);
+        CollectionAssert.AreEquivalent(
+            ExpectedExecutionProfileQueryModeNames,
+            Enum.GetNames(modeType));
+
+        var method = typeof(IProcessDiagnosticsSession).GetMethod(
+            "GetExecutionProfileAsync",
+            [typeof(ExecutionTimeRange), modeType, typeof(CancellationToken)]);
 
         Assert.IsNotNull(method);
         Assert.AreEqual(typeof(Task<ExecutionProfile>), method.ReturnType);
