@@ -55,11 +55,23 @@ public sealed class ExecutionSamplingIntegrationTests
                     _ => cancellationToken
                 }))
             .ToArray();
+        var firstQueryObservation = ObserveQueryCompletion(queryTasks[0]);
+        var secondQueryObservation = ObserveQueryCompletion(queryTasks[1]);
+        var firstCancellationScheduledAt = Stopwatch.GetTimestamp();
         firstCancelledQuery.CancelAfter(QueryCancellationDelayMilliseconds);
+        var secondCancellationScheduledAt = Stopwatch.GetTimestamp();
         secondCancelledQuery.CancelAfter(QueryCancellationDelayMilliseconds);
 
-        await Assert.ThrowsAsync<OperationCanceledException>(async () => await queryTasks[0]);
-        await Assert.ThrowsAsync<OperationCanceledException>(async () => await queryTasks[1]);
+        await AssertCancelledOrCompletedBeforeDeadlineAsync(
+            firstQueryObservation,
+            firstCancelledQuery,
+            firstCancellationScheduledAt,
+            cancellationToken);
+        await AssertCancelledOrCompletedBeforeDeadlineAsync(
+            secondQueryObservation,
+            secondCancelledQuery,
+            secondCancellationScheduledAt,
+            cancellationToken);
         var successfulProfiles = await Task.WhenAll(queryTasks[2..]);
 
         Assert.HasCount(6, successfulProfiles);
@@ -317,6 +329,48 @@ public sealed class ExecutionSamplingIntegrationTests
         Assert.AreEqual(DiagnosticsErrorCode.ExecutionProfileRangeUnavailable, exception.ErrorCode);
     }
 
+    private static Task<ObservedExecutionQuery> ObserveQueryCompletion(Task<ExecutionProfile> queryTask) =>
+        queryTask.ContinueWith(
+            static completedQuery => new ObservedExecutionQuery(completedQuery, Stopwatch.GetTimestamp()),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+
+    private static async Task AssertCancelledOrCompletedBeforeDeadlineAsync(
+        Task<ObservedExecutionQuery> observationTask,
+        CancellationTokenSource queryCancellation,
+        long cancellationScheduledAt,
+        CancellationToken testCancellation)
+    {
+        var observation = await observationTask;
+        var completionDelay = Stopwatch.GetElapsedTime(
+            cancellationScheduledAt,
+            observation.CompletedAtTimestamp);
+        if (observation.QueryTask.IsCompletedSuccessfully)
+        {
+            Assert.IsTrue(
+                completionDelay <= TimeSpan.FromMilliseconds(QueryCancellationDelayMilliseconds),
+                $"A cancellable execution query completed successfully after its {QueryCancellationDelayMilliseconds} ms deadline.");
+            AssertProfileCountsAreConsistent(observation.QueryTask.Result);
+            return;
+        }
+
+        try
+        {
+            await observation.QueryTask;
+            Assert.Fail("The observed execution query did not produce a result or cancellation.");
+        }
+        catch (OperationCanceledException) when (!testCancellation.IsCancellationRequested)
+        {
+            Assert.IsTrue(
+                queryCancellation.IsCancellationRequested,
+                "The execution query cancellation must originate from its scheduled query token.");
+            Assert.IsTrue(
+                completionDelay >= TimeSpan.FromMilliseconds(QueryCancellationDelayMilliseconds),
+                "Only an execution query that remained active until its cancellation deadline may report cancellation.");
+        }
+    }
+
     private static void AssertProfileCountsAreConsistent(ExecutionProfile profile)
     {
         Assert.IsGreaterThan(0L, profile.ReceivedSampleCount);
@@ -393,6 +447,10 @@ public sealed class ExecutionSamplingIntegrationTests
             }
         }
     }
+
+    private sealed record ObservedExecutionQuery(
+        Task<ExecutionProfile> QueryTask,
+        long CompletedAtTimestamp);
 
     private sealed class AttachedExecutionTarget : IAsyncDisposable
     {
