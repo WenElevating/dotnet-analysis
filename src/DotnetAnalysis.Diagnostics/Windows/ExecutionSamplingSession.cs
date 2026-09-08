@@ -6,14 +6,26 @@ using Microsoft.Extensions.Logging;
 
 namespace DotnetAnalysis.Diagnostics.Windows;
 
+/// <summary>
+/// 定义附着会话内执行采样的启动、查询和异步释放边界。
+/// </summary>
 internal interface IExecutionSamplingSession : IAsyncDisposable
 {
+    /// <summary>
+    /// 启动目标进程的执行采样；启动状态会决定后续查询是可用还是返回稳定不可用错误。
+    /// </summary>
     Task StartAsync(TargetProcess target, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// 使用默认增量模式构建指定时间范围的执行分析结果。
+    /// </summary>
     Task<ExecutionProfile> GetExecutionProfileAsync(
         ExecutionTimeRange timeRange,
         CancellationToken cancellationToken);
 
+    /// <summary>
+    /// 使用调用方指定的读取模式构建指定时间范围的执行分析结果。
+    /// </summary>
     Task<ExecutionProfile> GetExecutionProfileAsync(
         ExecutionTimeRange timeRange,
         ExecutionProfileQueryMode queryMode,
@@ -55,6 +67,9 @@ internal sealed class ExecutionSamplingSession : IExecutionSamplingSession
 
     /// <summary>
     /// 使用默认会话存储、EventPipe 读取器和本地符号解析器创建执行采样会话。
+    /// </summary>
+    /// <summary>
+    /// 为测试或组合根注入会话独占组件、时钟和延迟策略，以验证启动、取消和缓存生命周期。
     /// </summary>
     internal ExecutionSamplingSession(
         string? storageRootDirectory = null,
@@ -246,6 +261,9 @@ internal sealed class ExecutionSamplingSession : IExecutionSamplingSession
         }
     }
 
+    /// <summary>
+    /// 创建采样组件并启动 EventPipe；仅对已识别的短暂传输失败进行一次受控重试。
+    /// </summary>
     private async Task StartCoreAsync(TargetProcess target, CancellationToken cancellationToken)
     {
         await Task.Yield();
@@ -303,6 +321,9 @@ internal sealed class ExecutionSamplingSession : IExecutionSamplingSession
         }
     }
 
+    /// <summary>
+    /// 先取消共享查询和输入处理，再等待启动、查询、采样器与临时存储按安全顺序收敛。
+    /// </summary>
     private async Task DisposeCoreAsync(Task? startTask, Task queriesDrained)
     {
         await Task.Yield();
@@ -368,6 +389,9 @@ internal sealed class ExecutionSamplingSession : IExecutionSamplingSession
         failure?.Throw();
     }
 
+    /// <summary>
+    /// 注销一个查询等待者；最后一个退出者释放处置流程等待的查询排空信号。
+    /// </summary>
     private void ExitQuery()
     {
         TaskCompletionSource? queriesDrained = null;
@@ -383,6 +407,9 @@ internal sealed class ExecutionSamplingSession : IExecutionSamplingSession
         queriesDrained?.TrySetResult();
     }
 
+    /// <summary>
+    /// 在会话私有并发预算内完成一个不同键的增量构建，并无论成功、失败或会话取消都清理单飞项。
+    /// </summary>
     private async Task CompleteIncrementalProfileBuildAsync(
         ExecutionProfileQueryCacheKey cacheKey,
         TaskCompletionSource<ExecutionProfile> completion,
@@ -440,11 +467,17 @@ internal sealed class ExecutionSamplingSession : IExecutionSamplingSession
         }
     }
 
+    /// <summary>
+    /// 判断字典当前项仍是指定任务，避免旧失败或旧完成回调误删后来重建的同键单飞项。
+    /// </summary>
     private bool IsCachedIncrementalProfileTask(
         ExecutionProfileQueryCacheKey cacheKey,
         Task<ExecutionProfile> task) => _incrementalProfileCache.TryGetValue(cacheKey, out var cachedTask)
             && ReferenceEquals(cachedTask, task);
 
+    /// <summary>
+    /// 将已命中的完成结果移动到 LRU 末尾；运行或排队任务不参与容量淘汰。
+    /// </summary>
     private void RefreshCompletedIncrementalProfileRecency(ExecutionProfileQueryCacheKey cacheKey)
     {
         if (!_completedIncrementalProfileCacheLruNodes.TryGetValue(cacheKey, out var existingNode))
@@ -456,6 +489,9 @@ internal sealed class ExecutionSamplingSession : IExecutionSamplingSession
         _completedIncrementalProfileCacheLru.AddLast(existingNode);
     }
 
+    /// <summary>
+    /// 登记成功完成的增量结果并将 LRU 缓存限制在既定容量，绝不驱逐运行中的单飞任务。
+    /// </summary>
     private void TrackCompletedIncrementalProfile(ExecutionProfileQueryCacheKey cacheKey)
     {
         if (_completedIncrementalProfileCacheLruNodes.ContainsKey(cacheKey))
@@ -477,6 +513,9 @@ internal sealed class ExecutionSamplingSession : IExecutionSamplingSession
         _incrementalProfileCache.Remove(leastRecentlyUsedNode.Value);
     }
 
+    /// <summary>
+    /// 仅在当前项仍属于指定任务时移除缓存，保证失败或会话取消后相同范围可以安全重建。
+    /// </summary>
     private void RemoveCachedIncrementalProfile(
         ExecutionProfileQueryCacheKey cacheKey,
         Task<ExecutionProfile> task)
@@ -493,6 +532,9 @@ internal sealed class ExecutionSamplingSession : IExecutionSamplingSession
         }
     }
 
+    /// <summary>
+    /// 集中创建相互协作的采样器、持久化存储、聚合器与符号解析器，保持会话资源所有权清晰。
+    /// </summary>
     private static ExecutionSamplingComponents CreateComponents(
         string? storageRootDirectory,
         ILogger<ExecutionSymbolResolver>? symbolLogger)
@@ -506,16 +548,25 @@ internal sealed class ExecutionSamplingSession : IExecutionSamplingSession
             symbolResolver);
     }
 
+    /// <summary>
+    /// 判断启动失败是否属于允许一次延迟重试的短暂诊断传输故障。
+    /// </summary>
     private static bool IsTransientStartFailure(Exception exception) =>
         ContainsStartFailure(
             exception,
             static candidate => candidate is DiagnosticsClientException or IOException);
 
+    /// <summary>
+    /// 判断启动异常是否应映射为稳定的执行采样不可用错误。
+    /// </summary>
     private static bool IsMappedStartFailure(Exception exception) =>
         ContainsStartFailure(
             exception,
             static candidate => candidate is DiagnosticsClientException or IOException or UnauthorizedAccessException);
 
+    /// <summary>
+    /// 遍历聚合异常树，查找满足指定启动失败分类谓词的内部异常。
+    /// </summary>
     private static bool ContainsStartFailure(Exception exception, Func<Exception, bool> predicate)
     {
         if (predicate(exception))
@@ -528,20 +579,32 @@ internal sealed class ExecutionSamplingSession : IExecutionSamplingSession
                 ContainsStartFailure(innerException, predicate));
     }
 
+    /// <summary>
+    /// 为已超出会话可查询水位的时间范围创建稳定诊断错误。
+    /// </summary>
     private static DiagnosticsException CreateRangeUnavailableException() =>
         new(
             DiagnosticsErrorCode.ExecutionProfileRangeUnavailable,
             "The requested execution profile range is not available in this session.");
 
+    /// <summary>
+    /// 聚合一个会话独占的采样实现组件，便于启动失败时统一释放已创建资源。
+    /// </summary>
     private sealed record ExecutionSamplingComponents(
         ExecutionCaptureStore Store,
         IEventPipeExecutionSampler Sampler,
         ExecutionSymbolResolver SymbolResolver);
 
+    /// <summary>
+    /// 表示增量查询的稳定缓存键：封存历史使用段版本，活动范围使用完整读取边界，且始终包含丢失事件数。
+    /// </summary>
     private sealed class ExecutionProfileQueryCacheKey : IEquatable<ExecutionProfileQueryCacheKey>
     {
         private readonly ExecutionCaptureSealedSegmentVersion[]? _sealedSegmentVersions;
 
+        /// <summary>
+        /// 从固定读取边界和范围依赖快照构建缓存键；封存历史不保留与结果无关的活动段水位。
+        /// </summary>
         public ExecutionProfileQueryCacheKey(
             ExecutionTimeRange timeRange,
             ExecutionCaptureReadBoundary boundary,
@@ -577,6 +640,9 @@ internal sealed class ExecutionSamplingSession : IExecutionSamplingSession
 
         private long LostEventCount { get; }
 
+        /// <summary>
+        /// 比较所有决定执行分析结果的时间范围、读取依赖和丢失事件快照。
+        /// </summary>
         public bool Equals(ExecutionProfileQueryCacheKey? other)
         {
             if (ReferenceEquals(this, other))
@@ -602,8 +668,14 @@ internal sealed class ExecutionSamplingSession : IExecutionSamplingSession
             return _sealedSegmentVersions.AsSpan().SequenceEqual(other._sealedSegmentVersions);
         }
 
+        /// <summary>
+        /// 将对象比较转发到强类型键比较，供字典和 LRU 索引使用。
+        /// </summary>
         public override bool Equals(object? obj) => Equals(obj as ExecutionProfileQueryCacheKey);
 
+        /// <summary>
+        /// 组合与强类型相等比较完全一致的字段，避免不同结果范围共享缓存项。
+        /// </summary>
         public override int GetHashCode()
         {
             var hash = new HashCode();
@@ -628,6 +700,9 @@ internal sealed class ExecutionSamplingSession : IExecutionSamplingSession
         }
     }
 
+    /// <summary>
+    /// 表示执行采样会话的启动、可查询和处置终态，用于拒绝不合法生命周期调用。
+    /// </summary>
     private enum ExecutionSamplingSessionState
     {
         Created,

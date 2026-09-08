@@ -66,6 +66,9 @@ internal sealed class ExecutionProfileBuilder
             useIncrementalSummaries: true,
             cancellationToken).ConfigureAwait(false);
 
+    /// <summary>
+    /// 在固定读取边界内执行共享聚合流程，并根据查询模式选择逐条读取或封存摘要加速。
+    /// </summary>
     private async Task<ExecutionProfile> BuildCoreAsync(
         ExecutionTimeRange range,
         ExecutionCaptureReadBoundary boundary,
@@ -174,6 +177,9 @@ internal sealed class ExecutionProfileBuilder
             callTreeRoots);
     }
 
+    /// <summary>
+    /// 将采样存储帧解析为领域帧，并仅在本地符号可用时附加源码位置。
+    /// </summary>
     private async Task<ExecutionFrame> CreateCoreFrameAsync(
         ExecutionFrameReference frameReference,
         CancellationToken cancellationToken)
@@ -186,6 +192,9 @@ internal sealed class ExecutionProfileBuilder
         return new ExecutionFrame(descriptor.MethodName, descriptor.ModuleName, sourceLocation);
     }
 
+    /// <summary>
+    /// 按帧标识复用热点累加器，避免每个样本产生新的热点对象。
+    /// </summary>
     private static MutableHotspot GetOrAddHotspot(
         Dictionary<int, MutableHotspot> hotspotsByFrameId,
         int frameId,
@@ -202,6 +211,9 @@ internal sealed class ExecutionProfileBuilder
         return hotspot;
     }
 
+    /// <summary>
+    /// 获取或创建顶层调用树节点，并保持根节点首次出现的稳定顺序。
+    /// </summary>
     private static MutableCallTreeNode GetOrAddRoot(
         Dictionary<int, MutableCallTreeNode> rootsByFrameId,
         int frameId,
@@ -218,6 +230,9 @@ internal sealed class ExecutionProfileBuilder
         return root;
     }
 
+    /// <summary>
+    /// 将内部可变调用树递归投影为不可变领域节点，并在投影前完成稳定排序。
+    /// </summary>
     private static ExecutionCallTreeNode ToExecutionCallTreeNode(
         MutableCallTreeNode node,
         Action? beforeMaterialization,
@@ -244,6 +259,9 @@ internal sealed class ExecutionProfileBuilder
             children);
     }
 
+    /// <summary>
+    /// 按首次出现序号递归排序调用树，保证相同输入得到稳定展示顺序。
+    /// </summary>
     private static void SortCallTreeNodes(
         List<MutableCallTreeNode> nodes,
         CancellationToken cancellationToken)
@@ -263,6 +281,9 @@ internal sealed class ExecutionProfileBuilder
         }
     }
 
+    /// <summary>
+    /// 按热点样本数和首次出现序号排序可变热点集合。
+    /// </summary>
     private static void SortMutableHotspots(
         List<MutableHotspot> hotspots,
         Action? beforeComparison,
@@ -279,8 +300,14 @@ internal sealed class ExecutionProfileBuilder
         }
     }
 
+    /// <summary>
+    /// 聚合阶段使用的可变热点计数器，延后到输出时才创建不可变领域模型。
+    /// </summary>
     private sealed class MutableHotspot
     {
+        /// <summary>
+        /// 以对应领域帧及其首次出现序号初始化热点累加器。
+        /// </summary>
         public MutableHotspot(ExecutionFrame frame, long firstSeenOrder)
         {
             Frame = frame;
@@ -296,17 +323,26 @@ internal sealed class ExecutionProfileBuilder
         public long ExclusiveSampleCount { get; set; }
     }
 
+    /// <summary>
+    /// 为热点输出定义按样本数降序、首次出现升序的稳定比较规则。
+    /// </summary>
     private sealed class MutableHotspotComparer : IComparer<MutableHotspot>
     {
         private readonly CancellationToken _cancellationToken;
         private readonly Action? _beforeComparison;
 
+        /// <summary>
+        /// 绑定取消令牌与可选测试钩子，使比较期间也能响应取消。
+        /// </summary>
         public MutableHotspotComparer(Action? beforeComparison, CancellationToken cancellationToken)
         {
             _cancellationToken = cancellationToken;
             _beforeComparison = beforeComparison;
         }
 
+        /// <summary>
+        /// 比较两个热点；空值仅用于满足比较器契约，实际聚合集合不包含空项。
+        /// </summary>
         public int Compare(MutableHotspot? left, MutableHotspot? right)
         {
             _cancellationToken.ThrowIfCancellationRequested();
@@ -352,8 +388,14 @@ internal sealed class ExecutionProfileBuilder
         }
     }
 
+    /// <summary>
+    /// 聚合期间按帧去重并累计样本数的可变调用树节点。
+    /// </summary>
     private sealed class MutableCallTreeNode
     {
+        /// <summary>
+        /// 以领域帧和稳定首次出现序号初始化可变调用树节点。
+        /// </summary>
         public MutableCallTreeNode(ExecutionFrame frame, long firstSeenOrder)
         {
             Frame = frame;
@@ -370,6 +412,9 @@ internal sealed class ExecutionProfileBuilder
 
         public Dictionary<int, MutableCallTreeNode> ChildrenByFrameId { get; } = [];
 
+        /// <summary>
+        /// 获取或创建指定帧的子节点，并为首次出现的子节点分配稳定顺序。
+        /// </summary>
         public MutableCallTreeNode GetOrAddChild(
             int frameId,
             ExecutionFrame frame,

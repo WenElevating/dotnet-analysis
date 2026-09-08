@@ -17,6 +17,9 @@ namespace DotnetAnalysis.Diagnostics.IntegrationTests;
 
 [TestClass]
 [SuppressMessage("Naming", "CA1707:Identifiers should not contain underscores", Justification = "Test names describe behavior.")]
+/// <summary>
+/// 覆盖执行采样的常规证据校验、受门禁保护的性能基准、差分测试和长时压力运行。
+/// </summary>
 public sealed class ExecutionSamplingPerformanceTests
 {
     private const string BenchmarkGate = "DOTNET_ANALYSIS_RUN_EXECUTION_PROFILE_BENCHMARK";
@@ -610,6 +613,9 @@ public sealed class ExecutionSamplingPerformanceTests
         await ExecuteEvidenceRunAsync("stress", RunStressAsync, _testContext.CancellationToken);
     }
 
+    /// <summary>
+    /// 执行受门禁保护的验证主体，并无论成功或失败都写出包含原始数组的证据文件。
+    /// </summary>
     private async Task ExecuteEvidenceRunAsync(
         string runKind,
         Func<ExecutionSamplingRunEvidence, CancellationToken, Task> runAsync,
@@ -647,6 +653,9 @@ public sealed class ExecutionSamplingPerformanceTests
         }
     }
 
+    /// <summary>
+    /// 在固定时长内交替测量未附着与附着吞吐、查询和资源数据，生成性能门禁所需原始序列。
+    /// </summary>
     private static async Task RunBenchmarkAsync(
         ExecutionSamplingRunEvidence evidence,
         CancellationToken cancellationToken)
@@ -852,6 +861,9 @@ public sealed class ExecutionSamplingPerformanceTests
             "==", sessionDirectoryDeletedAfterEnd ? 1 : 0, 1, "boolean");
     }
 
+    /// <summary>
+    /// 在长时采样期间持续执行快照、并发查询和资源观测，以发现泄漏、边界或生命周期退化。
+    /// </summary>
     private static async Task RunStressAsync(
         ExecutionSamplingRunEvidence evidence,
         CancellationToken cancellationToken)
@@ -1051,6 +1063,9 @@ public sealed class ExecutionSamplingPerformanceTests
             "==", sessionDirectoryDeletedAfterEnd ? 1 : 0, 1, "boolean");
     }
 
+    /// <summary>
+    /// 在未附着诊断会话时测量目标工作负载吞吐，作为采样开销基线。
+    /// </summary>
     private static async Task<ExecutionSamplingThroughputMeasurement> MeasureUnattachedThroughputAsync(
         PreparedExecutionWorkloadTarget preparedTarget,
         int sequence,
@@ -1076,6 +1091,9 @@ public sealed class ExecutionSamplingPerformanceTests
             endingCount - startingCount);
     }
 
+    /// <summary>
+    /// 按指定诊断模式分派归因窗口测量，保持不同模式使用相同窗口契约。
+    /// </summary>
     private static Task<ExecutionSamplingAttributionMeasurement> MeasureAttributionAsync(
         ExecutionSamplingAttributionMode mode,
         PreparedExecutionWorkloadTarget preparedTarget,
@@ -1102,6 +1120,9 @@ public sealed class ExecutionSamplingPerformanceTests
             _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unknown attribution mode.")
         };
 
+    /// <summary>
+    /// 测量没有任何诊断附着时的归因窗口，提供全附着与局部提供程序模式的对照。
+    /// </summary>
     private static async Task<ExecutionSamplingAttributionMeasurement> MeasureUnattachedAttributionAsync(
         PreparedExecutionWorkloadTarget preparedTarget,
         int round,
@@ -1119,6 +1140,9 @@ public sealed class ExecutionSamplingPerformanceTests
             cancellationToken);
     }
 
+    /// <summary>
+    /// 仅启动执行采样并测量其相对基线的吞吐和资源影响。
+    /// </summary>
     private static async Task<ExecutionSamplingAttributionMeasurement> MeasureExecutionOnlyAttributionAsync(
         PreparedExecutionWorkloadTarget preparedTarget,
         int round,
@@ -1180,6 +1204,9 @@ public sealed class ExecutionSamplingPerformanceTests
         }
     }
 
+    /// <summary>
+    /// 仅订阅运行时提供程序而不构建完整诊断会话，隔离 EventPipe 提供程序自身开销。
+    /// </summary>
     private static async Task<ExecutionSamplingAttributionMeasurement> MeasureProviderOnlyAttributionAsync(
         PreparedExecutionWorkloadTarget preparedTarget,
         int round,
@@ -1211,6 +1238,9 @@ public sealed class ExecutionSamplingPerformanceTests
         }
     }
 
+    /// <summary>
+    /// 测量完整附着会话的总体影响，用于与局部采样路径的归因数据比较。
+    /// </summary>
     private static async Task<ExecutionSamplingAttributionMeasurement> MeasureFullAttachAttributionAsync(
         PreparedExecutionWorkloadTarget preparedTarget,
         int round,
@@ -1249,6 +1279,9 @@ public sealed class ExecutionSamplingPerformanceTests
         return measurement;
     }
 
+    /// <summary>
+    /// 在已建立指定诊断模式后测量一个统一持续时间的工作负载与进程资源窗口。
+    /// </summary>
     private static async Task<ExecutionSamplingAttributionMeasurement> MeasureAttributionWindowAsync(
         string mode,
         int round,
@@ -1296,6 +1329,9 @@ public sealed class ExecutionSamplingPerformanceTests
             CachedFullRangeQueryMaximumAllocatedBytes: null);
     }
 
+    /// <summary>
+    /// 重复查询同一完整范围并记录延迟，验证增量结果缓存不会改变结果一致性。
+    /// </summary>
     private static async Task<ExecutionSamplingAttributionQueryMeasurement> MeasureCachedFullRangeQueriesAsync(
         Func<ExecutionTimeRange, CancellationToken, Task<ExecutionProfile>> queryAsync,
         ExecutionCaptureStore store,
@@ -1345,6 +1381,9 @@ public sealed class ExecutionSamplingPerformanceTests
             allocatedBytes.Max());
     }
 
+    /// <summary>
+    /// 将归因测试的执行顺序标识标准化为冷、温或热状态标签。
+    /// </summary>
     private static string GetAttributionOrderTemperature(int orderPosition) =>
         orderPosition switch
         {
@@ -1354,6 +1393,9 @@ public sealed class ExecutionSamplingPerformanceTests
             _ => throw new ArgumentOutOfRangeException(nameof(orderPosition), orderPosition, "Order position must be between one and three.")
         };
 
+    /// <summary>
+    /// 汇总各诊断模式相对于未附着基线的成对吞吐下降和查询测量。
+    /// </summary>
     private static ExecutionSamplingAttributionSummary CreateAttributionSummary(
         IReadOnlyCollection<ExecutionSamplingAttributionMeasurement> measurements)
     {
@@ -1397,6 +1439,9 @@ public sealed class ExecutionSamplingPerformanceTests
             projectedStorageBytes.Max());
     }
 
+    /// <summary>
+    /// 逐窗口配对计算某模式相对未附着测量的吞吐下降，避免跨窗口噪声混入比较。
+    /// </summary>
     private static double[] CalculatePairedAttributionDrops(
         IReadOnlyCollection<ExecutionSamplingAttributionMeasurement> attachedMeasurements,
         IReadOnlyDictionary<int, ExecutionSamplingAttributionMeasurement> baselinesByRound) =>
@@ -1407,6 +1452,9 @@ public sealed class ExecutionSamplingPerformanceTests
                 measurement.TargetOperationsPerSecond))
             .ToArray();
 
+    /// <summary>
+    /// 在活动诊断会话期间读取目标已完成操作数并计算对应吞吐。
+    /// </summary>
     private static async Task<ExecutionSamplingThroughputMeasurement> MeasureAttachedThroughputAsync(
         PreparedExecutionWorkloadTarget preparedTarget,
         int sequence,
@@ -1451,6 +1499,9 @@ public sealed class ExecutionSamplingPerformanceTests
             endingCount - startingCount);
     }
 
+    /// <summary>
+    /// 执行一次可用执行分析查询，记录耗时和结果统计到证据对象。
+    /// </summary>
     private static async Task<ExecutionProfile> MeasureQueryAsync(
         ExecutionSamplingRunEvidence evidence,
         IProcessDiagnosticsSession session,
@@ -1497,6 +1548,9 @@ public sealed class ExecutionSamplingPerformanceTests
         return profile;
     }
 
+    /// <summary>
+    /// 并发提交多个范围查询并记录每个调用方的完成、取消和单飞复用结果。
+    /// </summary>
     private static async Task RunConcurrentQueryBatchAsync(
         ExecutionSamplingRunEvidence evidence,
         AttachedExecutionFixture fixture,
@@ -1608,6 +1662,9 @@ public sealed class ExecutionSamplingPerformanceTests
         }
     }
 
+    /// <summary>
+    /// 在执行采样连续运行期间捕获并分析快照，验证两种诊断工作不会互相中断。
+    /// </summary>
     private static async Task CaptureSnapshotWithContinuityAsync(
         ExecutionSamplingRunEvidence evidence,
         AttachedExecutionFixture fixture,
@@ -1683,6 +1740,9 @@ public sealed class ExecutionSamplingPerformanceTests
         }
     }
 
+    /// <summary>
+    /// 采集诊断端 CPU、内存和目标工作集的同一时刻资源快照。
+    /// </summary>
     private static ExecutionSamplingResourceMeasurement CaptureResourceMeasurement(
         string phase,
         Process diagnosticsProcess,
@@ -1711,18 +1771,27 @@ public sealed class ExecutionSamplingPerformanceTests
             targetCompletedOperations);
     }
 
+    /// <summary>
+    /// 安全刷新目标进程并读取累计处理器时间，供窗口 CPU 差分计算使用。
+    /// </summary>
     private static TimeSpan ReadProcessorTime(Process process)
     {
         process.Refresh();
         return process.TotalProcessorTime;
     }
 
+    /// <summary>
+    /// 将执行分析结果的关键计数与范围追加到当前运行证据。
+    /// </summary>
     private static void RecordProfile(ExecutionSamplingRunEvidence evidence, ExecutionProfile profile)
     {
         evidence.ReceivedSampleCounts.Add(profile.ReceivedSampleCount);
         evidence.LostEventCounts.Add(profile.LostEventCount);
     }
 
+    /// <summary>
+    /// 在运行结束时记录采样器成功样本、丢失事件和终端失败状态。
+    /// </summary>
     private static void RecordFinalSamplerState(
         ExecutionSamplingRunEvidence evidence,
         AttachedExecutionFixture fixture)
@@ -1731,6 +1800,9 @@ public sealed class ExecutionSamplingPerformanceTests
         evidence.LostEventCounts.Add(fixture.FinalLostEventCount);
     }
 
+    /// <summary>
+    /// 验证最近快照已完成分析且保留可读取转储，防止性能结论建立在失败捕获上。
+    /// </summary>
     private static void EnsureLatestSnapshotIsUsable(
         ExecutionSamplingRunEvidence evidence,
         int sequence)
@@ -1743,11 +1815,17 @@ public sealed class ExecutionSamplingPerformanceTests
         }
     }
 
+    /// <summary>
+    /// 验证调用树和热点计数没有超过接收样本数，并保留最基本的结果自洽性。
+    /// </summary>
     private static bool CountsAreConsistent(ExecutionProfile profile) =>
         profile.ReceivedSampleCount > 0
         && profile.ReceivedSampleCount == profile.Hotspots.Sum(static hotspot => hotspot.ExclusiveSampleCount)
         && profile.ReceivedSampleCount == profile.CallTreeRoots.Sum(static root => root.InclusiveSampleCount);
 
+    /// <summary>
+    /// 从当前水位生成多个合法且互异的查询范围，以驱动不同键的并发构建。
+    /// </summary>
     private static ExecutionTimeRange[] CreateConcurrentRanges(
         ExecutionTimeRange availableRange,
         int randomSeed)
@@ -1767,6 +1845,9 @@ public sealed class ExecutionSamplingPerformanceTests
         return ranges;
     }
 
+    /// <summary>
+    /// 在允许采样窗口内按随机偏移创建半开合法范围，避免压力测试只重复同一缓存键。
+    /// </summary>
     private static ExecutionTimeRange CreateRandomLegalRange(
         AttachedExecutionFixture fixture,
         Random random)
@@ -1785,6 +1866,9 @@ public sealed class ExecutionSamplingPerformanceTests
             new DateTimeOffset(startTicks + durationTicks, TimeSpan.Zero));
     }
 
+    /// <summary>
+    /// 等待目标采样水位足够后创建覆盖最新稳定数据的查询范围。
+    /// </summary>
     private static async Task<ExecutionTimeRange> CreateLatestRangeAsync(
         AttachedExecutionFixture fixture,
         TimeSpan duration,
@@ -1803,6 +1887,9 @@ public sealed class ExecutionSamplingPerformanceTests
         return new ExecutionTimeRange(startAtUtc, endAtUtc);
     }
 
+    /// <summary>
+    /// 在可取消条件下等待到指定 UTC 时刻，保持测量窗口长度可重复。
+    /// </summary>
     private static async Task DelayUntilAsync(DateTimeOffset targetAtUtc, CancellationToken cancellationToken)
     {
         var delay = targetAtUtc - DateTimeOffset.UtcNow;
@@ -1812,6 +1899,9 @@ public sealed class ExecutionSamplingPerformanceTests
         }
     }
 
+    /// <summary>
+    /// 递归计算证据或临时捕获目录大小，用于检测无界磁盘增长。
+    /// </summary>
     private static long GetDirectorySize(string directory)
     {
         if (!Directory.Exists(directory))

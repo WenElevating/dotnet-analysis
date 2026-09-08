@@ -9,6 +9,9 @@ using Microsoft.Extensions.Logging;
 
 namespace DotnetAnalysis.Diagnostics.Windows;
 
+/// <summary>
+/// 抽象会话持有的分配采样资源，以便进程诊断会话能按统一生命周期启动、中断和释放它。
+/// </summary>
 internal interface IAllocationSamplingSessionResource : IAsyncDisposable
 {
     AllocationSamplingSession Collector { get; }
@@ -18,6 +21,9 @@ internal interface IAllocationSamplingSessionResource : IAsyncDisposable
     void MarkInterrupted(DateTimeOffset observedAtUtc);
 }
 
+/// <summary>
+/// 将具体分配采样收集器适配为进程诊断会话拥有的资源契约。
+/// </summary>
 internal sealed class AllocationSamplingSessionResource : IAllocationSamplingSessionResource
 {
     public AllocationSamplingSessionResource(AllocationSamplingSession collector)
@@ -27,12 +33,21 @@ internal sealed class AllocationSamplingSessionResource : IAllocationSamplingSes
 
     public AllocationSamplingSession Collector { get; }
 
+    /// <summary>
+    /// 启动收集器对目标进程的分配采样。
+    /// </summary>
     public Task StartAsync(TargetProcess target, CancellationToken cancellationToken) =>
         Collector.StartAsync(target, cancellationToken);
 
+    /// <summary>
+    /// 记录目标或传输中断时间，供后续分配概要反映采样不完整状态。
+    /// </summary>
     public void MarkInterrupted(DateTimeOffset observedAtUtc) =>
         Collector.MarkInterrupted(observedAtUtc);
 
+    /// <summary>
+    /// 释放底层收集器及其 EventPipe 资源。
+    /// </summary>
     public ValueTask DisposeAsync() => Collector.DisposeAsync();
 }
 
@@ -512,6 +527,9 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
         }
     }
 
+    /// <summary>
+    /// 在涉及目标进程的操作前验证 PID 与启动时间仍匹配，并将目标丢失转换为会话结束。
+    /// </summary>
     private async Task EnsureTargetIdentityCurrentAsync(CancellationToken cancellationToken)
     {
         try
@@ -525,12 +543,21 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
         }
     }
 
+    /// <summary>
+    /// 判断稳定诊断错误是否表示进程退出或 PID 被复用，二者都要求终止当前会话。
+    /// </summary>
     private static bool IsTargetIdentityFailure(DiagnosticsException exception) =>
         exception.ErrorCode is DiagnosticsErrorCode.TargetExited or DiagnosticsErrorCode.TargetChanged;
 
+    /// <summary>
+    /// 在目标已丢失时尽力完成幂等结束；清理异常不覆盖原始身份验证失败。
+    /// </summary>
     private async Task CompleteEndAfterTargetLossAsync() =>
         await EndAsync(CancellationToken.None).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
 
+    /// <summary>
+    /// 为在目标丢失期间无法再读取的执行采样范围创建稳定错误。
+    /// </summary>
     private static DiagnosticsException CreateExecutionProfileRangeUnavailableException() =>
         new(
             DiagnosticsErrorCode.ExecutionProfileRangeUnavailable,

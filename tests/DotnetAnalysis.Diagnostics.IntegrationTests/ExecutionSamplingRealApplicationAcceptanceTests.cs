@@ -12,6 +12,9 @@ namespace DotnetAnalysis.Diagnostics.IntegrationTests;
 
 [TestClass]
 [SuppressMessage("Naming", "CA1707:Identifiers should not contain underscores", Justification = "Test names describe behavior.")]
+/// <summary>
+/// 对由外部环境显式提供的 MQTTnet 真实应用执行附着验收，验证采样证据而不自行启动或修改目标进程。
+/// </summary>
 public sealed class ExecutionSamplingRealApplicationAcceptanceTests
 {
     private const string AcceptanceGate = "DOTNET_ANALYSIS_RUN_REAL_APPLICATION_ACCEPTANCE";
@@ -27,6 +30,9 @@ public sealed class ExecutionSamplingRealApplicationAcceptanceTests
     [TestCategory("ExecutionSamplingRealApplicationAcceptance")]
     [DoNotParallelize]
     [Timeout(780_000, CooperativeCancellation = true)]
+    /// <summary>
+    /// 在人工门禁、目标 PID 和目标二进制验证全部通过后，附着既有 MQTTnet 测试应用并写出可追溯执行证据。
+    /// </summary>
     public async Task ExecutionSamplingRealApplicationAcceptance_AttachesOnlyToExistingMqttnetTestAppAndPreservesExecutionEvidence()
     {
         EnsureAcceptanceGateEnabled();
@@ -213,6 +219,9 @@ public sealed class ExecutionSamplingRealApplicationAcceptanceTests
         }
     }
 
+    /// <summary>
+    /// 强制要求人工显式启用验收门禁，避免常规集成测试依赖外部 PID。
+    /// </summary>
     private static void EnsureAcceptanceGateEnabled()
     {
         if (!ExecutionSamplingGate.IsEnabled(Environment.GetEnvironmentVariable(AcceptanceGate)))
@@ -221,6 +230,9 @@ public sealed class ExecutionSamplingRealApplicationAcceptanceTests
         }
     }
 
+    /// <summary>
+    /// 从环境变量读取并验证人工提供的目标进程标识。
+    /// </summary>
     private static int ReadTargetProcessId()
     {
         var value = Environment.GetEnvironmentVariable(TargetProcessIdVariable);
@@ -232,6 +244,9 @@ public sealed class ExecutionSamplingRealApplicationAcceptanceTests
         return processId;
     }
 
+    /// <summary>
+    /// 获取仍在运行的指定进程；目标已退出时给出验收前置条件错误。
+    /// </summary>
     private static Process GetRequiredTargetProcess(int processId)
     {
         try
@@ -244,6 +259,9 @@ public sealed class ExecutionSamplingRealApplicationAcceptanceTests
         }
     }
 
+    /// <summary>
+    /// 验证目标映像路径、名称和 AMD64 格式，防止验收误附着到无关进程。
+    /// </summary>
     private static string ValidateTargetProcess(Process process)
     {
         Assert.AreEqual("MQTTnet.TestApp", process.ProcessName, ignoreCase: true);
@@ -259,6 +277,9 @@ public sealed class ExecutionSamplingRealApplicationAcceptanceTests
         return executablePath;
     }
 
+    /// <summary>
+    /// 读取 PE 头机器类型，确认目标是当前诊断实现支持的 AMD64 进程。
+    /// </summary>
     private static bool IsAmd64PeImage(string filePath)
     {
         using var stream = File.OpenRead(filePath);
@@ -272,6 +293,9 @@ public sealed class ExecutionSamplingRealApplicationAcceptanceTests
             && BitConverter.ToUInt16(peHeader[4..]) == 0x8664;
     }
 
+    /// <summary>
+    /// 在可取消条件下等待到指定 UTC 时间，用于固定采样和查询节奏。
+    /// </summary>
     private static async Task DelayUntilAsync(DateTimeOffset targetAtUtc, CancellationToken cancellationToken)
     {
         var remaining = targetAtUtc - DateTimeOffset.UtcNow;
@@ -281,6 +305,9 @@ public sealed class ExecutionSamplingRealApplicationAcceptanceTests
         }
     }
 
+    /// <summary>
+    /// 轮询当前可查询时间范围，直到目标已有足够采样数据或调用方取消。
+    /// </summary>
     private static async Task<MeasuredExecutionProfile> QueryAvailableProfileAsync(
         IProcessDiagnosticsSession session,
         ExecutionTimeRange range,
@@ -318,6 +345,9 @@ public sealed class ExecutionSamplingRealApplicationAcceptanceTests
         }
     }
 
+    /// <summary>
+    /// 将阶段性执行分析结果和持续时间写入验收证据。
+    /// </summary>
     private static void RecordProfile(
         ExecutionSamplingRunEvidence evidence,
         string phase,
@@ -346,6 +376,9 @@ public sealed class ExecutionSamplingRealApplicationAcceptanceTests
             IsConsistent(profile)));
     }
 
+    /// <summary>
+    /// 记录当前诊断进程与目标进程的资源观测，供人工判断附着影响。
+    /// </summary>
     private static void RecordResource(
         ExecutionSamplingRunEvidence evidence,
         Process diagnosticsProcess,
@@ -365,6 +398,9 @@ public sealed class ExecutionSamplingRealApplicationAcceptanceTests
             0));
     }
 
+    /// <summary>
+    /// 断言执行分析包含有效样本、调用树和一致的计数关系。
+    /// </summary>
     private static void AssertProfile(ExecutionProfile profile)
     {
         Assert.IsGreaterThan(profile.ReceivedSampleCount, 0L);
@@ -373,10 +409,16 @@ public sealed class ExecutionSamplingRealApplicationAcceptanceTests
         Assert.IsTrue(IsConsistent(profile), "Execution profile hotspot and call-tree counts must equal received samples.");
     }
 
+    /// <summary>
+    /// 检查热点与调用树的样本计数是否可由接收样本总数解释。
+    /// </summary>
     private static bool IsConsistent(ExecutionProfile profile) =>
         profile.Hotspots.Sum(static hotspot => hotspot.ExclusiveSampleCount) == profile.ReceivedSampleCount
         && profile.CallTreeRoots.Sum(static node => node.InclusiveSampleCount) == profile.ReceivedSampleCount;
 
+    /// <summary>
+    /// 验证不同验收阶段查询的时间范围不重叠，避免重复样本掩盖缓存或边界问题。
+    /// </summary>
     private static void AssertNonOverlapping(params ExecutionProfile[] profiles)
     {
         for (var index = 1; index < profiles.Length; index++)
@@ -388,6 +430,9 @@ public sealed class ExecutionSamplingRealApplicationAcceptanceTests
         }
     }
 
+    /// <summary>
+    /// 从热点与调用树收集可解析源码帧，并去重为验收报告中的源码命中列表。
+    /// </summary>
     private static ExecutionSamplingSourceHitEvidence[] CreateSourceHits(
         IEnumerable<ExecutionProfile> profiles,
         IReadOnlyList<ExecutionSamplingPdbEvidence> pdbs)
@@ -404,6 +449,9 @@ public sealed class ExecutionSamplingRealApplicationAcceptanceTests
             .ToArray();
     }
 
+    /// <summary>
+    /// 将带有效源码位置的执行帧转换为证据条目；缺少位置时不制造虚假命中。
+    /// </summary>
     private static ExecutionSamplingSourceHitEvidence? CreateSourceHit(
         ExecutionFrame frame,
         IReadOnlyList<ExecutionSamplingPdbEvidence> pdbs)
@@ -428,6 +476,9 @@ public sealed class ExecutionSamplingRealApplicationAcceptanceTests
                 pdb.Sha256);
     }
 
+    /// <summary>
+    /// 枚举热点和递归调用树中的所有帧，以覆盖两种结果视图中的源码归因。
+    /// </summary>
     private static IEnumerable<ExecutionFrame> EnumerateFrames(ExecutionProfile profile)
     {
         foreach (var hotspot in profile.Hotspots)
@@ -446,6 +497,9 @@ public sealed class ExecutionSamplingRealApplicationAcceptanceTests
         }
     }
 
+    /// <summary>
+    /// 根据真实应用验收的最小样本、源码命中和资源约束生成可报告的阈值结论。
+    /// </summary>
     private static void AddAcceptanceThresholds(
         ExecutionSamplingRunEvidence evidence,
         ExecutionProfile early,
@@ -464,6 +518,9 @@ public sealed class ExecutionSamplingRealApplicationAcceptanceTests
             IsConsistent(early) && IsConsistent(middle) && IsConsistent(late), "==", 1, 1, "boolean"));
     }
 
+    /// <summary>
+    /// 异步计算所有命中 PDB 的 SHA-256，记录符号文件与源码结果的可追溯关联。
+    /// </summary>
     private static async Task<IReadOnlyList<ExecutionSamplingPdbEvidence>> CollectPdbEvidenceAsync(
         string executablePath,
         CancellationToken cancellationToken)
@@ -483,6 +540,9 @@ public sealed class ExecutionSamplingRealApplicationAcceptanceTests
         return evidence;
     }
 
+    /// <summary>
+    /// 以异步顺序读取计算文件 SHA-256，避免在大 PDB 上阻塞测试线程。
+    /// </summary>
     private static async Task<string> ComputeSha256Async(string path, CancellationToken cancellationToken)
     {
         await using var stream = new FileStream(
@@ -496,6 +556,9 @@ public sealed class ExecutionSamplingRealApplicationAcceptanceTests
         return Convert.ToHexString(hash);
     }
 
+    /// <summary>
+    /// 收集验收主机、目标和执行采样配置的环境证据。
+    /// </summary>
     private static async Task<ExecutionSamplingEnvironmentEvidence> CreateEnvironmentEvidenceAsync(
         CancellationToken cancellationToken)
     {
@@ -515,6 +578,9 @@ public sealed class ExecutionSamplingRealApplicationAcceptanceTests
             Environment.ProcessorCount);
     }
 
+    /// <summary>
+    /// 自测试程序集目录向上查找仓库标识文件，用于稳定定位验收输出。
+    /// </summary>
     private static string FindRepositoryRoot()
     {
         for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
@@ -528,6 +594,9 @@ public sealed class ExecutionSamplingRealApplicationAcceptanceTests
         throw new DirectoryNotFoundException("Could not locate the DotnetAnalysis repository root.");
     }
 
+    /// <summary>
+    /// 运行只读环境探测子进程并返回其标准输出；非零退出码属于验收基础环境失败。
+    /// </summary>
     private static async Task<string> RunForOutputAsync(
         string fileName,
         IReadOnlyCollection<string> arguments,
@@ -564,6 +633,9 @@ public sealed class ExecutionSamplingRealApplicationAcceptanceTests
         return output;
     }
 
+    /// <summary>
+    /// 在测试清理时删除本测试创建的临时目录；目录已不存在时保持幂等。
+    /// </summary>
     private static void DeleteDirectoryIfPresent(string path)
     {
         if (Directory.Exists(path))
@@ -572,6 +644,9 @@ public sealed class ExecutionSamplingRealApplicationAcceptanceTests
         }
     }
 
+    /// <summary>
+    /// 将一次阶段性执行分析结果与其查询耗时绑定，供证据和阈值检查共用。
+    /// </summary>
     private sealed record MeasuredExecutionProfile(
         ExecutionProfile Profile,
         DateTimeOffset StartedAtUtc,

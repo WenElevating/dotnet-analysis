@@ -7,30 +7,48 @@ using Microsoft.Diagnostics.Tracing.Etlx;
 
 namespace DotnetAnalysis.Diagnostics.Windows;
 
+/// <summary>
+/// 表示已归一化到 UTC、可写入执行采样分段的一条样本。
+/// </summary>
 internal readonly record struct ExecutionSampleRecord(
     DateTimeOffset ObservedAtUtc,
     int ThreadId,
     int StackId);
 
+/// <summary>
+/// 表示一个调用栈在固定读取边界内累计得到的样本数。
+/// </summary>
 internal readonly record struct ExecutionStackSampleCount(
     int StackId,
     long SampleCount);
 
+/// <summary>
+/// 保存按首次出现顺序排列的调用栈计数及其总样本数。
+/// </summary>
 internal sealed record ExecutionStackSampleCounts(
     long ReceivedSampleCount,
     IReadOnlyList<ExecutionStackSampleCount> Stacks);
 
+/// <summary>
+/// 描述可跨样本去重的托管调用帧元数据。
+/// </summary>
 internal readonly record struct ExecutionFrameDescriptor(
     string MethodName,
     string? ModuleName,
     string? ModulePath,
     string SymbolKey);
 
+/// <summary>
+/// 将会话内帧标识关联到帧描述符和可选运行时符号地址。
+/// </summary>
 internal sealed record ExecutionFrameReference(
     int FrameId,
     ExecutionFrameDescriptor Descriptor,
     TraceCodeAddress? SymbolAddress);
 
+/// <summary>
+/// 冻结一次读取可见的全局水位和各分段完成边界，避免并发追加改变查询结果。
+/// </summary>
 internal sealed record ExecutionCaptureReadBoundary(
     DateTimeOffset StartedAtUtc,
     DateTimeOffset WrittenThroughUtc,
@@ -39,10 +57,16 @@ internal sealed record ExecutionCaptureReadBoundary(
     internal IReadOnlyList<ExecutionCaptureSegmentReadLimit> SegmentReadLimits { get; init; } = [];
 }
 
+/// <summary>
+/// 标识封存段及其完成记录数，用于判断历史范围缓存是否仍然有效。
+/// </summary>
 internal readonly record struct ExecutionCaptureSealedSegmentVersion(
     int SegmentNumber,
     long CompletedRecordCount);
 
+/// <summary>
+/// 描述查询范围依赖的封存段版本以及是否涉及仍会变化的活动段。
+/// </summary>
 internal sealed record ExecutionCaptureRangeDependency(
     bool HasActiveSegment,
     IReadOnlyList<ExecutionCaptureSealedSegmentVersion> SealedSegmentVersions)
@@ -263,6 +287,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         return ValueTask.CompletedTask;
     }
 
+    /// <summary>
+    /// 在取得写入闸门前拒绝无法编码的线程或调用栈标识。
+    /// </summary>
     private static void ValidateSample(ExecutionSampleRecord sample)
     {
         if (sample.ThreadId < 0)
@@ -276,6 +303,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 在没有测试边界钩子时同步持有写入闸门，保证记录写入和可见边界原子发布。
+    /// </summary>
     private void AppendSynchronously(ExecutionSampleRecord sample, CancellationToken cancellationToken)
     {
         _writer.Wait(cancellationToken);
@@ -298,6 +328,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 为并发边界测试在物理写入与逻辑发布之间插入异步钩子，生产语义仍保持原子发布。
+    /// </summary>
     private async Task AppendWithBoundaryHookAsync(
         ExecutionSampleRecord sample,
         CancellationToken cancellationToken)
@@ -323,6 +356,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 将样本编码到适当分段；在分段容量达到上限时先封存旧段再创建新段。
+    /// </summary>
     private PendingExecutionSampleAppend WriteSample(ExecutionSampleRecord sample)
     {
         ThrowIfDisposing();
@@ -365,6 +401,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 在状态锁内发布已落盘记录，并同步推进读取水位与封存摘要所需的聚合状态。
+    /// </summary>
     private void PublishAppend(PendingExecutionSampleAppend pendingAppend)
     {
         lock (_stateLock)
@@ -391,6 +430,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 将首个不可恢复写入故障固定为会话状态，避免后续读取或追加观察到不一致的存储。
+    /// </summary>
     private DiagnosticsException RecordWriteFailure(Exception exception)
     {
         var storageException = exception as DiagnosticsException
@@ -527,6 +569,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 判断查询范围是否完整覆盖封存段，从而可以直接合并其摘要而无需逐条解码。
+    /// </summary>
     private static bool IsFullyContainedSealedSegment(
         ExecutionCaptureSegmentReadLimit segment,
         ExecutionTimeRange range) =>
@@ -534,6 +579,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         && segment.StartedAtUtc >= range.StartAtUtc
         && segment.EndedAtUtc < range.EndAtUtc;
 
+    /// <summary>
+    /// 将一个分段摘要合并到查询累加器，并校验摘要总数没有与分项计数脱节。
+    /// </summary>
     private static void MergeStackSampleCounts(
         ExecutionStackSampleCounts source,
         Dictionary<int, long> countsByStackId,
@@ -557,6 +605,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 合并单个调用栈计数，同时保留调用栈首次进入查询范围的稳定排序。
+    /// </summary>
     private static void MergeStackSampleCount(
         ExecutionStackSampleCount source,
         Dictionary<int, long> countsByStackId,
@@ -611,6 +662,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
             useIncrementalSummaries: true,
             cancellationToken).ConfigureAwait(false);
 
+    /// <summary>
+    /// 在登记读取生命周期内统一执行全量或增量计数；完整封存段可使用摘要，边界段必须逐条读取。
+    /// </summary>
     private async Task<ExecutionStackSampleCounts> ReadStackSampleCountsCoreAsync(
         ExecutionTimeRange range,
         ExecutionCaptureReadBoundary boundary,
@@ -714,6 +768,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 等待写入和已登记读取收敛后封存最后分段、关闭流并删除会话私有目录。
+    /// </summary>
     private async Task DisposeCoreAsync(Task readersDrained)
     {
         try
@@ -758,6 +815,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 创建带格式头的新分段，并把它注册为后续追加的活动分段。
+    /// </summary>
     private ExecutionCaptureSegment CreateSegment(DateTimeOffset anchorUtc)
     {
         try
@@ -790,6 +850,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 将已满或会话结束的分段刷盘、写入摘要，并只在摘要持久化成功后释放重复的内存聚合状态。
+    /// </summary>
     private void SealSegment(ExecutionCaptureSegment segment)
     {
         if (segment.IsSealed)
@@ -804,6 +867,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         segment.IsSealed = true;
     }
 
+    /// <summary>
+    /// 将封存段内按首次出现顺序聚合的调用栈计数写为可校验的持久化摘要。
+    /// </summary>
     private static void WriteSegmentSummary(ExecutionCaptureSegment segment)
     {
         try
@@ -840,6 +906,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 读取并严格校验封存段摘要；在分配条目数组前先验证声明长度与文件剩余字节完全一致。
+    /// </summary>
     private static async Task<ExecutionStackSampleCounts> ReadSegmentSummaryAsync(
         string summaryPath,
         long expectedRecordCount,
@@ -908,6 +977,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 在分段流锁内写入已编码记录，并将底层 I/O 故障转换为稳定存储错误。
+    /// </summary>
     private static void WriteRecord(FileStream stream, ReadOnlySpan<byte> record)
     {
         try
@@ -923,6 +995,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 将分段已写入字节提交给读取边界；测试钩子在实际刷新前用于构造故障场景。
+    /// </summary>
     private void FlushSegment(ExecutionCaptureSegment segment)
     {
         try
@@ -941,6 +1016,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 回写分段固定头中的时间范围、完成记录数和数据长度，使后续读者可验证边界。
+    /// </summary>
     private static void WriteSegmentHeader(ExecutionCaptureSegment segment)
     {
         try
@@ -964,6 +1042,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 以异步顺序读取方式打开分段，并统一映射文件访问失败。
+    /// </summary>
     private static FileStream OpenSegmentForRead(string path)
     {
         try
@@ -982,6 +1063,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 读取并验证分段固定头，拒绝格式版本、长度或时间边界不可信的存储。
+    /// </summary>
     private static async Task<ExecutionCaptureSegmentHeader> ReadSegmentHeaderAsync(FileStream stream, CancellationToken cancellationToken)
     {
         try
@@ -1012,6 +1096,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 从分段字节流解码一条相对时间戳记录，并验证其线程索引和数值边界。
+    /// </summary>
     private static ExecutionSampleRecord ReadRecord(
         ExecutionCaptureSegmentReader reader,
         DateTimeOffset previousObservedAtUtc,
@@ -1039,6 +1126,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 从冻结读取边界筛选与半开查询区间相交的分段，并先验证边界自身完整性。
+    /// </summary>
     private static IEnumerable<ExecutionCaptureSegmentReadLimit> GetIntersectingSegments(
         ExecutionTimeRange range,
         ExecutionCaptureReadBoundary boundary)
@@ -1055,6 +1145,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
             && segment.StartedAtUtc < range.EndAtUtc);
     }
 
+    /// <summary>
+    /// 登记一个读取者，阻止处置开始后出现新读取，并让处置流程能够等待既有读取完成。
+    /// </summary>
     private void EnterReader(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -1065,6 +1158,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 注销读取者；最后一个读取者退出时唤醒正在等待清理的处置流程。
+    /// </summary>
     private void ExitReader()
     {
         TaskCompletionSource? readersDrained = null;
@@ -1080,6 +1176,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         readersDrained?.TrySetResult();
     }
 
+    /// <summary>
+    /// 在状态锁保护下拒绝处置已开始的写入路径。
+    /// </summary>
     private void ThrowIfDisposing()
     {
         lock (_stateLock)
@@ -1088,6 +1187,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 传播已固定的首个写入失败，避免继续向可能不一致的存储写入。
+    /// </summary>
     private void ThrowIfWriteFailed()
     {
         lock (_stateLock)
@@ -1099,11 +1201,17 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 要求调用方已持有状态锁时检查处置状态。
+    /// </summary>
     private void ThrowIfDisposingLocked()
     {
         ObjectDisposedException.ThrowIf(_disposeStarted, this);
     }
 
+    /// <summary>
+    /// 为运行时线程标识分配紧凑、会话内稳定的编码索引。
+    /// </summary>
     private int GetOrAddThreadIndex(int threadId)
     {
         lock (_stateLock)
@@ -1121,6 +1229,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 复制线程索引表，保证读取者不会枚举到并发追加正在修改的集合。
+    /// </summary>
     private int[] GetThreadIdsSnapshot()
     {
         lock (_stateLock)
@@ -1129,6 +1240,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 将时间差、调用栈标识和线程索引编码到调用方租用的紧凑缓冲区。
+    /// </summary>
     private static int EncodeRecord(
         ExecutionSampleRecord sample,
         DateTimeOffset anchorUtc,
@@ -1142,12 +1256,18 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         return offset;
     }
 
+    /// <summary>
+    /// 使用 ZigZag 加无符号 7 位变长编码写入有符号时间差。
+    /// </summary>
     private static void WriteSigned7Bit(Span<byte> destination, ref int offset, long value)
     {
         var encoded = unchecked((ulong)((value << 1) ^ (value >> 63)));
         WriteUnsigned7Bit(destination, ref offset, encoded);
     }
 
+    /// <summary>
+    /// 将无符号值以 7 位变长格式写入目标缓冲区并推进偏移量。
+    /// </summary>
     private static void WriteUnsigned7Bit(Span<byte> destination, ref int offset, ulong value)
     {
         while (value >= 0x80)
@@ -1159,6 +1279,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         destination[offset++] = (byte)value;
     }
 
+    /// <summary>
+    /// 读取无符号 7 位编码并还原 ZigZag 表示的有符号时间差。
+    /// </summary>
     private static long ReadSigned7Bit(ExecutionCaptureSegmentReader reader)
     {
         var encoded = ReadUnsigned7Bit(reader);
@@ -1166,6 +1289,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         return (encoded & 1) == 0 ? value : ~value;
     }
 
+    /// <summary>
+    /// 读取非负变长标识，并拒绝超过 <see cref="int.MaxValue"/> 的编码值。
+    /// </summary>
     private static int ReadInt32(ExecutionCaptureSegmentReader reader)
     {
         var value = ReadUnsigned7Bit(reader);
@@ -1177,6 +1303,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         return (int)value;
     }
 
+    /// <summary>
+    /// 从受完成字节边界约束的读者读取无符号 7 位变长值，并检测溢出和过长编码。
+    /// </summary>
     private static ulong ReadUnsigned7Bit(ExecutionCaptureSegmentReader reader)
     {
         ulong value = 0;
@@ -1198,21 +1327,42 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         throw new InvalidDataException("Execution capture variable-length integer is too long.");
     }
 
+    /// <summary>
+    /// 返回两个 UTC 时间点中较早的值，用于扩展分段的观测下界。
+    /// </summary>
     private static DateTimeOffset Min(DateTimeOffset first, DateTimeOffset second) => first <= second ? first : second;
 
+    /// <summary>
+    /// 返回两个 UTC 时间点中较晚的值，用于推进分段或会话的观测上界。
+    /// </summary>
     private static DateTimeOffset Max(DateTimeOffset first, DateTimeOffset second) => first >= second ? first : second;
 
+    /// <summary>
+    /// 取得规范化 UTC 刻度，确保分段持久化和增量时间差不受原始偏移影响。
+    /// </summary>
     private static long UtcTicks(DateTimeOffset value) => value.UtcDateTime.Ticks;
 
+    /// <summary>
+    /// 携带已经写入但尚未发布到读取边界的记录元数据。
+    /// </summary>
     private readonly record struct PendingExecutionSampleAppend(
         ExecutionCaptureSegment Segment,
         ExecutionSampleRecord Sample,
         int RecordLength);
 
+    /// <summary>
+    /// 用父调用栈与当前帧组成调用树节点的去重键。
+    /// </summary>
     private readonly record struct ExecutionStackKey(int ParentStackId, int FrameId);
 
+    /// <summary>
+    /// 保存一个物理分段的流、已发布边界和封存前的摘要聚合状态。
+    /// </summary>
     private sealed class ExecutionCaptureSegment
     {
+        /// <summary>
+        /// 以首条样本时间初始化新分段的路径、时间锚点和空边界。
+        /// </summary>
         public ExecutionCaptureSegment(
             int number,
             string path,
@@ -1255,6 +1405,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         public FileStream Stream { get; set; } = null!;
     }
 
+    /// <summary>
+    /// 在不越过固定完成字节边界的前提下，为变长记录提供带缓冲的异步分段读取。
+    /// </summary>
     private sealed class ExecutionCaptureSegmentReader
     {
         private readonly FileStream _stream;
@@ -1262,6 +1415,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
         private int _bufferOffset;
         private int _bufferLength;
 
+        /// <summary>
+        /// 绑定分段流与调用方固定的可读取字节数，禁止读取并发追加的后续数据。
+        /// </summary>
         public ExecutionCaptureSegmentReader(FileStream stream, long remainingBytes)
         {
             _stream = stream;
@@ -1270,6 +1426,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
 
         public long RemainingBytes { get; private set; }
 
+        /// <summary>
+        /// 确保缓冲区包含一个最大编码记录所需的前导字节，或在固定边界前报告截断。
+        /// </summary>
         public ValueTask EnsureRecordDataAsync(CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -1289,6 +1448,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
             return FillBufferAsync(requiredByteCount, cancellationToken);
         }
 
+        /// <summary>
+        /// 读取并消费一个已缓冲字节，同时推进固定完成边界的剩余计数。
+        /// </summary>
         public byte ReadByte()
         {
             if (RemainingBytes == 0 || _bufferOffset == _bufferLength)
@@ -1300,6 +1462,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
             return _buffer[_bufferOffset++];
         }
 
+        /// <summary>
+        /// 保留未消费前缀后异步补齐缓冲区，且绝不向流请求超过已发布边界的字节。
+        /// </summary>
         private async ValueTask FillBufferAsync(int requiredByteCount, CancellationToken cancellationToken)
         {
             try
@@ -1341,6 +1506,9 @@ internal sealed class ExecutionCaptureStore : IAsyncDisposable
     }
 }
 
+/// <summary>
+/// 描述一次冻结读取可见的单个分段路径、时间范围、完成边界和封存状态。
+/// </summary>
 internal sealed record ExecutionCaptureSegmentReadLimit(
     int SegmentNumber,
     string Path,
@@ -1351,6 +1519,9 @@ internal sealed record ExecutionCaptureSegmentReadLimit(
     long RecordCount,
     bool IsSealed);
 
+/// <summary>
+/// 表示从物理分段固定头解析出的锚点、时间范围和完成数据边界。
+/// </summary>
 internal sealed record ExecutionCaptureSegmentHeader(
     DateTimeOffset AnchorUtc,
     DateTimeOffset StartedAtUtc,

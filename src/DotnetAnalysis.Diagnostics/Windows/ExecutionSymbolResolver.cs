@@ -7,6 +7,9 @@ using CoreSourceLocation = DotnetAnalysis.Core.Diagnostics.SourceLocation;
 
 namespace DotnetAnalysis.Diagnostics.Windows;
 
+/// <summary>
+/// 说明本地 PDB 源码位置查找的确定结果，供调用方记录而不把普通不可用状态当作异常。
+/// </summary>
 internal enum ExecutionSourceLocationLookupStatus
 {
     Found,
@@ -16,57 +19,108 @@ internal enum ExecutionSourceLocationLookupStatus
     SourceUnavailable
 }
 
+/// <summary>
+/// 携带本地符号查找状态及找到时的构建路径、行号和列号。
+/// </summary>
 internal sealed record ExecutionSourceLocationLookupResult(
     ExecutionSourceLocationLookupStatus Status,
     string? BuildTimeFilePath,
     int LineNumber,
     int ColumnNumber);
 
+/// <summary>
+/// 抽象从执行帧解析源码位置的策略，便于替换符号实现和构造故障测试。
+/// </summary>
 internal interface IExecutionSourceLocationLookup
 {
+    /// <summary>
+    /// 查找给定执行帧的本地源码位置或返回确定的不可用状态。
+    /// </summary>
     ExecutionSourceLocationLookupResult Lookup(ExecutionFrameReference frame);
 }
 
+/// <summary>
+/// 描述模块嵌入的 PDB 标识，用于拒绝名称相同但签名或年龄不匹配的符号文件。
+/// </summary>
 internal sealed record ExecutionModuleSymbolIdentity(
     string? PdbName,
     Guid PdbSignature,
     int PdbAge,
     string? FileVersion);
 
+/// <summary>
+/// 表示符号读取器返回的构建时源码路径和可选列位置。
+/// </summary>
 internal sealed record ExecutionSourceLine(
     string? BuildTimeFilePath,
     int LineNumber,
     int ColumnNumber);
 
+/// <summary>
+/// 从运行时符号地址提取模块 PDB 标识，隔离 TraceEvent 类型。
+/// </summary>
 internal interface IExecutionSymbolAddressInspector
 {
+    /// <summary>
+    /// 返回帧所属模块声明的 PDB 标识；缺少运行时符号地址时返回空值。
+    /// </summary>
     ExecutionModuleSymbolIdentity? GetModuleIdentity(ExecutionFrameReference frame);
 }
 
+/// <summary>
+/// 抽象本地路径和文件检查，使符号解析可拒绝非本地路径并可确定性测试。
+/// </summary>
 internal interface IExecutionLocalFileSystem
 {
+    /// <summary>
+    /// 读取路径根所在驱动器类型，用于区分本地与网络或设备路径。
+    /// </summary>
     DriveType GetDriveType(string pathRoot);
 
+    /// <summary>
+    /// 检查受路径策略限制的本地文件是否存在。
+    /// </summary>
     bool FileExists(string path);
 }
 
+/// <summary>
+/// 创建仅允许访问指定模块目录的符号读取器。
+/// </summary>
 internal interface IExecutionSymbolReaderFactory
 {
+    /// <summary>
+    /// 为指定模块目录创建仅接受安全检查允许路径的符号读取器。
+    /// </summary>
     IExecutionSymbolReader Create(string moduleDirectory, Func<string, bool> securityCheck);
 }
 
+/// <summary>
+/// 定义匹配 PDB 与读取执行帧源码行所需的最小符号读取能力。
+/// </summary>
 internal interface IExecutionSymbolReader : IDisposable
 {
+    /// <summary>
+    /// 按模块完整 PDB 标识返回候选符号文件路径。
+    /// </summary>
     string? FindSymbolFilePath(
         string pdbFileName,
         ExecutionModuleSymbolIdentity moduleIdentity,
         string modulePath);
 
+    /// <summary>
+    /// 读取执行帧对应的构建时源码行；缺少源码映射时返回空值。
+    /// </summary>
     ExecutionSourceLine? GetSourceLine(ExecutionFrameReference frame);
 }
 
+/// <summary>
+/// 使用 TraceEvent 的模块元数据提取运行时帧所声明的 PDB 标识。
+/// </summary>
 internal sealed class TraceEventExecutionSymbolAddressInspector : IExecutionSymbolAddressInspector
 {
+    /// <summary>
+    /// 从 TraceEvent 模块文件提取 PDB 名称、签名、年龄和文件版本。
+    /// </summary>
     public ExecutionModuleSymbolIdentity? GetModuleIdentity(ExecutionFrameReference frame)
     {
         var moduleFile = frame.SymbolAddress?.ModuleFile;
@@ -80,21 +134,39 @@ internal sealed class TraceEventExecutionSymbolAddressInspector : IExecutionSymb
     }
 }
 
+/// <summary>
+/// 以系统文件 API 实现本地驱动器类型和文件存在性检查。
+/// </summary>
 internal sealed class SystemExecutionLocalFileSystem : IExecutionLocalFileSystem
 {
+    /// <summary>
+    /// 返回指定本地路径根的驱动器类型。
+    /// </summary>
     public DriveType GetDriveType(string pathRoot) => new DriveInfo(pathRoot).DriveType;
 
+    /// <summary>
+    /// 使用系统文件 API 检查文件存在性。
+    /// </summary>
     public bool FileExists(string path) => File.Exists(path);
 }
 
+/// <summary>
+/// 创建配置为本地缓存模式、禁用符号下载的 TraceEvent 符号读取器。
+/// </summary>
 internal sealed class TraceEventExecutionSymbolReaderFactory : IExecutionSymbolReaderFactory
 {
+    /// <summary>
+    /// 为模块目录创建带路径安全回调的读取器，并封装为诊断层内部契约。
+    /// </summary>
     public IExecutionSymbolReader Create(string moduleDirectory, Func<string, bool> securityCheck)
     {
         var reader = CreateConfiguredReader(moduleDirectory, securityCheck);
         return new TraceEventExecutionSymbolReader(reader);
     }
 
+    /// <summary>
+    /// 配置 TraceEvent 读取器为仅查找本地缓存，禁止生成 NGen 符号或探测远程符号源。
+    /// </summary>
     internal static SymbolReader CreateConfiguredReader(
         string moduleDirectory,
         Func<string, bool> securityCheck)
@@ -110,15 +182,24 @@ internal sealed class TraceEventExecutionSymbolReaderFactory : IExecutionSymbolR
         };
     }
 
+    /// <summary>
+    /// 将 TraceEvent 的 <see cref="SymbolReader"/> 适配为仅暴露本项目需要的符号读取操作。
+    /// </summary>
     private sealed class TraceEventExecutionSymbolReader : IExecutionSymbolReader
     {
         private readonly SymbolReader _reader;
 
+        /// <summary>
+        /// 包装已按本地安全策略配置的 TraceEvent 符号读取器。
+        /// </summary>
         public TraceEventExecutionSymbolReader(SymbolReader reader)
         {
             _reader = reader;
         }
 
+        /// <summary>
+        /// 根据模块完整 PDB 标识查找匹配符号文件，而不是仅按文件名接受候选文件。
+        /// </summary>
         public string? FindSymbolFilePath(
             string pdbFileName,
             ExecutionModuleSymbolIdentity moduleIdentity,
@@ -131,6 +212,9 @@ internal sealed class TraceEventExecutionSymbolReaderFactory : IExecutionSymbolR
                 moduleIdentity.FileVersion,
                 portablePdbMatch: true);
 
+        /// <summary>
+        /// 将 TraceEvent 源码行投影为不泄漏 SDK 类型的内部值对象。
+        /// </summary>
         public ExecutionSourceLine? GetSourceLine(ExecutionFrameReference frame)
         {
             TraceCodeAddress? symbolAddress = frame.SymbolAddress;
@@ -143,19 +227,31 @@ internal sealed class TraceEventExecutionSymbolReaderFactory : IExecutionSymbolR
                     sourceLocation.ColumnNumber);
         }
 
+        /// <summary>
+        /// 释放底层符号读取器及其本地文件句柄。
+        /// </summary>
         public void Dispose() => _reader.Dispose();
     }
 }
 
+/// <summary>
+/// 统一限制符号与源码解析只能访问本机本地卷上的完整路径，避免网络或设备路径触发非预期 I/O。
+/// </summary>
 internal sealed class ExecutionLocalPathPolicy
 {
     private readonly IExecutionLocalFileSystem _fileSystem;
 
+    /// <summary>
+    /// 使用可替换的文件系统边界创建路径策略。
+    /// </summary>
     public ExecutionLocalPathPolicy(IExecutionLocalFileSystem fileSystem)
     {
         _fileSystem = fileSystem ?? throw new ArgumentNullException(nameof(fileSystem));
     }
 
+    /// <summary>
+    /// 仅当路径是已规范化的本机本地卷绝对路径时返回其完整形式；UNC、设备和远程卷一律拒绝。
+    /// </summary>
     public bool TryGetLocalFullPath(string? path, out string fullPath)
     {
         fullPath = string.Empty;
@@ -200,6 +296,9 @@ internal sealed class ExecutionLocalPathPolicy
         }
     }
 
+    /// <summary>
+    /// 在通过本地路径策略后检查文件存在性，并将文件系统访问失败安全降级为不可用。
+    /// </summary>
     public bool TryGetExistingLocalFile(string? path, out string fullPath)
     {
         if (!TryGetLocalFullPath(path, out fullPath))
@@ -314,6 +413,9 @@ internal sealed class ExecutionSymbolResolver : IAsyncDisposable
         _sourceLocations.Clear();
     }
 
+    /// <summary>
+    /// 在线程池执行单帧解析并总是完成共享任务，使一个调用方的异常不会遗留等待者。
+    /// </summary>
     private async Task ResolveAndCompleteAsync(
         ExecutionFrameReference frame,
         TaskCompletionSource<CoreSourceLocation?> completion)
@@ -335,6 +437,9 @@ internal sealed class ExecutionSymbolResolver : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 根据本地 PDB 查找结果生成领域源码位置；普通不可用和解析异常均返回空值并记录诊断。
+    /// </summary>
     private CoreSourceLocation? ResolveCore(ExecutionFrameReference frame)
     {
         try
@@ -364,6 +469,9 @@ internal sealed class ExecutionSymbolResolver : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 尽力记录正常的源码不可用原因，日志实现异常不得影响执行分析。
+    /// </summary>
     private void LogSourceUnavailable(int frameId, ExecutionSourceLocationLookupStatus status)
     {
         try
@@ -375,6 +483,9 @@ internal sealed class ExecutionSymbolResolver : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 尽力记录意外的符号解析故障，日志异常不得打破共享单飞任务。
+    /// </summary>
     private void LogResolutionFailure(int frameId, Exception exception)
     {
         try
@@ -386,6 +497,9 @@ internal sealed class ExecutionSymbolResolver : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 仅使用模块同目录、PDB 标识精确匹配的本地符号文件解析源码，并按模块目录复用读取器。
+    /// </summary>
     private sealed class LocalPdbSourceLocationLookup : IExecutionSourceLocationLookup, IDisposable
     {
         private readonly object _readersLock = new();
@@ -395,6 +509,9 @@ internal sealed class ExecutionSymbolResolver : IAsyncDisposable
         private readonly Dictionary<string, SymbolReaderLease> _readers = new(StringComparer.OrdinalIgnoreCase);
         private bool _disposed;
 
+        /// <summary>
+        /// 组合路径策略、读取器工厂与模块标识检查器，所有依赖均可替换以覆盖安全边界。
+        /// </summary>
         public LocalPdbSourceLocationLookup(
             ExecutionLocalPathPolicy localPathPolicy,
             IExecutionSymbolReaderFactory symbolReaderFactory,
@@ -405,6 +522,9 @@ internal sealed class ExecutionSymbolResolver : IAsyncDisposable
             _symbolAddressInspector = symbolAddressInspector;
         }
 
+        /// <summary>
+        /// 验证模块和 PDB 均为本地且精确匹配后，读取帧的构建时源码位置。
+        /// </summary>
         public ExecutionSourceLocationLookupResult Lookup(ExecutionFrameReference frame)
         {
             var modulePath = frame.Descriptor.ModulePath;
@@ -469,6 +589,9 @@ internal sealed class ExecutionSymbolResolver : IAsyncDisposable
             }
         }
 
+        /// <summary>
+        /// 停止创建新读取器并释放所有按模块目录缓存的符号读取器。
+        /// </summary>
         public void Dispose()
         {
             SymbolReaderLease[] readers;
@@ -490,6 +613,9 @@ internal sealed class ExecutionSymbolResolver : IAsyncDisposable
             }
         }
 
+        /// <summary>
+        /// 获取模块目录唯一读取器；创建时将读取器安全检查限制为同一目录。
+        /// </summary>
         private SymbolReaderLease GetOrAddReader(string moduleDirectory)
         {
             lock (_readersLock)
@@ -509,6 +635,9 @@ internal sealed class ExecutionSymbolResolver : IAsyncDisposable
             }
         }
 
+        /// <summary>
+        /// 判断符号读取器请求的路径是否经本地化后仍恰好位于允许模块目录内。
+        /// </summary>
         private bool IsFileInDirectory(string path, string directory)
         {
             if (!_localPathPolicy.TryGetLocalFullPath(path, out var fullPath))
@@ -520,10 +649,16 @@ internal sealed class ExecutionSymbolResolver : IAsyncDisposable
             return string.Equals(containingDirectory, directory, StringComparison.OrdinalIgnoreCase);
         }
 
+        /// <summary>
+        /// 为普通本地符号不可用情况创建无路径、零坐标的确定性结果。
+        /// </summary>
         private static ExecutionSourceLocationLookupResult Unavailable(
             ExecutionSourceLocationLookupStatus status) =>
             new(status, null, LineNumber: 0, ColumnNumber: 0);
 
+        /// <summary>
+        /// 将目录缓存的读取器与其串行访问锁绑定，避免 SymbolReader 并发读取竞态。
+        /// </summary>
         private sealed record SymbolReaderLease(IExecutionSymbolReader Reader)
         {
             public object SyncRoot { get; } = new();

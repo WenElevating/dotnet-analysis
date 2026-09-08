@@ -12,6 +12,9 @@ using Microsoft.Diagnostics.Tracing.Parsers.Clr;
 
 namespace DotnetAnalysis.Diagnostics.Windows;
 
+/// <summary>
+/// 抽象 EventPipe 执行采样器的启动、停止、统计和异步释放边界。
+/// </summary>
 internal interface IEventPipeExecutionSampler : IAsyncDisposable
 {
     long SuccessfulSampleCount { get; }
@@ -25,6 +28,9 @@ internal interface IEventPipeExecutionSampler : IAsyncDisposable
     Task StopAsync(CancellationToken cancellationToken);
 }
 
+/// <summary>
+/// 表示 Sample Profiler 回调中的单个调用帧及其可选符号地址。
+/// </summary>
 internal readonly record struct EventPipeExecutionFrame(
     string? MethodName,
     string? ModuleName,
@@ -32,11 +38,17 @@ internal readonly record struct EventPipeExecutionFrame(
     string SymbolKey,
     TraceCodeAddress? SymbolAddress);
 
+/// <summary>
+/// 表示一次 Sample Profiler 线程样本及其叶到根调用帧序列。
+/// </summary>
 internal readonly record struct EventPipeExecutionSample(
     DateTimeOffset ObservedAtUtc,
     int ThreadId,
     IReadOnlyList<EventPipeExecutionFrame> LeafToRootFrames);
 
+/// <summary>
+/// 隔离 DiagnosticsClient 与 TraceEvent 创建细节，使采样生命周期可独立测试。
+/// </summary>
 internal interface IEventPipeExecutionRuntime
 {
     IEventPipeExecutionSession StartSession(
@@ -48,11 +60,17 @@ internal interface IEventPipeExecutionRuntime
     IEventPipeExecutionTraceSource CreateTraceSource(IEventPipeExecutionSession session);
 }
 
+/// <summary>
+/// 表示可被停止和释放的底层 EventPipe 会话。
+/// </summary>
 internal interface IEventPipeExecutionSession : IDisposable
 {
     void Stop();
 }
 
+/// <summary>
+/// 表示可订阅 Sample Profiler 事件并控制处理循环的 TraceEvent 数据源。
+/// </summary>
 internal interface IEventPipeExecutionTraceSource : IDisposable
 {
     long EventsLost { get; }
@@ -64,6 +82,9 @@ internal interface IEventPipeExecutionTraceSource : IDisposable
     void StopProcessing();
 }
 
+/// <summary>
+/// 使用 DiagnosticsClient 和 TraceEvent 提供生产环境 EventPipe 会话与事件源。
+/// </summary>
 internal sealed class DiagnosticsClientExecutionSamplingRuntime : IEventPipeExecutionRuntime
 {
     public IEventPipeExecutionSession StartSession(
@@ -80,6 +101,9 @@ internal sealed class DiagnosticsClientExecutionSamplingRuntime : IEventPipeExec
         return new DiagnosticsClientExecutionSamplingSession(client, session);
     }
 
+    /// <summary>
+    /// 仅接受本运行时创建的会话，并为它创建可订阅执行样本的 TraceEvent 适配器。
+    /// </summary>
     public IEventPipeExecutionTraceSource CreateTraceSource(IEventPipeExecutionSession session)
     {
         if (session is not DiagnosticsClientExecutionSamplingSession diagnosticsSession)
@@ -93,8 +117,14 @@ internal sealed class DiagnosticsClientExecutionSamplingRuntime : IEventPipeExec
         return new TraceEventExecutionTraceSource(source);
     }
 
+    /// <summary>
+    /// 绑定 DiagnosticsClient 与其创建的 EventPipeSession，确保会话停止和释放使用同一所有权边界。
+    /// </summary>
     private sealed class DiagnosticsClientExecutionSamplingSession : IEventPipeExecutionSession
     {
+        /// <summary>
+        /// 保存创建会话所需的诊断客户端和已启动的 EventPipe 会话。
+        /// </summary>
         public DiagnosticsClientExecutionSamplingSession(DiagnosticsClient client, EventPipeSession session)
         {
             Client = client;
@@ -105,11 +135,20 @@ internal sealed class DiagnosticsClientExecutionSamplingRuntime : IEventPipeExec
 
         public EventPipeSession Session { get; }
 
+        /// <summary>
+        /// 请求底层 EventPipe 停止产生新事件。
+        /// </summary>
         public void Stop() => Session.Stop();
 
+        /// <summary>
+        /// 释放底层 EventPipe 会话资源。
+        /// </summary>
         public void Dispose() => Session.Dispose();
     }
 
+    /// <summary>
+    /// 将 TraceLogEventSource 适配为仅暴露执行采样所需的订阅和处理能力。
+    /// </summary>
     internal sealed class TraceEventExecutionTraceSource : IEventPipeExecutionTraceSource
     {
         private readonly TraceLogEventSource _source;
@@ -117,6 +156,9 @@ internal sealed class DiagnosticsClientExecutionSamplingRuntime : IEventPipeExec
         private SampleProfilerTraceEventParser? _sampleProfiler;
         private Action<EventPipeExecutionSample>? _sampleObserved;
 
+        /// <summary>
+        /// 使用指定 TraceEvent 源初始化可复用的调用帧缓冲区。
+        /// </summary>
         public TraceEventExecutionTraceSource(TraceLogEventSource source)
         {
             _source = source;
@@ -124,6 +166,9 @@ internal sealed class DiagnosticsClientExecutionSamplingRuntime : IEventPipeExec
 
         public long EventsLost => _source.EventsLost;
 
+        /// <summary>
+        /// 注册唯一的 Sample Profiler 回调，防止重复订阅导致同一采样被重复持久化。
+        /// </summary>
         public void SubscribeSampleProfilerThreadSample(Action<EventPipeExecutionSample> sampleObserved)
         {
             ArgumentNullException.ThrowIfNull(sampleObserved);
@@ -137,10 +182,19 @@ internal sealed class DiagnosticsClientExecutionSamplingRuntime : IEventPipeExec
             _sampleProfiler.ThreadSample += OnThreadSample;
         }
 
+        /// <summary>
+        /// 在当前线程处理 TraceEvent 流，直到停止或流结束。
+        /// </summary>
         public void Process() => _source.Process();
 
+        /// <summary>
+        /// 请求当前 TraceEvent 处理循环退出。
+        /// </summary>
         public void StopProcessing() => _source.StopProcessing();
 
+        /// <summary>
+        /// 取消回调订阅并释放 TraceEvent 源，断开对采样器和调用帧缓冲区的引用。
+        /// </summary>
         public void Dispose()
         {
             if (_sampleProfiler is not null)
@@ -153,6 +207,9 @@ internal sealed class DiagnosticsClientExecutionSamplingRuntime : IEventPipeExec
             _source.Dispose();
         }
 
+        /// <summary>
+        /// 将 TraceEvent 调用栈转换为叶到根帧序列，跳过缺少可识别方法名的帧后通知采样器。
+        /// </summary>
         private void OnThreadSample(ClrThreadSampleTraceData data)
         {
             _leafToRootFrames.Clear();
@@ -213,6 +270,9 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
     {
     }
 
+    /// <summary>
+    /// 为测试或组合根注入运行时适配器和处理器排空时限。
+    /// </summary>
     internal EventPipeExecutionSampler(
         ExecutionCaptureStore store,
         IEventPipeExecutionRuntime runtime,
@@ -307,6 +367,9 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// 创建 Sample Profiler 与 CLR JIT 符号提供程序，后者为后续本地源码解析保留符号元数据。
+    /// </summary>
     internal static EventPipeProvider[] CreateDefaultProviders() =>
     [
         new EventPipeProvider(
@@ -353,6 +416,9 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
         }
     }
 
+    /// <summary>
+    /// 即使停止或处理循环故障也按顺序停止输入、终止处理、释放 EventPipe 资源并保留首个异常。
+    /// </summary>
     private async Task DisposeCoreAsync()
     {
         await Task.Yield();
@@ -415,6 +481,9 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
         failure?.Throw();
     }
 
+    /// <summary>
+    /// 请求 EventPipe 停止并在受限时间内等待处理器排空；超时后强制停止事件源处理。
+    /// </summary>
     private async Task StopCoreAsync()
     {
         Task? processing;
@@ -464,6 +533,9 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
         }
     }
 
+    /// <summary>
+    /// 接收单个运行时样本，遇到不可恢复存储或处理故障时固定失败并请求停止输入。
+    /// </summary>
     private void OnThreadSample(EventPipeExecutionSample data)
     {
         if (TerminalFailure is not null || data.ThreadId < 0)
@@ -501,6 +573,9 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
         }
     }
 
+    /// <summary>
+    /// 将叶到根帧反转为根到叶的去重调用栈，并把有效样本提交到会话存储。
+    /// </summary>
     private void StoreSample(EventPipeExecutionSample data)
     {
         var parentStackId = -1;
@@ -538,6 +613,9 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
         Interlocked.Increment(ref _successfulSampleCount);
     }
 
+    /// <summary>
+    /// 在 EventPipe 同步回调中完成值任务；已完成路径避免分配，未完成路径仅等待必要的持久化操作。
+    /// </summary>
     private static T GetValueTaskResult<T>(ValueTask<T> operation)
     {
         if (operation.IsCompletedSuccessfully)
@@ -548,6 +626,9 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
         return operation.AsTask().GetAwaiter().GetResult();
     }
 
+    /// <summary>
+    /// 在 EventPipe 同步回调中完成无结果值任务，同时保留调用方异常语义。
+    /// </summary>
     private static void CompleteValueTask(ValueTask operation)
     {
         if (operation.IsCompletedSuccessfully)
@@ -559,6 +640,9 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
         operation.AsTask().GetAwaiter().GetResult();
     }
 
+    /// <summary>
+    /// 运行事件处理循环，将非预期流结束转换为稳定故障，并在退出时固化丢失事件计数。
+    /// </summary>
     private void ProcessEvents(IEventPipeExecutionTraceSource source)
     {
         try
@@ -591,6 +675,9 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
         }
     }
 
+    /// <summary>
+    /// 在首个终端故障后只启动一次停止流程，防止后续回调继续累积不可信样本。
+    /// </summary>
     private void RequestStopAfterFailure()
     {
         lock (_syncRoot)
@@ -603,9 +690,15 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
         }
     }
 
+    /// <summary>
+    /// 原子保留首个终端故障，后续故障仅作为派生症状被忽略。
+    /// </summary>
     private void SetTerminalFailure(DiagnosticsException failure) =>
         Interlocked.CompareExchange(ref _terminalFailure, failure, comparand: null);
 
+    /// <summary>
+    /// 要求持有生命周期锁时解除会话引用，并以事件源先于会话的顺序释放底层资源。
+    /// </summary>
     private void CleanupSessionLocked()
     {
         var source = _source;
@@ -623,9 +716,15 @@ internal sealed class EventPipeExecutionSampler : IEventPipeExecutionSampler
         }
     }
 
+    /// <summary>
+    /// 将底层 EventPipe 传输或处理异常映射为稳定的执行采样不可用错误。
+    /// </summary>
     private static DiagnosticsException CreateUnavailableException(string message, Exception exception) =>
         new(DiagnosticsErrorCode.ExecutionProfilingUnavailable, message, exception);
 
+    /// <summary>
+    /// 将 TraceEvent 中的空白模块元数据规范为缺失值，避免污染帧去重键和展示结果。
+    /// </summary>
     private static string? NullIfWhiteSpace(string? value) =>
         string.IsNullOrWhiteSpace(value) ? null : value;
 }
