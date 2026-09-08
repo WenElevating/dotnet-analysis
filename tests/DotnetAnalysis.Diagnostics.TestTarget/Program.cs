@@ -1,4 +1,5 @@
 const string InitialObjectCountVariable = "DOTNET_ANALYSIS_TEST_OBJECT_COUNT";
+const string ExecutionWorkloadVariable = "DOTNET_ANALYSIS_TEST_EXECUTION_WORKLOAD";
 const int LargeObjectPayloadBytes = 256;
 
 var initialObjectCount = ReadInitialObjectCount();
@@ -9,13 +10,24 @@ for (var index = 0; index < initialObjectCount; index++)
 }
 
 TestState.Graph = new RetainedGraph(allocations, new byte[4096]);
-Console.WriteLine("READY");
-while (Console.ReadLine() is not "EXIT")
+var executionWorkload = ReadExecutionWorkloadEnabled() ? ExecutionSamplingWorkload.Start() : null;
+try
 {
-    allocations.Add(new byte[1024]);
-    if (allocations.Count > 256)
+    Console.WriteLine("READY");
+    while (Console.ReadLine() is not "EXIT")
     {
-        allocations.RemoveAt(0);
+        allocations.Add(new byte[1024]);
+        if (allocations.Count > 256)
+        {
+            allocations.RemoveAt(0);
+        }
+    }
+}
+finally
+{
+    if (executionWorkload is not null)
+    {
+        await executionWorkload.StopAsync();
     }
 }
 
@@ -26,6 +38,12 @@ static int ReadInitialObjectCount()
         ? count
         : 0;
 }
+
+static bool ReadExecutionWorkloadEnabled() =>
+    string.Equals(
+        Environment.GetEnvironmentVariable(ExecutionWorkloadVariable),
+        "true",
+        StringComparison.OrdinalIgnoreCase);
 
 sealed class RetainedGraph
 {

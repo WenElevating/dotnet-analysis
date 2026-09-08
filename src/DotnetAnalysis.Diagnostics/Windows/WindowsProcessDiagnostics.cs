@@ -20,6 +20,9 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
     private readonly SnapshotStorageLayout _snapshotLayout;
     private readonly MemorySnapshotStore _snapshotStore;
     private readonly IMemorySnapshotCapture _snapshotCapture;
+    private readonly Func<IExecutionSamplingSession> _executionSamplingSessionFactory;
+    private readonly Func<DateTimeOffset, IAllocationSamplingSessionResource> _allocationSamplingSessionFactory;
+    private readonly Func<TargetProcess, ProcessMemorySampler> _processMemorySamplerFactory;
     private readonly IEventBus _eventBus;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<ProcessDiagnosticsSession> _sessionLogger;
@@ -39,14 +42,50 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
         IProcessMemoryReader? processMemoryReader = null,
         ImportedSnapshotCatalog? importedSnapshots = null,
         SnapshotStorageLayout? snapshotLayout = null)
+        : this(
+            eventBus,
+            timeProvider,
+            static () => new ExecutionSamplingSession(),
+            sessionLogger,
+            enumerator,
+            identityValidator,
+            capabilitiesResolver,
+            processMemoryReader,
+            importedSnapshots,
+            snapshotLayout,
+            allocationSamplingSessionFactory: null,
+            processMemorySamplerFactory: null)
+    {
+    }
+
+    internal WindowsProcessDiagnostics(
+        IEventBus eventBus,
+        TimeProvider timeProvider,
+        Func<IExecutionSamplingSession> executionSamplingSessionFactory,
+        ILogger<ProcessDiagnosticsSession>? sessionLogger = null,
+        ProcessEnumerator? enumerator = null,
+        ProcessIdentityValidator? identityValidator = null,
+        RuntimeCapabilitiesResolver? capabilitiesResolver = null,
+        IProcessMemoryReader? processMemoryReader = null,
+        ImportedSnapshotCatalog? importedSnapshots = null,
+        SnapshotStorageLayout? snapshotLayout = null,
+        Func<DateTimeOffset, IAllocationSamplingSessionResource>? allocationSamplingSessionFactory = null,
+        Func<TargetProcess, ProcessMemorySampler>? processMemorySamplerFactory = null)
     {
         _eventBus = eventBus ?? throw new ArgumentNullException(nameof(eventBus));
         _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
+        _executionSamplingSessionFactory = executionSamplingSessionFactory
+            ?? throw new ArgumentNullException(nameof(executionSamplingSessionFactory));
         _sessionLogger = sessionLogger ?? NullLogger<ProcessDiagnosticsSession>.Instance;
         _enumerator = enumerator ?? new ProcessEnumerator();
         _identityValidator = identityValidator ?? new ProcessIdentityValidator();
         _capabilitiesResolver = capabilitiesResolver ?? new RuntimeCapabilitiesResolver();
         _processMemoryReader = processMemoryReader ?? new ProcessMemoryReader();
+        _allocationSamplingSessionFactory = allocationSamplingSessionFactory
+            ?? (startedAtUtc => new AllocationSamplingSessionResource(
+                new AllocationSamplingSession(new AllocationProfileBuilder(startedAtUtc))));
+        _processMemorySamplerFactory = processMemorySamplerFactory
+            ?? (process => new ProcessMemorySampler(process, _processMemoryReader));
         _importedSnapshots = importedSnapshots ?? new ImportedSnapshotCatalog();
         _snapshotLayout = snapshotLayout ?? new SnapshotStorageLayout(
             SnapshotStorageLayout.GetDefaultRootDirectory());
@@ -89,29 +128,75 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
     {
         await _identityValidator.ValidateAsync(process, cancellationToken).ConfigureAwait(false);
         await _capabilitiesResolver.ValidateAsync(process, cancellationToken).ConfigureAwait(false);
-        var sampler = new ProcessMemorySampler(process, _processMemoryReader);
-        var allocationCollector = new AllocationSamplingSession(
-            new AllocationProfileBuilder(_timeProvider.GetUtcNow()));
+        ProcessMemorySampler? sampler = null;
+        IAllocationSamplingSessionResource? allocationSampling = null;
+        IExecutionSamplingSession? executionSampling = null;
         try
         {
-            await allocationCollector.StartAsync(process, cancellationToken).ConfigureAwait(false);
+            sampler = _processMemorySamplerFactory(process)
+                ?? throw new InvalidOperationException("The process memory sampler factory returned null.");
+            allocationSampling = _allocationSamplingSessionFactory(_timeProvider.GetUtcNow())
+                ?? throw new InvalidOperationException("The allocation sampling session factory returned null.");
+            try
+            {
+                await allocationSampling.StartAsync(process, cancellationToken).ConfigureAwait(false);
+            }
+            catch (DiagnosticsException)
+            {
+                // Allocation sampling is an independent timeline.  A runtime may
+                // expose memory counters while refusing the allocation provider;
+                // preserve the session and mark that interval as interrupted.
+                allocationSampling.MarkInterrupted(_timeProvider.GetUtcNow());
+            }
+
+            executionSampling = _executionSamplingSessionFactory()
+                ?? throw new InvalidOperationException("The execution sampling session factory returned null.");
+            try
+            {
+                await executionSampling.StartAsync(process, cancellationToken).ConfigureAwait(false);
+            }
+            catch (DiagnosticsException exception) when (
+                exception.ErrorCode is DiagnosticsErrorCode.ExecutionProfilingUnavailable)
+            {
+                // Execution sampling is independent from the attached memory and
+                // snapshot timelines.  Retain its unavailable state for queries.
+            }
+
+            return new ProcessDiagnosticsSession(
+                process,
+                sampler,
+                allocationSampling,
+                executionSampling,
+                _snapshotCapture,
+                _eventBus,
+                _timeProvider,
+                _sessionLogger,
+                _identityValidator);
         }
-        catch (DiagnosticsException)
+        catch
         {
-            // Allocation sampling is an independent timeline.  A runtime may
-            // expose memory counters while refusing the allocation provider;
-            // preserve the session and mark that interval as interrupted.
-            allocationCollector.MarkInterrupted(DateTimeOffset.UtcNow);
+            await DisposeAfterFailedAttachAsync(executionSampling).ConfigureAwait(false);
+            await DisposeAfterFailedAttachAsync(allocationSampling).ConfigureAwait(false);
+            await DisposeAfterFailedAttachAsync(sampler).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    private static async ValueTask DisposeAfterFailedAttachAsync(IAsyncDisposable? resource)
+    {
+        if (resource is null)
+        {
+            return;
         }
 
-        return new ProcessDiagnosticsSession(
-            process,
-            sampler,
-            allocationCollector,
-            _snapshotCapture,
-            _eventBus,
-            _timeProvider,
-            _sessionLogger);
+        try
+        {
+            await resource.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // Cleanup is best effort so the original attach failure remains observable.
+        }
     }
 
     /// <summary>

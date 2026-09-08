@@ -38,4 +38,34 @@ public interface IProcessDiagnosticsSession : IAsyncDisposable
     /// </summary>
     Task<MemorySnapshot> CaptureSnapshotAsync(
         CancellationToken cancellationToken);
+
+    /// <summary>
+    /// 查询指定时间区间内的托管执行采样分析结果。
+    /// </summary>
+    /// <param name="timeRange">需要查询的 UTC 执行采样时间区间。</param>
+    /// <param name="cancellationToken">取消本次查询等待的标记。</param>
+    /// <returns>指定时间区间内的执行采样分析结果。</returns>
+    /// <exception cref="DiagnosticsException">执行采样不可用、指定区间不可查询或读取结果失败时引发。</exception>
+    Task<ExecutionProfile> GetExecutionProfileAsync(
+        ExecutionTimeRange timeRange,
+        CancellationToken cancellationToken) => GetExecutionProfileAsync(
+            timeRange,
+            ExecutionProfileQueryMode.Incremental,
+            cancellationToken);
+
+    /// <summary>
+    /// 使用指定读取方式查询指定时间区间内的托管执行采样分析结果。
+    /// </summary>
+    /// <param name="timeRange">需要查询的 UTC 执行采样时间区间。</param>
+    /// <param name="queryMode">执行分析读取方式。</param>
+    /// <param name="cancellationToken">取消本次查询等待的标记。</param>
+    /// <returns>指定时间区间内的执行采样分析结果。</returns>
+    /// <exception cref="DiagnosticsException">执行采样不可用、指定区间不可查询或读取结果失败时引发。</exception>
+    Task<ExecutionProfile> GetExecutionProfileAsync(
+        ExecutionTimeRange timeRange,
+        ExecutionProfileQueryMode queryMode,
+        CancellationToken cancellationToken) => Task.FromException<ExecutionProfile>(
+            new DiagnosticsException(
+                DiagnosticsErrorCode.ExecutionProfilingUnavailable,
+                "当前诊断会话不支持执行采样查询。"));
 }
