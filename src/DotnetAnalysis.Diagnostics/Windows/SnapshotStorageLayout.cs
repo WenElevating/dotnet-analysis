@@ -64,6 +64,22 @@ public sealed class SnapshotStorageLayout
         Path.Combine(GetSnapshotDirectory(snapshotId), $"{snapshotId}.gcdump");
 
     /// <summary>
+    /// 获取指定快照的临时保留分析堆文件路径。
+    /// </summary>
+    /// <param name="snapshotId">快照稳定标识。</param>
+    /// <returns>仅在写入成功前存在的专用格式路径。</returns>
+    public string GetTemporaryRetentionHeapPath(MemorySnapshotId snapshotId) =>
+        Path.Combine(GetSnapshotDirectory(snapshotId), "capture.tmp.retentionheap");
+
+    /// <summary>
+    /// 获取指定快照的最终保留分析堆文件路径。
+    /// </summary>
+    /// <param name="snapshotId">快照稳定标识。</param>
+    /// <returns>带有独立文件扩展名的最终保留分析快照路径。</returns>
+    public string GetFinalRetentionHeapPath(MemorySnapshotId snapshotId) =>
+        Path.Combine(GetSnapshotDirectory(snapshotId), $"{snapshotId}.retentionheap");
+
+    /// <summary>
     /// 获取指定快照的临时 JSON 清单路径。
     /// </summary>
     public string GetTemporaryManifestPath(MemorySnapshotId snapshotId) =>

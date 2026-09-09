@@ -90,11 +90,21 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
         _snapshotLayout = snapshotLayout ?? new SnapshotStorageLayout(
             SnapshotStorageLayout.GetDefaultRootDirectory());
         _snapshotStore = new MemorySnapshotStore(_snapshotLayout, _importedSnapshots);
-        _snapshotCapture = new GCDumpMemorySnapshotCapture(
-            _identityValidator,
-            _snapshotLayout,
-            _snapshotStore,
-            _timeProvider);
+        var retentionStorageGuard = new RetentionSnapshotStorageGuard(_snapshotLayout);
+        _snapshotCapture = new MemorySnapshotCaptureRegistry(
+        [
+            new GCDumpMemorySnapshotCapture(
+                _identityValidator,
+                _snapshotLayout,
+                _snapshotStore,
+                _timeProvider),
+            new ProfilerMemorySnapshotCapture(
+                _identityValidator,
+                _snapshotLayout,
+                _snapshotStore,
+                retentionStorageGuard,
+                _timeProvider)
+        ]);
     }
 
     /// <summary>
@@ -200,9 +210,9 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
     }
 
     /// <summary>
-    /// 打开现有 .gcdump 文件并创建处于分析中的导入快照。
+    /// 打开受管快照，或导入外部 .gcdump 文件并创建处于分析中的快照。
     /// </summary>
-    /// <param name="filePath">现有 .gcdump 文件路径。</param>
+    /// <param name="filePath">已受管的快照路径，或外部 .gcdump 文件路径。</param>
     /// <param name="cancellationToken">打开前检查的取消令牌。</param>
     /// <returns>已登记到导入目录的快照描述。</returns>
     public async Task<MemorySnapshot> OpenSnapshotAsync(
@@ -211,13 +221,6 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
         cancellationToken.ThrowIfCancellationRequested();
-
-        if (!string.Equals(Path.GetExtension(filePath), ".gcdump", StringComparison.OrdinalIgnoreCase))
-        {
-            throw new DiagnosticsException(
-                DiagnosticsErrorCode.SnapshotFormatNotSupported,
-                "Only .gcdump snapshots are accepted by the diagnostics contract.");
-        }
 
         if (!File.Exists(filePath))
         {
@@ -230,6 +233,13 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
         if (restored is not null)
         {
             return restored.Snapshot;
+        }
+
+        if (!string.Equals(Path.GetExtension(filePath), ".gcdump", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new DiagnosticsException(
+                DiagnosticsErrorCode.SnapshotFormatNotSupported,
+                "Only managed retention snapshots or external .gcdump snapshots are accepted by the diagnostics contract.");
         }
 
         var lastWriteUtc = File.GetLastWriteTimeUtc(filePath);

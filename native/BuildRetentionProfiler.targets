@@ -1,0 +1,24 @@
+<Project>
+  <!--
+    Windows AMD64 Profiler 只能与 Diagnostics 一起构建和部署。此目标不参与设计时构建，
+    以免编辑器因本机缺少 CMake 或 Windows SDK 而阻塞。
+  -->
+  <PropertyGroup>
+    <RetentionProfilerSourceDirectory>$([System.String]::Copy('$(MSBuildThisFileDirectory)').TrimEnd('\'))</RetentionProfilerSourceDirectory>
+    <RetentionProfilerBuildDirectory>$(BaseIntermediateOutputPath)retention-profiler</RetentionProfilerBuildDirectory>
+  </PropertyGroup>
+
+  <Target Name="BuildRetentionProfiler"
+          BeforeTargets="Build"
+          Condition="'$(OS)' == 'Windows_NT' and '$(DesignTimeBuild)' != 'true'">
+    <Exec Command="cmake -S &quot;$(RetentionProfilerSourceDirectory)&quot; -B &quot;$(RetentionProfilerBuildDirectory)&quot; -G &quot;Visual Studio 17 2022&quot; -A x64" />
+    <Exec Command="cmake --build &quot;$(RetentionProfilerBuildDirectory)&quot; --config &quot;$(Configuration)&quot;" />
+    <ItemGroup>
+      <RetentionProfilerNativeArtifact Include="$(RetentionProfilerBuildDirectory)\$(Configuration)\DotnetAnalysis.RetentionProfiler.dll" />
+      <RetentionProfilerNativeArtifact Include="$(RetentionProfilerBuildDirectory)\$(Configuration)\DotnetAnalysis.RetentionProfilerController.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(RetentionProfilerNativeArtifact)"
+          DestinationFolder="$(OutDir)native\"
+          SkipUnchangedFiles="true" />
+  </Target>
+</Project>

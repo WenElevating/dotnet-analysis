@@ -202,4 +202,106 @@ public sealed class SnapshotIndexTests
         Assert.IsNotNull(path);
         Assert.IsLessThan(1_048_576L, allocated);
     }
+
+    [TestMethod]
+    public void RetentionPaths_WhenMultipleRootsReachTarget_OrdersVerifiedStackEvidenceBeforeOtherRootKinds()
+    {
+        var type = new TypeIdentity("Node", "Sample");
+        var index = new SnapshotIndex(
+        [
+            new SnapshotIndex.ObjectRow(1, type, 16),
+            new SnapshotIndex.ObjectRow(2, type, 16),
+            new SnapshotIndex.ObjectRow(3, type, 16),
+            new SnapshotIndex.ObjectRow(4, type, 16)
+        ],
+        new Dictionary<ulong, IReadOnlyList<ulong>>
+        {
+            [1] = [4],
+            [2] = [4],
+            [3] = [4]
+        },
+        retentionRoots:
+        [
+            new SnapshotIndex.RetentionRootRow(
+                1,
+                new MemoryRetentionRoot(
+                    MemoryRootKind.Handle,
+                    MemoryRootFlags.None,
+                    null,
+                    null)),
+            new SnapshotIndex.RetentionRootRow(
+                2,
+                new MemoryRetentionRoot(
+                    MemoryRootKind.Stack,
+                    MemoryRootFlags.StackRoot,
+                    "Sample.Holder.KeepAlive",
+                    "Sample")),
+            new SnapshotIndex.RetentionRootRow(
+                3,
+                new MemoryRetentionRoot(
+                    MemoryRootKind.Stack,
+                    MemoryRootFlags.StackRoot,
+                    null,
+                    null))
+        ]);
+
+        var result = index.GetRetentionPaths(4, maxPathCount: 16);
+
+        Assert.IsNotNull(result);
+        Assert.HasCount(3, result.Paths);
+        Assert.AreEqual("Sample.Holder.KeepAlive", result.Paths[0].Root.FunctionName);
+        Assert.AreEqual(MemoryRootKind.Stack, result.Paths[1].Root.Kind);
+        Assert.IsNull(result.Paths[1].Root.FunctionName);
+        Assert.AreEqual(MemoryRootKind.Handle, result.Paths[2].Root.Kind);
+        Assert.AreEqual(2UL, result.Paths[0].Objects[0].Address);
+        Assert.AreEqual(4UL, result.Paths[0].Objects[1].Address);
+    }
+
+    /// <summary>
+    /// 弱引用只描述观察到的根标志，不构成对象存活证据，不能作为保留路径的起点。
+    /// </summary>
+    [TestMethod]
+    public void RetentionPaths_WhenOnlyWeakRootReachesTarget_ReturnsNull()
+    {
+        var type = new TypeIdentity("Node", "Sample");
+        var index = new SnapshotIndex(
+        [
+            new SnapshotIndex.ObjectRow(1, type, 16),
+            new SnapshotIndex.ObjectRow(2, type, 16)
+        ],
+        new Dictionary<ulong, IReadOnlyList<ulong>> { [1] = [2] },
+        retentionRoots:
+        [
+            new SnapshotIndex.RetentionRootRow(
+                1,
+                new MemoryRetentionRoot(
+                    MemoryRootKind.Handle,
+                    MemoryRootFlags.WeakReference,
+                    null,
+                    null))
+        ]);
+
+        Assert.IsNull(index.GetRetentionPaths(2, maxPathCount: 16));
+    }
+
+    /// <summary>
+    /// 保留路径查询在开始构建反向索引前必须响应调用方取消，不能进入全图遍历。
+    /// </summary>
+    [TestMethod]
+    public void RetentionPaths_WhenCancellationIsRequested_ThrowsBeforeTraversal()
+    {
+        var type = new TypeIdentity("Node", "Sample");
+        var index = new SnapshotIndex(
+        [
+            new SnapshotIndex.ObjectRow(1, type, 16),
+            new SnapshotIndex.ObjectRow(2, type, 16)
+        ],
+        new Dictionary<ulong, IReadOnlyList<ulong>> { [1] = [2] },
+        roots: [1]);
+        using var cancellationSource = new CancellationTokenSource();
+        cancellationSource.Cancel();
+
+        Assert.ThrowsExactly<OperationCanceledException>(
+            () => index.GetRetentionPaths(2, maxPathCount: 16, cancellationSource.Token));
+    }
 }

@@ -34,6 +34,18 @@ public enum DiagnosticsErrorCode
     /// </summary>
     CaptureCancelled,
     /// <summary>
+    /// 无法向目标进程附加所需的 CLR Profiler，例如目标已附加其他 Profiler。
+    /// </summary>
+    ProfilerAttachUnavailable,
+    /// <summary>
+    /// CLR Profiler 已开始工作但未能生成有效的保留分析快照。
+    /// </summary>
+    ProfilerCaptureFailed,
+    /// <summary>
+    /// 保留分析快照达到单文件、总量或卷保留空间限制。
+    /// </summary>
+    SnapshotStorageLimitReached,
+    /// <summary>
     /// 快照对象数量过大，不能执行完整对象枚举，应改用分页查询。
     /// </summary>
     SnapshotTooLargeForFullEnumeration,

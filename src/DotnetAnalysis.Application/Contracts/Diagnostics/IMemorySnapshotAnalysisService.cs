@@ -58,4 +58,19 @@ public interface IMemorySnapshotAnalysisService
         MemorySnapshot snapshot,
         ulong objectAddress,
         CancellationToken cancellationToken);
+
+    /// <summary>
+    /// 查询指定对象最多 16 条包含 GC 根证据的保留路径。
+    /// </summary>
+    /// <param name="snapshot">待查询的快照。</param>
+    /// <param name="objectAddress">目标对象在快照中的地址。</param>
+    /// <param name="maxPathCount">最多返回的路径数，范围为 1 至 16。</param>
+    /// <param name="cancellationToken">取消当前等待或路径投影操作的令牌。</param>
+    /// <returns>按函数已验证栈根、其他栈根、Handle、Finalizer、Other/Unknown 顺序排列的保留路径；对象未知或不可达时返回空。</returns>
+    /// <exception cref="ArgumentOutOfRangeException">最大路径数不在 1 至 16 范围内时引发。</exception>
+    Task<MemoryRetentionPathResult?> GetRetentionPathsAsync(
+        MemorySnapshot snapshot,
+        ulong objectAddress,
+        int maxPathCount,
+        CancellationToken cancellationToken) => throw new NotSupportedException("当前快照分析服务不支持保留路径查询。");
 }

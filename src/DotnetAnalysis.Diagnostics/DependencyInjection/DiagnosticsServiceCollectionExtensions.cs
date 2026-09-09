@@ -29,6 +29,7 @@ public static class DiagnosticsServiceCollectionExtensions
             new SnapshotStorageLayout(SnapshotStorageLayout.GetDefaultRootDirectory()));
         services.AddSingleton<MemorySnapshotStore>();
         services.AddSingleton<IMemorySnapshotReader, GCDumpSnapshotReader>();
+        services.AddSingleton<IMemorySnapshotReader, RetentionHeapSnapshotReader>();
         services.AddSingleton<IMemorySnapshotReader, DumpSnapshotReader>();
         services.AddSingleton<MemorySnapshotReaderRegistry>();
         services.AddSingleton<IMemorySnapshotAnalysisService, DiagnosticsMemorySnapshotAnalysisService>();
