@@ -98,6 +98,18 @@ internal sealed class DiagnosticsMemorySnapshotAnalysisService : IMemorySnapshot
     }
 
     /// <summary>
+    /// 读取到目标对象的保留路径；GCDump 只能提供 Unknown 根证据，Profiler 快照可提供更具体证据。
+    /// </summary>
+    public Task<MemoryRetentionPathResult?> GetRetentionPathsAsync(
+        MemorySnapshot snapshot,
+        ulong objectAddress,
+        int maxPathCount,
+        CancellationToken cancellationToken)
+    {
+        return ReadRetentionPathsCoreAsync(snapshot, objectAddress, maxPathCount, cancellationToken);
+    }
+
+    /// <summary>
     /// 从内存目录或持久化清单解析快照文件路径。
     /// </summary>
     private async Task<string> ResolvePathAsync(MemorySnapshotId snapshotId, CancellationToken cancellationToken)
@@ -142,6 +154,25 @@ internal sealed class DiagnosticsMemorySnapshotAnalysisService : IMemorySnapshot
     }
 
     /// <summary>
+    /// 解析快照路径并委托索引计算指定数量的 GC 根保留路径。
+    /// </summary>
+    private async Task<MemoryRetentionPathResult?> ReadRetentionPathsCoreAsync(
+        MemorySnapshot snapshot,
+        ulong objectAddress,
+        int maxPathCount,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxPathCount, 1);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(maxPathCount, 16);
+        var path = await ResolvePathAsync(snapshot.Id, cancellationToken).ConfigureAwait(false);
+        var index = await GetIndexAsync(snapshot, path, cancellationToken).ConfigureAwait(false);
+        return await Task.Run(
+            () => index.GetRetentionPaths(objectAddress, maxPathCount, cancellationToken),
+            CancellationToken.None).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// 使用当前快照的单飞缓存读取紧凑对象索引。
     /// </summary>
     private Task<SnapshotIndex> GetIndexAsync(
@@ -150,7 +181,7 @@ internal sealed class DiagnosticsMemorySnapshotAnalysisService : IMemorySnapshot
         CancellationToken cancellationToken)
     {
         var reader = _registry.Resolve(path);
-        if (reader is not GCDumpSnapshotReader)
+        if (reader is not IIndexedMemorySnapshotReader indexedReader)
         {
             throw new DiagnosticsException(
                 DiagnosticsErrorCode.SnapshotFormatNotSupported,
@@ -159,7 +190,7 @@ internal sealed class DiagnosticsMemorySnapshotAnalysisService : IMemorySnapshot
 
         return _indexCache.GetAsync(
             snapshot.Id,
-            () => GCDumpSnapshotReader.ReadIndexAsync(path),
+            () => indexedReader.ReadIndexAsync(path),
             cancellationToken);
     }
 }

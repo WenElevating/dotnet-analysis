@@ -10,7 +10,7 @@ namespace DotnetAnalysis.Diagnostics.Windows;
 /// <summary>
 /// 读取 FastSerialization 或 EventPipe .gcdump 并提供统一堆查询。
 /// </summary>
-public sealed class GCDumpSnapshotReader : IMemorySnapshotReader
+public sealed class GCDumpSnapshotReader : IIndexedMemorySnapshotReader
 {
     /// <summary>
     /// 判断文件是否为 FastSerialization 或 EventPipe 形式的 .gcdump。
@@ -110,6 +110,9 @@ public sealed class GCDumpSnapshotReader : IMemorySnapshotReader
     /// </summary>
     internal static Task<SnapshotIndex> ReadIndexAsync(string filePath) =>
         Task.Run(() => ReadIndex(filePath, CancellationToken.None), CancellationToken.None);
+
+    /// <inheritdoc />
+    Task<SnapshotIndex> IIndexedMemorySnapshotReader.ReadIndexAsync(string filePath) => ReadIndexAsync(filePath);
 
     /// <summary>
     /// 直接从快照流生成紧凑索引；不会先构造完整 <see cref="HeapData"/> 对象图。

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Security.Cryptography;
 using DotnetAnalysis.Application.Contracts.Diagnostics;
 using DotnetAnalysis.Core.Diagnostics;
@@ -12,12 +13,29 @@ namespace DotnetAnalysis.Diagnostics.Windows;
 internal sealed record StoredSnapshot(
     MemorySnapshot Snapshot,
     string FilePath,
-    AllocationProfile AllocationProfile)
+    AllocationProfile AllocationProfile,
+    SnapshotStorageFormat SnapshotFormat = SnapshotStorageFormat.GCDump)
 {
     /// <summary>
     /// 持久化快照的稳定标识。
     /// </summary>
     public MemorySnapshotId SnapshotId => Snapshot.Id;
+}
+
+/// <summary>
+/// 表示由应用持久化的快照文件格式；该信息仅用于 Diagnostics 内部选择读取器和存储规则。
+/// </summary>
+internal enum SnapshotStorageFormat
+{
+    /// <summary>
+    /// 官方 FastSerialization/EventPipe GCDump 文件。
+    /// </summary>
+    GCDump,
+
+    /// <summary>
+    /// 由保留分析 Profiler 输出的受校验专用对象图文件。
+    /// </summary>
+    RetentionHeap
 }
 
 /// <summary>
@@ -93,12 +111,14 @@ internal sealed class MemorySnapshotStore
 {
     private static readonly JsonSerializerOptions s_jsonOptions = new()
     {
-        WriteIndented = true
+        WriteIndented = true,
+        Converters = { new JsonStringEnumConverter() }
     };
 
     private readonly SnapshotStorageLayout _layout;
     private readonly ImportedSnapshotCatalog _catalog;
     private readonly ISnapshotReadabilityValidator _readabilityValidator;
+    private readonly IRetentionSnapshotStorageGuard _retentionStorageGuard;
 
     /// <summary>
     /// 创建快照提升、清单持久化和路径解析所需的存储。
@@ -106,11 +126,13 @@ internal sealed class MemorySnapshotStore
     public MemorySnapshotStore(
         SnapshotStorageLayout layout,
         ImportedSnapshotCatalog catalog,
-        ISnapshotReadabilityValidator? readabilityValidator = null)
+        ISnapshotReadabilityValidator? readabilityValidator = null,
+        IRetentionSnapshotStorageGuard? retentionStorageGuard = null)
     {
         _layout = layout ?? throw new ArgumentNullException(nameof(layout));
         _catalog = catalog ?? throw new ArgumentNullException(nameof(catalog));
         _readabilityValidator = readabilityValidator ?? new FileSnapshotReadabilityValidator();
+        _retentionStorageGuard = retentionStorageGuard ?? new RetentionSnapshotStorageGuard(_layout);
     }
 
     /// <summary>
@@ -120,6 +142,51 @@ internal sealed class MemorySnapshotStore
         MemorySnapshot snapshot,
         string temporaryPath,
         AllocationProfile allocationProfile,
+        CancellationToken cancellationToken)
+    {
+        return await PromoteCoreAsync(
+            snapshot,
+            temporaryPath,
+            allocationProfile,
+            SnapshotStorageFormat.GCDump,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 校验并提升 Profiler 输出的保留分析专用快照，且不会将它伪装成 GCDump。
+    /// </summary>
+    /// <param name="snapshot">已成功采集但尚待分析的快照元数据。</param>
+    /// <param name="temporaryPath">包含完整标记与校验和的临时保留快照路径。</param>
+    /// <param name="allocationProfile">本次捕获封存的分配区间概要。</param>
+    /// <param name="cancellationToken">取消当前验证或提升操作的令牌。</param>
+    /// <returns>包含保留格式和最终路径的已持久化快照。</returns>
+    public async Task<StoredSnapshot> PromoteRetentionAsync(
+        MemorySnapshot snapshot,
+        string temporaryPath,
+        AllocationProfile allocationProfile,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        ArgumentException.ThrowIfNullOrWhiteSpace(temporaryPath);
+        ArgumentNullException.ThrowIfNull(allocationProfile);
+        using var promotionReservation = await _retentionStorageGuard.ReservePromotionAsync(temporaryPath, cancellationToken).ConfigureAwait(false);
+        await RetentionHeapSnapshot.ReadIndexAsync(temporaryPath, cancellationToken).ConfigureAwait(false);
+        return await PromoteCoreAsync(
+            snapshot,
+            temporaryPath,
+            allocationProfile,
+            SnapshotStorageFormat.RetentionHeap,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 为不同格式执行共用的完整性计算、原子提升和清单写入。
+    /// </summary>
+    private async Task<StoredSnapshot> PromoteCoreAsync(
+        MemorySnapshot snapshot,
+        string temporaryPath,
+        AllocationProfile allocationProfile,
+        SnapshotStorageFormat snapshotFormat,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
@@ -134,15 +201,18 @@ internal sealed class MemorySnapshotStore
                 throw new IOException("Temporary snapshot does not exist.");
             }
 
-            await _readabilityValidator.ValidateAsync(temporaryPath, cancellationToken).ConfigureAwait(false);
+            if (snapshotFormat is SnapshotStorageFormat.GCDump)
+            {
+                await _readabilityValidator.ValidateAsync(temporaryPath, cancellationToken).ConfigureAwait(false);
+            }
 
             var snapshotDirectory = _layout.GetSnapshotDirectory(snapshotId);
             Directory.CreateDirectory(snapshotDirectory);
-            var finalDumpPath = _layout.GetFinalDumpPath(snapshotId);
+            var finalDumpPath = GetFinalSnapshotPath(snapshotId, snapshotFormat);
             var finalManifestPath = _layout.GetFinalManifestPath(snapshotId);
             var temporaryManifestPath = _layout.GetTemporaryManifestPath(snapshotId);
 
-            var stored = new StoredSnapshot(snapshot, finalDumpPath, allocationProfile);
+            var stored = new StoredSnapshot(snapshot, finalDumpPath, allocationProfile, snapshotFormat);
             var integrity = await SnapshotIntegrity.CreateAsync(temporaryPath, cancellationToken).ConfigureAwait(false);
             await WriteManifestAsync(temporaryManifestPath, stored, integrity, cancellationToken).ConfigureAwait(false);
             File.Move(temporaryPath, finalDumpPath, false);
@@ -161,7 +231,7 @@ internal sealed class MemorySnapshotStore
         catch (Exception exception)
         {
             await DeleteTemporaryAsync(temporaryPath).ConfigureAwait(false);
-            TryDelete(_layout.GetFinalDumpPath(snapshotId));
+            TryDelete(GetFinalSnapshotPath(snapshotId, snapshotFormat));
             TryDelete(_layout.GetFinalManifestPath(snapshotId));
             TryDelete(_layout.GetTemporaryManifestPath(snapshotId));
             if (exception is DiagnosticsException diagnosticsException)
@@ -172,6 +242,14 @@ internal sealed class MemorySnapshotStore
             throw new DiagnosticsException(DiagnosticsErrorCode.CaptureFailed, "Snapshot promotion failed.", exception);
         }
     }
+
+    /// <summary>
+    /// 根据受管快照格式返回专属最终文件路径。
+    /// </summary>
+    private string GetFinalSnapshotPath(MemorySnapshotId snapshotId, SnapshotStorageFormat snapshotFormat) =>
+        snapshotFormat is SnapshotStorageFormat.GCDump
+            ? _layout.GetFinalDumpPath(snapshotId)
+            : _layout.GetFinalRetentionHeapPath(snapshotId);
 
     /// <summary>
     /// 清理临时堆文件及其同名清单。
@@ -323,6 +401,8 @@ internal sealed class MemorySnapshotStore
 
         public string RelativeFilePath { get; init; } = string.Empty;
 
+        public SnapshotStorageFormat SnapshotFormat { get; init; }
+
         public SnapshotIntegrity Integrity { get; init; } = new();
 
         public AllocationProfileManifest AllocationProfile { get; init; } = new();
@@ -333,7 +413,7 @@ internal sealed class MemorySnapshotStore
         public static StoredSnapshotManifest From(StoredSnapshot snapshot, SnapshotIntegrity integrity) =>
             new()
             {
-                ManifestVersion = 1,
+                ManifestVersion = 2,
                 SnapshotId = snapshot.SnapshotId.Value,
                 Origin = snapshot.Snapshot.Origin,
                 RequestedAtUtc = snapshot.Snapshot.RequestedAtUtc,
@@ -342,13 +422,14 @@ internal sealed class MemorySnapshotStore
                 RelativeFilePath = Path.Combine(
                     snapshot.SnapshotId.ToString(),
                     Path.GetFileName(snapshot.FilePath)),
+                SnapshotFormat = snapshot.SnapshotFormat,
                 Integrity = integrity,
                 AllocationProfile = AllocationProfileManifest.From(snapshot.AllocationProfile)
             };
 
         public StoredSnapshot ToStoredSnapshot(SnapshotStorageLayout layout)
         {
-            if (ManifestVersion != 1 || string.IsNullOrWhiteSpace(RelativeFilePath))
+            if (ManifestVersion is < 1 or > 2 || string.IsNullOrWhiteSpace(RelativeFilePath))
             {
                 throw new InvalidDataException("Snapshot manifest version or relative path is invalid.");
             }
@@ -370,7 +451,15 @@ internal sealed class MemorySnapshotStore
                 CaptureStartedAtUtc,
                 CapturedAtUtc,
                 MemorySnapshotState.Analyzing);
-            return new StoredSnapshot(snapshot, filePath, AllocationProfile.ToAllocationProfile());
+            var snapshotFormat = ManifestVersion == 1
+                ? SnapshotStorageFormat.GCDump
+                : SnapshotFormat;
+            if (!Enum.IsDefined(snapshotFormat))
+            {
+                throw new InvalidDataException("Snapshot manifest format is invalid.");
+            }
+
+            return new StoredSnapshot(snapshot, filePath, AllocationProfile.ToAllocationProfile(), snapshotFormat);
         }
     }
 

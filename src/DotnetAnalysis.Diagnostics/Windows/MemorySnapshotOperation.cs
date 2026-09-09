@@ -164,6 +164,24 @@ public sealed class MemorySnapshotOperation
     }
 
     /// <summary>
+    /// 读取到指定对象的保留路径及 GC 根函数证据；标准 GCDump 的根证据为 Unknown。
+    /// </summary>
+    /// <param name="objectAddress">目标对象在快照中的地址。</param>
+    /// <param name="maxPathCount">最多返回的路径数，范围为 1 至 16。</param>
+    /// <param name="cancellationToken">取消当前等待或路径投影操作的令牌。</param>
+    /// <returns>包含最多指定数量保留路径的结果；对象未知或没有 GC 根时返回空。</returns>
+    /// <exception cref="ArgumentOutOfRangeException">最大路径数不在 1 至 16 范围内时引发。</exception>
+    public Task<MemoryRetentionPathResult?> GetRetentionPathsAsync(
+        ulong objectAddress,
+        int maxPathCount,
+        CancellationToken cancellationToken)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxPathCount, 1);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(maxPathCount, 16);
+        return _analysisService.GetRetentionPathsAsync(Snapshot, objectAddress, maxPathCount, cancellationToken);
+    }
+
+    /// <summary>
     /// 执行一次分析并统一处理成功、取消和失败状态。
     /// </summary>
     private async Task<MemorySnapshotAnalysis> AnalyzeCoreAsync(

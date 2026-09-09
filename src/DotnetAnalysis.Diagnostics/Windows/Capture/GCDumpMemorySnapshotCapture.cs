@@ -9,6 +9,8 @@ namespace DotnetAnalysis.Diagnostics.Windows.Capture;
 /// </summary>
 internal sealed class GCDumpMemorySnapshotCapture : IMemorySnapshotCapture
 {
+    private static readonly IReadOnlySet<MemorySnapshotCaptureMode> s_supportedCaptureModes =
+        new HashSet<MemorySnapshotCaptureMode> { MemorySnapshotCaptureMode.Standard };
     private readonly ProcessIdentityValidator _identityValidator;
     private readonly SnapshotStorageLayout _snapshotLayout;
     private readonly MemorySnapshotStore _snapshotStore;
@@ -30,11 +32,22 @@ internal sealed class GCDumpMemorySnapshotCapture : IMemorySnapshotCapture
     }
 
     /// <inheritdoc />
+    public IReadOnlySet<MemorySnapshotCaptureMode> SupportedCaptureModes => s_supportedCaptureModes;
+
+    /// <inheritdoc />
     public async Task<MemorySnapshot> CaptureAsync(
+        MemorySnapshotCaptureMode captureMode,
         TargetProcess target,
         AllocationSamplingSession allocationCollector,
         CancellationToken cancellationToken)
     {
+        if (captureMode is not MemorySnapshotCaptureMode.Standard)
+        {
+            throw new DiagnosticsException(
+                DiagnosticsErrorCode.ProfilerAttachUnavailable,
+                "GCDump 捕获器不支持保留函数分析捕获。");
+        }
+
         ArgumentNullException.ThrowIfNull(target);
         ArgumentNullException.ThrowIfNull(allocationCollector);
 

@@ -8,3 +8,4 @@ TestResults/
 *.gcdump
 *.nettrace
 *.dmp
+native/out/

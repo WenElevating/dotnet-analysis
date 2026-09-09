@@ -11,10 +11,25 @@
     <PackageReference Include="Microsoft.Diagnostics.Tracing.TraceEvent" Version="3.2.6" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Content Include="$(BaseIntermediateOutputPath)retention-profiler\$(Configuration)\DotnetAnalysis.RetentionProfiler.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <TargetPath>native\DotnetAnalysis.RetentionProfiler.dll</TargetPath>
+    </Content>
+    <Content Include="$(BaseIntermediateOutputPath)retention-profiler\$(Configuration)\DotnetAnalysis.RetentionProfilerController.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <TargetPath>native\DotnetAnalysis.RetentionProfilerController.dll</TargetPath>
+    </Content>
+  </ItemGroup>
+
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
+
+  <Import Project="..\..\native\BuildRetentionProfiler.targets" />
 
 </Project>

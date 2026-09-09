@@ -25,6 +25,21 @@ public sealed class IntegrationTestHost : IAsyncDisposable
 
     public int ProcessId => _process.Id;
 
+    /// <summary>
+    /// 向受控目标发送一条命令，并异步读取其对应的单行响应。
+    /// </summary>
+    /// <param name="command">目标程序识别的非空命令文本。</param>
+    /// <param name="cancellationToken">取消写入或等待响应的令牌。</param>
+    /// <returns>目标输出的响应行；目标提前退出时为空。</returns>
+    internal async Task<string?> SendCommandAsync(string command, CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(command);
+        cancellationToken.ThrowIfCancellationRequested();
+        await _process.StandardInput.WriteLineAsync(command).WaitAsync(cancellationToken).ConfigureAwait(false);
+        await _process.StandardInput.FlushAsync(cancellationToken).ConfigureAwait(false);
+        return await _process.StandardOutput.ReadLineAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     public static ReadOnlyCollection<int> GetInstalledRuntimeMajorVersions() => s_installedRuntimeMajorVersions.Value;
 
     public static IEnumerable<string> GetSupportedTargetFrameworks() =>
@@ -50,8 +65,8 @@ public sealed class IntegrationTestHost : IAsyncDisposable
         var projectDirectory = GetTargetProjectDirectory();
         var candidates = new[]
         {
-            Path.Combine(projectDirectory, "bin", "x64", "Debug", targetFramework, "DotnetAnalysis.Diagnostics.TestTarget.exe"),
             Path.Combine(projectDirectory, "bin", "Debug", targetFramework, "DotnetAnalysis.Diagnostics.TestTarget.exe"),
+            Path.Combine(projectDirectory, "bin", "x64", "Debug", targetFramework, "DotnetAnalysis.Diagnostics.TestTarget.exe"),
             Path.Combine(projectDirectory, "bin", "x64", "Release", targetFramework, "DotnetAnalysis.Diagnostics.TestTarget.exe"),
             Path.Combine(projectDirectory, "bin", "Release", targetFramework, "DotnetAnalysis.Diagnostics.TestTarget.exe")
         };

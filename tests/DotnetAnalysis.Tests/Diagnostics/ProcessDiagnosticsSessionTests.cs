@@ -39,6 +39,28 @@ public sealed class ProcessDiagnosticsSessionTests
     }
 
     [TestMethod]
+    public async Task CaptureSnapshotAsync_WithoutMode_UsesStandardCaptureMode()
+    {
+        var capture = new ControlledCapture();
+        await using var session = CreateSession(capture);
+
+        _ = await session.CaptureSnapshotAsync(CancellationToken.None);
+
+        Assert.AreEqual(MemorySnapshotCaptureMode.Standard, capture.LastCaptureMode);
+    }
+
+    [TestMethod]
+    public async Task CaptureSnapshotAsync_WithRetentionAnalysisMode_ForwardsTheExplicitCaptureMode()
+    {
+        var capture = new ControlledCapture();
+        await using var session = CreateSession(capture);
+
+        _ = await session.CaptureSnapshotAsync(MemorySnapshotCaptureMode.RetentionAnalysis, CancellationToken.None);
+
+        Assert.AreEqual(MemorySnapshotCaptureMode.RetentionAnalysis, capture.LastCaptureMode);
+    }
+
+    [TestMethod]
     public async Task CaptureSnapshotAsync_WhenCaptureIsCancelled_ClearsCaptureGateForRetry()
     {
         var capture = new ControlledCapture
@@ -724,6 +746,13 @@ public sealed class ProcessDiagnosticsSessionTests
 
     private sealed class ControlledCapture : IMemorySnapshotCapture
     {
+        private static readonly IReadOnlySet<MemorySnapshotCaptureMode> s_supportedCaptureModes =
+            new HashSet<MemorySnapshotCaptureMode>
+            {
+                MemorySnapshotCaptureMode.Standard,
+                MemorySnapshotCaptureMode.RetentionAnalysis
+            };
+
         public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public TaskCompletionSource? CaptureGate { get; init; }
@@ -732,14 +761,20 @@ public sealed class ProcessDiagnosticsSessionTests
 
         public int Calls { get; private set; }
 
+        public MemorySnapshotCaptureMode? LastCaptureMode { get; private set; }
+
+        public IReadOnlySet<MemorySnapshotCaptureMode> SupportedCaptureModes => s_supportedCaptureModes;
+
         public bool WaitForCancellation { get; init; }
 
         public async Task<MemorySnapshot> CaptureAsync(
+            MemorySnapshotCaptureMode captureMode,
             TargetProcess target,
             AllocationSamplingSession allocationCollector,
             CancellationToken cancellationToken)
         {
             Calls++;
+            LastCaptureMode = captureMode;
             Started.TrySetResult();
 
             if (WaitForCancellation)

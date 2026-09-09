@@ -102,6 +102,30 @@ public sealed class MemorySnapshotOperationTests
     }
 
     [TestMethod]
+    public async Task GetRetentionPathsAsync_ReadsRootEvidenceThroughAnalysisService()
+    {
+        var type = new TypeIdentity("Sample.Type", "Sample");
+        var expected = new MemoryRetentionPathResult(
+            42,
+            [
+                new MemoryRetentionPath(
+                    new MemoryRetentionRoot(
+                        MemoryRootKind.Stack,
+                        MemoryRootFlags.StackRoot,
+                        "Sample.Holder.KeepAlive",
+                        "Sample"),
+                    [new MemoryObjectInfo(42, type, 64)])
+            ]);
+        var analysisService = new ControlledSnapshotAnalysisService { RetentionPaths = expected };
+        var operation = CreateOperation(Snapshot(MemorySnapshotState.Ready), analysisService);
+
+        var result = await operation.GetRetentionPathsAsync(42, 16, CancellationToken.None);
+
+        Assert.AreEqual(expected, result);
+        Assert.AreEqual(1, analysisService.GetRetentionPathsCalls);
+    }
+
+    [TestMethod]
     public async Task GetObjectsPageAsync_ReadsRequestedPageThroughAnalysisService()
     {
         var type = new TypeIdentity("Sample.Type", "Sample");
@@ -188,11 +212,15 @@ public sealed class MemorySnapshotOperationTests
 
         public int GetObjectsPageCalls { get; private set; }
 
+        public int GetRetentionPathsCalls { get; private set; }
+
         public IReadOnlyList<MemoryObjectInfo> Objects { get; init; } = [];
 
         public MemoryReferencePath? ReferencePath { get; init; }
 
         public MemoryObjectPage ObjectPage { get; init; } = new([], 0, 0, 1);
+
+        public MemoryRetentionPathResult? RetentionPaths { get; init; }
 
         public Task<MemorySnapshotAnalysis> AnalyzeAsync(MemorySnapshot snapshot, CancellationToken cancellationToken)
         {
@@ -242,6 +270,17 @@ public sealed class MemorySnapshotOperationTests
             cancellationToken.ThrowIfCancellationRequested();
             GetReferencePathCalls++;
             return Task.FromResult(ReferencePath);
+        }
+
+        public Task<MemoryRetentionPathResult?> GetRetentionPathsAsync(
+            MemorySnapshot snapshot,
+            ulong objectAddress,
+            int maxPathCount,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            GetRetentionPathsCalls++;
+            return Task.FromResult(RetentionPaths);
         }
 
         public Task<MemoryObjectPage> GetObjectsPageAsync(

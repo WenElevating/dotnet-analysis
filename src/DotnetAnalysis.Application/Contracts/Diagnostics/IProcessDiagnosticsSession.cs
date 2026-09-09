@@ -40,6 +40,21 @@ public interface IProcessDiagnosticsSession : IAsyncDisposable
         CancellationToken cancellationToken);
 
     /// <summary>
+    /// 使用指定证据级别捕获一次快照；保留分析方式不会静默降级为轻量堆快照。
+    /// </summary>
+    /// <param name="captureMode">请求的快照捕获方式。</param>
+    /// <param name="cancellationToken">取消当前捕获的令牌。</param>
+    /// <returns>已被持久化、等待分析的快照描述。</returns>
+    /// <exception cref="DiagnosticsException">所选捕获方式不可用、目标身份变化、捕获失败或捕获取消时引发。</exception>
+    Task<MemorySnapshot> CaptureSnapshotAsync(
+        MemorySnapshotCaptureMode captureMode,
+        CancellationToken cancellationToken) => captureMode is MemorySnapshotCaptureMode.Standard
+            ? CaptureSnapshotAsync(cancellationToken)
+            : Task.FromException<MemorySnapshot>(new DiagnosticsException(
+                DiagnosticsErrorCode.ProfilerAttachUnavailable,
+                "当前诊断会话不支持保留函数分析捕获。"));
+
+    /// <summary>
     /// 查询指定时间区间内的托管执行采样分析结果。
     /// </summary>
     /// <param name="timeRange">需要查询的 UTC 执行采样时间区间。</param>

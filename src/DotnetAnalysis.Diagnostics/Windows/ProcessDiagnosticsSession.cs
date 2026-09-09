@@ -185,7 +185,19 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
     /// </summary>
     public Task<MemorySnapshot> CaptureSnapshotAsync(CancellationToken cancellationToken)
     {
+        return CaptureSnapshotAsync(MemorySnapshotCaptureMode.Standard, cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public Task<MemorySnapshot> CaptureSnapshotAsync(
+        MemorySnapshotCaptureMode captureMode,
+        CancellationToken cancellationToken)
+    {
         cancellationToken.ThrowIfCancellationRequested();
+        if (!Enum.IsDefined(captureMode))
+        {
+            throw new ArgumentOutOfRangeException(nameof(captureMode));
+        }
 
         lock (_syncRoot)
         {
@@ -204,7 +216,7 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
             }
 
             _captureCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _endCancellation.Token);
-            _captureTask = CaptureCoreAsync(_captureCancellation);
+            _captureTask = CaptureCoreAsync(captureMode, _captureCancellation);
             _ = PublishEventAsync(new MemorySnapshotCaptureStarted(
                 Id,
                 _timeProvider.GetUtcNow(),
@@ -312,14 +324,16 @@ public sealed class ProcessDiagnosticsSession : IProcessDiagnosticsSession
     /// <summary>
     /// 执行底层捕获并发布成功、取消或失败事件。
     /// </summary>
-    private async Task<MemorySnapshot> CaptureCoreAsync(CancellationTokenSource captureCancellation)
+    private async Task<MemorySnapshot> CaptureCoreAsync(
+        MemorySnapshotCaptureMode captureMode,
+        CancellationTokenSource captureCancellation)
     {
         await Task.Yield();
 
         try
         {
             var snapshot = await _capture
-                .CaptureAsync(Process, _allocationSampling.Collector, captureCancellation.Token)
+                .CaptureAsync(captureMode, Process, _allocationSampling.Collector, captureCancellation.Token)
                 .ConfigureAwait(false);
             _ = PublishEventAsync(new MemorySnapshotCaptured(
                 Id,
