@@ -82,6 +82,33 @@ public sealed class ProcessDiagnosticsSessionTests
         Assert.AreEqual(2, capture.Calls);
     }
 
+    /// <summary>
+    /// 捕获期间报告目标退出时，所属诊断会话必须完成结束流程，不能残留在 Monitoring 状态。
+    /// </summary>
+    [TestMethod]
+    public async Task CaptureSnapshotAsync_WhenTargetExitsDuringCapture_EndsOwningSession()
+    {
+        var capture = new ControlledCapture
+        {
+            Failure = new DiagnosticsException(DiagnosticsErrorCode.TargetExited, "Target exited.")
+        };
+        await using var session = CreateSession(capture);
+
+        var exception = await Assert.ThrowsExactlyAsync<DiagnosticsException>(
+            async () => await session.CaptureSnapshotAsync(
+                MemorySnapshotCaptureMode.RetentionAnalysis,
+                CancellationToken.None));
+        var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(1);
+        while (session.State is ProcessDiagnosticsSessionState.Monitoring or ProcessDiagnosticsSessionState.Ending
+               && DateTimeOffset.UtcNow < deadline)
+        {
+            await Task.Delay(10);
+        }
+
+        Assert.AreEqual(DiagnosticsErrorCode.TargetExited, exception.ErrorCode);
+        Assert.AreEqual(ProcessDiagnosticsSessionState.Ended, session.State);
+    }
+
     [TestMethod]
     public async Task EndAsync_CancelsInFlightCaptureAndDisposesAllocationCollector()
     {

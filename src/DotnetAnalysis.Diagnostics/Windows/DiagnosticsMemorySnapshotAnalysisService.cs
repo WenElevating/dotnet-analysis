@@ -6,12 +6,13 @@ namespace DotnetAnalysis.Diagnostics.Windows;
 /// <summary>
 /// 协调快照存储、格式读取器和核心分析结果的 Windows 实现。
 /// </summary>
-internal sealed class DiagnosticsMemorySnapshotAnalysisService : IMemorySnapshotAnalysisService
+internal sealed class DiagnosticsMemorySnapshotAnalysisService : IMemorySnapshotAnalysisService, IDisposable
 {
     private readonly ImportedSnapshotCatalog _catalog;
     private readonly MemorySnapshotStore _store;
     private readonly MemorySnapshotReaderRegistry _registry;
-    private readonly SnapshotIndexCache _indexCache = new();
+    private readonly HeapIndexHandleCache _indexCache = new();
+    private readonly HeapIndexRouter _indexRouter;
 
     /// <summary>
     /// 创建连接快照目录、持久化存储和格式读取器的分析服务。
@@ -19,12 +20,19 @@ internal sealed class DiagnosticsMemorySnapshotAnalysisService : IMemorySnapshot
     public DiagnosticsMemorySnapshotAnalysisService(
         ImportedSnapshotCatalog catalog,
         MemorySnapshotStore store,
-        MemorySnapshotReaderRegistry registry)
+        MemorySnapshotReaderRegistry registry,
+        SnapshotStorageLayout layout)
     {
         _catalog = catalog;
         _store = store;
         _registry = registry;
+        _indexRouter = new HeapIndexRouter(layout);
     }
+
+    /// <summary>
+    /// 释放当前快照的映射索引句柄；不会删除原始快照或已验证工件。
+    /// </summary>
+    public void Dispose() => _indexCache.Dispose();
 
     /// <summary>
     /// 读取快照中的类型统计和关联分配概要，并将可分析快照推进为就绪状态。
@@ -34,7 +42,7 @@ internal sealed class DiagnosticsMemorySnapshotAnalysisService : IMemorySnapshot
         ArgumentNullException.ThrowIfNull(snapshot);
         var path = await ResolvePathAsync(snapshot.Id, cancellationToken).ConfigureAwait(false);
 
-        var index = await GetIndexAsync(snapshot, path, cancellationToken).ConfigureAwait(false);
+        using var index = await GetIndexAsync(snapshot, path, cancellationToken).ConfigureAwait(false);
         var endedAtUtc = snapshot.CapturedAtUtc ?? snapshot.RequestedAtUtc;
         if (endedAtUtc < snapshot.RequestedAtUtc)
         {
@@ -85,7 +93,7 @@ internal sealed class DiagnosticsMemorySnapshotAnalysisService : IMemorySnapshot
         ArgumentOutOfRangeException.ThrowIfGreaterThan(pageSize, 1000);
 
         var path = await ResolvePathAsync(snapshot.Id, cancellationToken).ConfigureAwait(false);
-        var index = await GetIndexAsync(snapshot, path, cancellationToken).ConfigureAwait(false);
+        using var index = await GetIndexAsync(snapshot, path, cancellationToken).ConfigureAwait(false);
         return index.GetPage(type, offset, pageSize);
     }
 
@@ -107,6 +115,73 @@ internal sealed class DiagnosticsMemorySnapshotAnalysisService : IMemorySnapshot
         CancellationToken cancellationToken)
     {
         return ReadRetentionPathsCoreAsync(snapshot, objectAddress, maxPathCount, cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public async Task<MemoryDominatorPage> GetDominatorPageAsync(
+        MemorySnapshot snapshot,
+        int offset,
+        int pageSize,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        ArgumentOutOfRangeException.ThrowIfLessThan(pageSize, 1);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(pageSize, 1000);
+        var path = await ResolvePathAsync(snapshot.Id, cancellationToken).ConfigureAwait(false);
+        using var index = await GetIndexAsync(snapshot, path, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await index.GetDominatorPageAsync(offset, pageSize, cancellationToken).ConfigureAwait(false);
+        }
+        catch (DiagnosticsException)
+        {
+            throw;
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            throw new DiagnosticsException(
+                DiagnosticsErrorCode.DerivedAnalysisUnavailable,
+                "无法构建快照支配树分析。",
+                exception);
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<MemorySnapshotComparison> CompareSnapshotsAsync(
+        MemorySnapshot baselineSnapshot,
+        MemorySnapshot candidateSnapshot,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(baselineSnapshot);
+        ArgumentNullException.ThrowIfNull(candidateSnapshot);
+        var baselinePath = await ResolvePathAsync(baselineSnapshot.Id, cancellationToken).ConfigureAwait(false);
+        var candidatePath = await ResolvePathAsync(candidateSnapshot.Id, cancellationToken).ConfigureAwait(false);
+        using var baselineIndex = await GetIndexAsync(baselineSnapshot, baselinePath, cancellationToken).ConfigureAwait(false);
+        var baselineSummaries = baselineIndex.TypeSummaries.ToArray();
+        using var candidateIndex = await GetIndexAsync(candidateSnapshot, candidatePath, cancellationToken).ConfigureAwait(false);
+        var candidateSummaries = candidateIndex.TypeSummaries.ToArray();
+        var baselineByType = baselineSummaries.ToDictionary(summary => summary.Type);
+        var candidateByType = candidateSummaries.ToDictionary(summary => summary.Type);
+        var summaries = baselineByType.Keys
+            .Concat(candidateByType.Keys)
+            .Distinct()
+            .Select(type =>
+            {
+                baselineByType.TryGetValue(type, out var baseline);
+                candidateByType.TryGetValue(type, out var candidate);
+                return new MemoryTypeGrowth(
+                    type,
+                    baseline?.ObjectCount ?? 0,
+                    candidate?.ObjectCount ?? 0,
+                    baseline?.TotalSizeBytes ?? 0,
+                    candidate?.TotalSizeBytes ?? 0);
+            })
+            .OrderByDescending(growth => growth.ShallowSizeGrowthBytes)
+            .ThenByDescending(growth => growth.ObjectCountGrowth)
+            .ThenBy(growth => growth.Type.TypeName, StringComparer.Ordinal)
+            .ToArray();
+        return new MemorySnapshotComparison(baselineSnapshot.Id, candidateSnapshot.Id, summaries);
     }
 
     /// <summary>
@@ -135,7 +210,7 @@ internal sealed class DiagnosticsMemorySnapshotAnalysisService : IMemorySnapshot
         ArgumentNullException.ThrowIfNull(snapshot);
         ArgumentNullException.ThrowIfNull(type);
         var path = await ResolvePathAsync(snapshot.Id, cancellationToken).ConfigureAwait(false);
-        var index = await GetIndexAsync(snapshot, path, cancellationToken).ConfigureAwait(false);
+        using var index = await GetIndexAsync(snapshot, path, cancellationToken).ConfigureAwait(false);
         return index.GetObjects(type);
     }
 
@@ -149,8 +224,8 @@ internal sealed class DiagnosticsMemorySnapshotAnalysisService : IMemorySnapshot
     {
         ArgumentNullException.ThrowIfNull(snapshot);
         var path = await ResolvePathAsync(snapshot.Id, cancellationToken).ConfigureAwait(false);
-        var index = await GetIndexAsync(snapshot, path, cancellationToken).ConfigureAwait(false);
-        return index.GetReferencePath(objectAddress);
+        using var index = await GetIndexAsync(snapshot, path, cancellationToken).ConfigureAwait(false);
+        return index.GetReferencePath(objectAddress, cancellationToken);
     }
 
     /// <summary>
@@ -166,7 +241,7 @@ internal sealed class DiagnosticsMemorySnapshotAnalysisService : IMemorySnapshot
         ArgumentOutOfRangeException.ThrowIfLessThan(maxPathCount, 1);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(maxPathCount, 16);
         var path = await ResolvePathAsync(snapshot.Id, cancellationToken).ConfigureAwait(false);
-        var index = await GetIndexAsync(snapshot, path, cancellationToken).ConfigureAwait(false);
+        using var index = await GetIndexAsync(snapshot, path, cancellationToken).ConfigureAwait(false);
         return await Task.Run(
             () => index.GetRetentionPaths(objectAddress, maxPathCount, cancellationToken),
             CancellationToken.None).ConfigureAwait(false);
@@ -175,7 +250,7 @@ internal sealed class DiagnosticsMemorySnapshotAnalysisService : IMemorySnapshot
     /// <summary>
     /// 使用当前快照的单飞缓存读取紧凑对象索引。
     /// </summary>
-    private Task<SnapshotIndex> GetIndexAsync(
+    private Task<HeapIndexHandle> GetIndexAsync(
         MemorySnapshot snapshot,
         string path,
         CancellationToken cancellationToken)
@@ -190,7 +265,14 @@ internal sealed class DiagnosticsMemorySnapshotAnalysisService : IMemorySnapshot
 
         return _indexCache.GetAsync(
             snapshot.Id,
-            () => indexedReader.ReadIndexAsync(path),
+            async () =>
+            {
+                return await indexedReader.BuildIndexAsync(
+                    snapshot.Id,
+                    path,
+                    _indexRouter,
+                    CancellationToken.None).ConfigureAwait(false);
+            },
             cancellationToken);
     }
 }

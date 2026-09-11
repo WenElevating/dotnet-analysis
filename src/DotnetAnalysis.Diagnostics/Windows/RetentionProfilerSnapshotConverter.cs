@@ -81,13 +81,7 @@ internal static class RetentionProfilerSnapshotConverter
                 continue;
             }
 
-            var kind = MapRootKind(rawRoot.RootKind);
-            var root = new MemoryRetentionRoot(
-                kind,
-                MapRootFlags(kind, rawRoot.RootFlags),
-                ResolveFunctionName(kind, rawRoot, rawCapture.Functions, out var moduleName),
-                moduleName);
-            roots.Add(new RetentionHeapSnapshot.RootRecord(address, root));
+            roots.Add(new RetentionHeapSnapshot.RootRecord(address, CreateRoot(rawRoot, rawCapture.Functions)));
         }
 
         return new RetentionHeapSnapshot.SnapshotData(types, objects, edges, roots);
@@ -96,9 +90,9 @@ internal static class RetentionProfilerSnapshotConverter
     /// <summary>
     /// 优先使用 CLR Metadata API 已验证的类型名；缺少证据时显式保留 ClassID，避免错误宣称类型名称。
     /// </summary>
-    private static TypeIdentity CreateTypeIdentity(
+    internal static TypeIdentity CreateTypeIdentity(
         nuint classId,
-        Dictionary<nuint, RetentionProfilerRawType> verifiedTypesByClassId)
+        IReadOnlyDictionary<nuint, RetentionProfilerRawType> verifiedTypesByClassId)
     {
         if (verifiedTypesByClassId.TryGetValue(classId, out var type))
         {
@@ -108,6 +102,28 @@ internal static class RetentionProfilerSnapshotConverter
         }
 
         return new TypeIdentity($"未知类型 (ClassID 0x{(ulong)classId:X})", null);
+    }
+
+    /// <summary>
+    /// 将 CLR 原生根类别映射为公开模型；未知数值保留为 Unknown 而非猜测为 Other。
+    /// </summary>
+    /// <summary>
+    /// 使用 CLR 回调的根类别、标志和已验证 FunctionID 证据创建公开根模型；
+    /// 非栈根或证据不匹配时绝不返回函数名称。
+    /// </summary>
+    /// <param name="rawRoot">原始 CLR 根记录。</param>
+    /// <param name="functions">按原始证据索引排列的函数记录。</param>
+    /// <returns>包含可信根类别和可选函数证据的根模型。</returns>
+    internal static MemoryRetentionRoot CreateRoot(
+        RetentionProfilerRawRoot rawRoot,
+        IReadOnlyList<RetentionProfilerRawFunction> functions)
+    {
+        var kind = MapRootKind(rawRoot.RootKind);
+        return new MemoryRetentionRoot(
+            kind,
+            MapRootFlags(kind, rawRoot.RootFlags),
+            ResolveFunctionName(kind, rawRoot, functions, out var moduleName),
+            moduleName);
     }
 
     /// <summary>

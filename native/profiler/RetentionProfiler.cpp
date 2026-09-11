@@ -22,6 +22,8 @@ namespace
     constexpr std::uint32_t kMaximumFunctionEvidence = 1024;
     constexpr std::size_t kTypeHashCapacity = 8192;
     constexpr std::size_t kMaximumTypeResolutionDepth = 8;
+    constexpr ULONG32 kMaximumGenericTypeArguments = 32;
+    constexpr std::size_t kMaximumRetentionSegments = DotnetAnalysis::kRetentionProfilerMaximumSegmentCount;
     std::atomic<LONG> s_activeProfilerObjects{ 0 };
     std::atomic<LONG> s_activeClassFactories{ 0 };
     std::atomic<LONG> s_serverLocks{ 0 };
@@ -36,10 +38,15 @@ namespace
         ICorProfilerInfo3* profilerInfo;
         ICorProfilerInfo3* forceGcProfilerInfo;
         HANDLE mappingHandle;
+        HANDLE additionalMappingHandles[kMaximumRetentionSegments - 1];
         HANDLE completionEvent;
         HANDLE failureEvent;
         HANDLE detachEvent;
         DotnetAnalysis::RetentionProfilerSharedHeader* header;
+        DotnetAnalysis::RetentionProfilerSharedHeader* additionalHeaders[kMaximumRetentionSegments - 1];
+        std::uint32_t segmentCount;
+        std::uint32_t nextSegmentIndex;
+        volatile LONGLONG nextPublicationSequence;
         bool overflowed;
         UINT_PTR typeHashKeys[kTypeHashCapacity];
         std::uint32_t typeHashEvidenceIndexes[kTypeHashCapacity];
@@ -72,6 +79,19 @@ namespace
     /// </summary>
     void CloseResources(RawRetentionProfiler* profiler)
     {
+        for (std::size_t index = 0; index < kMaximumRetentionSegments - 1; ++index)
+        {
+            if (profiler->additionalHeaders[index] != nullptr)
+            {
+                UnmapViewOfFile(profiler->additionalHeaders[index]);
+                profiler->additionalHeaders[index] = nullptr;
+            }
+            if (profiler->additionalMappingHandles[index] != nullptr)
+            {
+                CloseHandle(profiler->additionalMappingHandles[index]);
+                profiler->additionalMappingHandles[index] = nullptr;
+            }
+        }
         if (profiler->header != nullptr)
         {
             UnmapViewOfFile(profiler->header);
@@ -110,10 +130,14 @@ namespace
     void FailCapture(RawRetentionProfiler* profiler, HRESULT failureHResult = E_FAIL)
     {
         profiler->overflowed = true;
-        if (profiler->header != nullptr)
+        for (std::uint32_t index = 0; index < profiler->segmentCount; ++index)
         {
-            InterlockedCompareExchange(&profiler->header->failureHResult, failureHResult, S_OK);
-            InterlockedExchange(&profiler->header->status, static_cast<LONG>(DotnetAnalysis::RetentionProfilerCaptureStatus::Failed));
+            auto* header = index == 0 ? profiler->header : profiler->additionalHeaders[index - 1];
+            if (header != nullptr)
+            {
+                InterlockedCompareExchange(&header->failureHResult, failureHResult, S_OK);
+                InterlockedExchange(&header->status, static_cast<LONG>(DotnetAnalysis::RetentionProfilerCaptureStatus::Failed));
+            }
         }
         if (profiler->failureEvent != nullptr)
         {
@@ -145,6 +169,115 @@ namespace
 
         InterlockedExchange64(&profiler->header->lastProgressTickCount, GetTickCount64());
         return slot;
+    }
+
+    /// <summary>
+    /// 尝试在单个段中原子预留记录，不把正常的段切换误记为容量失败。
+    /// </summary>
+    LONG TryReserveSegmentSlot(volatile LONG* count, std::uint32_t capacity)
+    {
+        LONG current = InterlockedCompareExchange(count, 0, 0);
+        while (current >= 0 && static_cast<std::uint32_t>(current) < capacity)
+        {
+            const LONG desired = current + 1;
+            const LONG observed = InterlockedCompareExchange(count, desired, current);
+            if (observed == current)
+            {
+                return current;
+            }
+            current = observed;
+        }
+        return -1;
+    }
+
+    /// <summary>
+    /// 按稳定索引返回预分配共享段，隐藏主段与附加段的句柄布局差异。
+    /// </summary>
+    DotnetAnalysis::RetentionProfilerSharedHeader* GetSegmentHeader(
+        RawRetentionProfiler* profiler,
+        std::uint32_t segmentIndex)
+    {
+        return segmentIndex == 0 ? profiler->header : profiler->additionalHeaders[segmentIndex - 1];
+    }
+
+    /// <summary>
+    /// 封存一个不再接受记录的 Writing 段；状态机自行等待已经取得租约的写入者退出，不阻塞当前回调。
+    /// </summary>
+    void PublishGraphSegment(
+        RawRetentionProfiler* profiler,
+        DotnetAnalysis::RetentionProfilerSharedHeader* header)
+    {
+        (void)DotnetAnalysis::TryPublishRetentionProfilerSegment(
+            header,
+            &profiler->nextPublicationSequence);
+    }
+
+    /// <summary>
+    /// 在预分配环中立即预留一条记录并保留写入租约；没有已确认段时稳定报告缓冲区耗尽。
+    /// </summary>
+    DotnetAnalysis::RetentionProfilerSharedHeader* ReserveGraphSlot(
+        RawRetentionProfiler* profiler,
+        DotnetAnalysis::RetentionProfilerGraphRecordKind kind,
+        LONG* slot)
+    {
+        for (std::uint32_t pass = 0; pass < profiler->segmentCount * 2; ++pass)
+        {
+            for (std::uint32_t index = 0; index < profiler->segmentCount; ++index)
+            {
+                auto* header = GetSegmentHeader(profiler, index);
+                if (header == nullptr || !DotnetAnalysis::TryBeginRetentionProfilerSegmentWrite(header))
+                {
+                    continue;
+                }
+                volatile LONG* count = kind == DotnetAnalysis::RetentionProfilerGraphRecordKind::Object
+                    ? &header->objectCount
+                    : kind == DotnetAnalysis::RetentionProfilerGraphRecordKind::Edge
+                        ? &header->edgeCount
+                        : &header->rootCount;
+                const std::uint32_t capacity = kind == DotnetAnalysis::RetentionProfilerGraphRecordKind::Object
+                    ? header->objectCapacity
+                    : kind == DotnetAnalysis::RetentionProfilerGraphRecordKind::Edge
+                        ? header->edgeCapacity
+                        : header->rootCapacity;
+                const LONG reserved = TryReserveSegmentSlot(count, capacity);
+                if (reserved >= 0)
+                {
+                    *slot = reserved;
+                    InterlockedExchange64(&profiler->header->lastProgressTickCount, GetTickCount64());
+                    return header;
+                }
+
+                DotnetAnalysis::CompleteRetentionProfilerSegmentWrite(header);
+                PublishGraphSegment(profiler, header);
+            }
+
+            DotnetAnalysis::RetentionProfilerSharedHeader* segments[kMaximumRetentionSegments]{};
+            for (std::uint32_t index = 0; index < profiler->segmentCount; ++index)
+            {
+                segments[index] = GetSegmentHeader(profiler, index);
+            }
+            bool protocolCorrupted{};
+            auto* acquired = DotnetAnalysis::TryAcquireRetentionProfilerSegment(
+                segments,
+                profiler->segmentCount,
+                &profiler->nextSegmentIndex,
+                kind,
+                &protocolCorrupted);
+            if (protocolCorrupted)
+            {
+                FailCapture(profiler, E_INVALIDARG);
+                *slot = -1;
+                return nullptr;
+            }
+            if (acquired == nullptr)
+            {
+                break;
+            }
+        }
+
+        FailCapture(profiler, E_OUTOFMEMORY);
+        *slot = -1;
+        return nullptr;
     }
 
     /// <summary>
@@ -266,25 +399,29 @@ namespace
         {
             return S_OK;
         }
-        const LONG objectSlot = ReserveSlot(profiler, &profiler->header->objectCount, profiler->header->objectCapacity);
-        if (objectSlot < 0)
+        LONG objectSlot{};
+        auto* objectHeader = ReserveGraphSlot(profiler, DotnetAnalysis::RetentionProfilerGraphRecordKind::Object, &objectSlot);
+        if (objectHeader == nullptr)
         {
             return S_OK;
         }
-        auto* objects = reinterpret_cast<DotnetAnalysis::RetentionProfilerObjectRecord*>(reinterpret_cast<BYTE*>(profiler->header) + profiler->header->objectOffset);
+        auto* objects = reinterpret_cast<DotnetAnalysis::RetentionProfilerObjectRecord*>(reinterpret_cast<BYTE*>(objectHeader) + objectHeader->objectOffset);
         objects[objectSlot] =
         {
             static_cast<UINT_PTR>(objectId),
             static_cast<UINT_PTR>(classId),
             0
         };
-        auto* edges = reinterpret_cast<DotnetAnalysis::RetentionProfilerEdgeRecord*>(reinterpret_cast<BYTE*>(profiler->header) + profiler->header->edgeOffset);
+        DotnetAnalysis::CompleteRetentionProfilerSegmentWrite(objectHeader);
         for (ULONG index = 0; index < referenceCount && !profiler->overflowed; ++index)
         {
-            const LONG edgeSlot = ReserveSlot(profiler, &profiler->header->edgeCount, profiler->header->edgeCapacity);
-            if (edgeSlot >= 0)
+            LONG edgeSlot{};
+            auto* edgeHeader = ReserveGraphSlot(profiler, DotnetAnalysis::RetentionProfilerGraphRecordKind::Edge, &edgeSlot);
+            if (edgeHeader != nullptr)
             {
+                auto* edges = reinterpret_cast<DotnetAnalysis::RetentionProfilerEdgeRecord*>(reinterpret_cast<BYTE*>(edgeHeader) + edgeHeader->edgeOffset);
                 edges[edgeSlot] = { static_cast<UINT_PTR>(objectId), static_cast<UINT_PTR>(references[index]) };
+                DotnetAnalysis::CompleteRetentionProfilerSegmentWrite(edgeHeader);
             }
         }
         return S_OK;
@@ -300,16 +437,17 @@ namespace
         {
             return S_OK;
         }
-        auto* records = reinterpret_cast<DotnetAnalysis::RetentionProfilerRootRecord*>(reinterpret_cast<BYTE*>(profiler->header) + profiler->header->rootOffset);
         for (ULONG index = 0; index < rootCount && !profiler->overflowed; ++index)
         {
             if (roots[index] == 0)
             {
                 continue;
             }
-            const LONG slot = ReserveSlot(profiler, &profiler->header->rootCount, profiler->header->rootCapacity);
-            if (slot >= 0)
+            LONG slot{};
+            auto* rootHeader = ReserveGraphSlot(profiler, DotnetAnalysis::RetentionProfilerGraphRecordKind::Root, &slot);
+            if (rootHeader != nullptr)
             {
+                auto* records = reinterpret_cast<DotnetAnalysis::RetentionProfilerRootRecord*>(reinterpret_cast<BYTE*>(rootHeader) + rootHeader->rootOffset);
                 records[slot] =
                 {
                     static_cast<UINT_PTR>(roots[index]),
@@ -319,6 +457,7 @@ namespace
                     DotnetAnalysis::kNoFunctionEvidence,
                     0
                 };
+                DotnetAnalysis::CompleteRetentionProfilerSegmentWrite(rootHeader);
             }
         }
         return S_OK;
@@ -472,18 +611,27 @@ namespace
     }
 
     /// <summary>
-    /// 使用 CLR ClassID 与 Metadata API 解析真实类型名和模块；固定缓冲区和深度保证完成回调内资源有界。
+    /// 使用 CLR ClassID 与 Metadata API 递归解析真实类型名和模块；固定缓冲区、实参数和祖先链保证资源有界。
     /// </summary>
-    bool ResolveTypeEvidence(
+    bool ResolveTypeEvidenceCore(
         ICorProfilerInfo3* profilerInfo,
         ClassID classId,
         DotnetAnalysis::RetentionProfilerTypeEvidenceRecord* evidence,
-        std::size_t depth = 0)
+        std::size_t depth,
+        ClassID (&resolutionPath)[kMaximumTypeResolutionDepth])
     {
         if (profilerInfo == nullptr || classId == 0 || evidence == nullptr || depth >= kMaximumTypeResolutionDepth)
         {
             return false;
         }
+        for (std::size_t ancestorIndex = 0; ancestorIndex < depth; ++ancestorIndex)
+        {
+            if (resolutionPath[ancestorIndex] == classId)
+            {
+                return false;
+            }
+        }
+        resolutionPath[depth] = classId;
 
         ModuleID moduleId{};
         mdTypeDef typeToken{};
@@ -512,7 +660,7 @@ namespace
             if (elementClassId != 0)
             {
                 DotnetAnalysis::RetentionProfilerTypeEvidenceRecord elementEvidence{};
-                if (!ResolveTypeEvidence(profilerInfo, elementClassId, &elementEvidence, depth + 1))
+                if (!ResolveTypeEvidenceCore(profilerInfo, elementClassId, &elementEvidence, depth + 1, resolutionPath))
                 {
                     return false;
                 }
@@ -556,6 +704,28 @@ namespace
             return false;
         }
 
+        ClassID typeArguments[kMaximumGenericTypeArguments]{};
+        if (typeArgumentCount > kMaximumGenericTypeArguments)
+        {
+            return false;
+        }
+        if (typeArgumentCount > 0)
+        {
+            ULONG32 resolvedTypeArgumentCount{};
+            const HRESULT typeArgumentsResult = profilerInfo->GetClassIDInfo2(
+                classId,
+                &moduleId,
+                &typeToken,
+                &parentClassId,
+                kMaximumGenericTypeArguments,
+                &resolvedTypeArgumentCount,
+                typeArguments);
+            if (FAILED(typeArgumentsResult) || resolvedTypeArgumentCount != typeArgumentCount)
+            {
+                return false;
+            }
+        }
+
         IUnknown* metadataUnknown = nullptr;
         if (FAILED(profilerInfo->GetModuleMetaData(moduleId, ofRead, IID_IMetaDataImport2, &metadataUnknown)) || metadataUnknown == nullptr)
         {
@@ -574,6 +744,37 @@ namespace
             return false;
         }
 
+        if (typeArgumentCount > 0)
+        {
+            if (FAILED(StringCchCatW(evidence->typeName, _countof(evidence->typeName), L"<")))
+            {
+                return false;
+            }
+            for (ULONG32 argumentIndex = 0; argumentIndex < typeArgumentCount; ++argumentIndex)
+            {
+                DotnetAnalysis::RetentionProfilerTypeEvidenceRecord argumentEvidence{};
+                if (!ResolveTypeEvidenceCore(
+                        profilerInfo,
+                        typeArguments[argumentIndex],
+                        &argumentEvidence,
+                        depth + 1,
+                        resolutionPath)
+                    || (argumentIndex > 0
+                        && FAILED(StringCchCatW(evidence->typeName, _countof(evidence->typeName), L",")))
+                    || FAILED(StringCchCatW(
+                        evidence->typeName,
+                        _countof(evidence->typeName),
+                        argumentEvidence.typeName)))
+                {
+                    return false;
+                }
+            }
+            if (FAILED(StringCchCatW(evidence->typeName, _countof(evidence->typeName), L">")))
+            {
+                return false;
+            }
+        }
+
         evidence->classId = static_cast<UINT_PTR>(classId);
         ULONG moduleNameLength{};
         if (FAILED(profilerInfo->GetModuleInfo(
@@ -588,6 +789,19 @@ namespace
         }
         return true;
     }
+
+    /// <summary>
+    /// 为一次顶层类型解析创建固定祖先链，避免递归构造泛型或数组类型发生 ClassID 环路。
+    /// </summary>
+    bool ResolveTypeEvidence(
+        ICorProfilerInfo3* profilerInfo,
+        ClassID classId,
+        DotnetAnalysis::RetentionProfilerTypeEvidenceRecord* evidence)
+    {
+        ClassID resolutionPath[kMaximumTypeResolutionDepth]{};
+        return ResolveTypeEvidenceCore(profilerInfo, classId, evidence, 0, resolutionPath);
+    }
+
 
     /// <summary>
     /// 为一个 ClassID 注册至多一条类型证据；实例内固定哈希表避免按对象数线性扫描类型表。
@@ -648,15 +862,18 @@ namespace
         {
             return;
         }
-        auto* objects = reinterpret_cast<DotnetAnalysis::RetentionProfilerObjectRecord*>(
-            reinterpret_cast<BYTE*>(profiler->header) + profiler->header->objectOffset);
-        const LONG objectCount = profiler->header->objectCount;
-        for (LONG objectIndex = 0; objectIndex < objectCount; ++objectIndex)
+        for (std::uint32_t segmentIndex = 0; segmentIndex < profiler->segmentCount; ++segmentIndex)
         {
-            RegisterTypeEvidence(profiler, static_cast<ClassID>(objects[objectIndex].classId));
-            if ((objectIndex & 0xffff) == 0)
+            auto* header = GetSegmentHeader(profiler, segmentIndex);
+            auto* objects = reinterpret_cast<DotnetAnalysis::RetentionProfilerObjectRecord*>(
+                reinterpret_cast<BYTE*>(header) + header->objectOffset);
+            for (LONG objectIndex = 0; objectIndex < header->objectCount; ++objectIndex)
             {
-                InterlockedExchange64(&profiler->header->lastProgressTickCount, GetTickCount64());
+                RegisterTypeEvidence(profiler, static_cast<ClassID>(objects[objectIndex].classId));
+                if ((objectIndex & 0xffff) == 0)
+                {
+                    InterlockedExchange64(&profiler->header->lastProgressTickCount, GetTickCount64());
+                }
             }
         }
     }
@@ -675,22 +892,25 @@ namespace
             return;
         }
 
-        auto* objects = reinterpret_cast<DotnetAnalysis::RetentionProfilerObjectRecord*>(
-            reinterpret_cast<BYTE*>(profiler->header) + profiler->header->objectOffset);
-        const LONG objectCount = profiler->header->objectCount;
-        for (LONG objectIndex = 0; objectIndex < objectCount; ++objectIndex)
+        for (std::uint32_t segmentIndex = 0; segmentIndex < profiler->segmentCount; ++segmentIndex)
         {
-            ULONG objectSize{};
-            if (SUCCEEDED(profiler->profilerInfo->GetObjectSize(
-                    static_cast<ObjectID>(objects[objectIndex].objectId),
-                    &objectSize)))
+            auto* header = GetSegmentHeader(profiler, segmentIndex);
+            auto* objects = reinterpret_cast<DotnetAnalysis::RetentionProfilerObjectRecord*>(
+                reinterpret_cast<BYTE*>(header) + header->objectOffset);
+            for (LONG objectIndex = 0; objectIndex < header->objectCount; ++objectIndex)
             {
-                objects[objectIndex].sizeBytes = static_cast<UINT_PTR>(objectSize);
-            }
+                ULONG objectSize{};
+                if (SUCCEEDED(profiler->profilerInfo->GetObjectSize(
+                        static_cast<ObjectID>(objects[objectIndex].objectId),
+                        &objectSize)))
+                {
+                    objects[objectIndex].sizeBytes = static_cast<UINT_PTR>(objectSize);
+                }
 
-            if ((objectIndex & 0xffff) == 0)
-            {
-                InterlockedExchange64(&profiler->header->lastProgressTickCount, GetTickCount64());
+                if ((objectIndex & 0xffff) == 0)
+                {
+                    InterlockedExchange64(&profiler->header->lastProgressTickCount, GetTickCount64());
+                }
             }
         }
     }
@@ -704,41 +924,44 @@ namespace
         {
             return;
         }
-        auto* roots = reinterpret_cast<DotnetAnalysis::RetentionProfilerRootRecord*>(reinterpret_cast<BYTE*>(profiler->header) + profiler->header->rootOffset);
-        auto* functions = reinterpret_cast<DotnetAnalysis::RetentionProfilerFunctionEvidenceRecord*>(reinterpret_cast<BYTE*>(profiler->header) + profiler->header->functionOffset);
-        const LONG rootCount = profiler->header->rootCount;
-        for (LONG rootIndex = 0; rootIndex < rootCount; ++rootIndex)
+        for (std::uint32_t segmentIndex = 0; segmentIndex < profiler->segmentCount; ++segmentIndex)
         {
-            auto& root = roots[rootIndex];
-            if (root.rootKind != COR_PRF_GC_ROOT_STACK || root.rootId == 0)
+            auto* header = GetSegmentHeader(profiler, segmentIndex);
+            auto* roots = reinterpret_cast<DotnetAnalysis::RetentionProfilerRootRecord*>(reinterpret_cast<BYTE*>(header) + header->rootOffset);
+            auto* functions = reinterpret_cast<DotnetAnalysis::RetentionProfilerFunctionEvidenceRecord*>(reinterpret_cast<BYTE*>(header) + header->functionOffset);
+            for (LONG rootIndex = 0; rootIndex < header->rootCount; ++rootIndex)
             {
-                continue;
-            }
-            LONG functionIndex = -1;
-            const LONG existingCount = profiler->header->functionCount;
-            for (LONG index = 0; index < existingCount; ++index)
-            {
-                if (functions[index].functionId == root.rootId)
+                auto& root = roots[rootIndex];
+                if (root.rootKind != COR_PRF_GC_ROOT_STACK || root.rootId == 0)
                 {
-                    functionIndex = index;
-                    break;
+                    continue;
                 }
-            }
-            if (functionIndex < 0 && static_cast<std::uint32_t>(existingCount) < profiler->header->functionCapacity)
-            {
-                const LONG reserved = ReserveSlot(profiler, &profiler->header->functionCount, profiler->header->functionCapacity);
-                if (reserved >= 0 && ResolveFunctionEvidence(profiler->profilerInfo, root.rootId, &functions[reserved]))
+                LONG functionIndex = -1;
+                const LONG existingCount = header->functionCount;
+                for (LONG index = 0; index < existingCount; ++index)
                 {
-                    functionIndex = reserved;
+                    if (functions[index].functionId == root.rootId)
+                    {
+                        functionIndex = index;
+                        break;
+                    }
                 }
-                else if (reserved >= 0)
+                if (functionIndex < 0 && static_cast<std::uint32_t>(existingCount) < header->functionCapacity)
                 {
-                    functions[reserved].functionId = 0;
+                    const LONG reserved = ReserveSlot(profiler, &header->functionCount, header->functionCapacity);
+                    if (reserved >= 0 && ResolveFunctionEvidence(profiler->profilerInfo, root.rootId, &functions[reserved]))
+                    {
+                        functionIndex = reserved;
+                    }
+                    else if (reserved >= 0)
+                    {
+                        functions[reserved].functionId = 0;
+                    }
                 }
-            }
-            if (functionIndex >= 0)
-            {
-                root.functionEvidenceIndex = static_cast<std::uint32_t>(functionIndex);
+                if (functionIndex >= 0)
+                {
+                    root.functionEvidenceIndex = static_cast<std::uint32_t>(functionIndex);
+                }
             }
         }
     }
@@ -756,7 +979,12 @@ namespace
                 static_cast<LONG>(DotnetAnalysis::RetentionProfilerCaptureStatus::Pending));
             if (previous == static_cast<LONG>(DotnetAnalysis::RetentionProfilerCaptureStatus::Pending))
             {
-                InterlockedExchange64(&profiler->header->lastProgressTickCount, GetTickCount64());
+                for (std::uint32_t index = 0; index < profiler->segmentCount; ++index)
+                {
+                    auto* header = index == 0 ? profiler->header : profiler->additionalHeaders[index - 1];
+                    InterlockedExchange(&header->status, static_cast<LONG>(DotnetAnalysis::RetentionProfilerCaptureStatus::Capturing));
+                    InterlockedExchange64(&header->lastProgressTickCount, GetTickCount64());
+                }
             }
         }
         return S_OK;
@@ -772,12 +1000,31 @@ namespace
         {
             return S_OK;
         }
+        // ObjectReferences 和 RootReferences2 已全部返回；把每个最终部分段发布到单调序列，
+        // Controller 可继续转存，而对象 ledger 保持不变供本回调在合法时点回填大小与证据。
+        for (std::uint32_t index = 0; index < profiler->segmentCount; ++index)
+        {
+            PublishGraphSegment(profiler, GetSegmentHeader(profiler, index));
+        }
+        for (std::uint32_t index = 0; index < profiler->segmentCount; ++index)
+        {
+            InterlockedExchange(
+                &GetSegmentHeader(profiler, index)->status,
+                static_cast<LONG>(DotnetAnalysis::RetentionProfilerCaptureStatus::Finalizing));
+        }
         ResolveHeapObjectSizes(profiler);
         ResolveHeapTypes(profiler);
         ResolveStackRootFunctions(profiler);
         if (profiler->overflowed)
         {
             return S_OK;
+        }
+        MemoryBarrier();
+        for (std::uint32_t index = 1; index < profiler->segmentCount; ++index)
+        {
+            InterlockedExchange(
+                &profiler->additionalHeaders[index - 1]->status,
+                static_cast<LONG>(DotnetAnalysis::RetentionProfilerCaptureStatus::Completed));
         }
         MemoryBarrier();
         InterlockedExchange(&profiler->header->status, static_cast<LONG>(DotnetAnalysis::RetentionProfilerCaptureStatus::Completed));
@@ -822,7 +1069,7 @@ namespace
         {
             return E_NOINTERFACE;
         }
-        profiler->mappingHandle = OpenFileMappingW(FILE_MAP_WRITE, FALSE, data.mappingName);
+        profiler->mappingHandle = OpenFileMappingW(FILE_MAP_WRITE, FALSE, data.segmentNames[0]);
         profiler->completionEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, data.completionEventName);
         profiler->failureEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, data.failureEventName);
         profiler->detachEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, data.detachEventName);
@@ -831,23 +1078,52 @@ namespace
             CloseResources(profiler);
             return HRESULT_FROM_WIN32(GetLastError());
         }
-        profiler->header = static_cast<DotnetAnalysis::RetentionProfilerSharedHeader*>(MapViewOfFile(profiler->mappingHandle, FILE_MAP_WRITE, 0, 0, data.mappingCapacityBytes));
+        profiler->header = static_cast<DotnetAnalysis::RetentionProfilerSharedHeader*>(MapViewOfFile(profiler->mappingHandle, FILE_MAP_WRITE, 0, 0, data.segmentCapacityBytes));
         if (profiler->header == nullptr
             || profiler->header->magic != DotnetAnalysis::kRetentionProfilerSharedMemoryMagic
             || profiler->header->version != DotnetAnalysis::kRetentionProfilerProtocolVersion
-            || profiler->header->capacityBytes != data.mappingCapacityBytes
-            || !IsRegionValid(profiler->header->objectOffset, profiler->header->objectCapacity, sizeof(DotnetAnalysis::RetentionProfilerObjectRecord), data.mappingCapacityBytes)
-            || !IsRegionValid(profiler->header->edgeOffset, profiler->header->edgeCapacity, sizeof(DotnetAnalysis::RetentionProfilerEdgeRecord), data.mappingCapacityBytes)
-            || !IsRegionValid(profiler->header->rootOffset, profiler->header->rootCapacity, sizeof(DotnetAnalysis::RetentionProfilerRootRecord), data.mappingCapacityBytes)
-            || !IsRegionValid(profiler->header->typeOffset, profiler->header->typeCapacity, sizeof(DotnetAnalysis::RetentionProfilerTypeEvidenceRecord), data.mappingCapacityBytes))
+            || profiler->header->capacityBytes != data.segmentCapacityBytes
+            || profiler->header->segmentState != static_cast<LONG>(DotnetAnalysis::RetentionProfilerSegmentState::Reusable)
+            || profiler->header->publicationSequence != profiler->header->acknowledgedSequence
+            || !IsRegionValid(profiler->header->objectOffset, profiler->header->objectCapacity, sizeof(DotnetAnalysis::RetentionProfilerObjectRecord), data.segmentCapacityBytes)
+            || !IsRegionValid(profiler->header->edgeOffset, profiler->header->edgeCapacity, sizeof(DotnetAnalysis::RetentionProfilerEdgeRecord), data.segmentCapacityBytes)
+            || !IsRegionValid(profiler->header->rootOffset, profiler->header->rootCapacity, sizeof(DotnetAnalysis::RetentionProfilerRootRecord), data.segmentCapacityBytes)
+            || !IsRegionValid(profiler->header->typeOffset, profiler->header->typeCapacity, sizeof(DotnetAnalysis::RetentionProfilerTypeEvidenceRecord), data.segmentCapacityBytes))
         {
             CloseResources(profiler);
             return E_INVALIDARG;
         }
-        if (!IsRegionValid(profiler->header->functionOffset, profiler->header->functionCapacity, sizeof(DotnetAnalysis::RetentionProfilerFunctionEvidenceRecord), data.mappingCapacityBytes))
+        if (!IsRegionValid(profiler->header->functionOffset, profiler->header->functionCapacity, sizeof(DotnetAnalysis::RetentionProfilerFunctionEvidenceRecord), data.segmentCapacityBytes))
         {
             CloseResources(profiler);
             return E_INVALIDARG;
+        }
+        profiler->segmentCount = data.segmentCount;
+        profiler->nextSegmentIndex = 0;
+        profiler->nextPublicationSequence = 0;
+        for (std::uint32_t index = 1; index < data.segmentCount; ++index)
+        {
+            profiler->additionalMappingHandles[index - 1] = OpenFileMappingW(FILE_MAP_WRITE, FALSE, data.segmentNames[index]);
+            profiler->additionalHeaders[index - 1] = profiler->additionalMappingHandles[index - 1] == nullptr
+                ? nullptr
+                : static_cast<DotnetAnalysis::RetentionProfilerSharedHeader*>(MapViewOfFile(
+                    profiler->additionalMappingHandles[index - 1], FILE_MAP_WRITE, 0, 0, data.segmentCapacityBytes));
+            auto* header = profiler->additionalHeaders[index - 1];
+            if (header == nullptr
+                || header->magic != DotnetAnalysis::kRetentionProfilerSharedMemoryMagic
+                || header->version != DotnetAnalysis::kRetentionProfilerProtocolVersion
+                || header->capacityBytes != data.segmentCapacityBytes
+                || header->segmentState != static_cast<LONG>(DotnetAnalysis::RetentionProfilerSegmentState::Reusable)
+                || header->publicationSequence != header->acknowledgedSequence
+                || !IsRegionValid(header->objectOffset, header->objectCapacity, sizeof(DotnetAnalysis::RetentionProfilerObjectRecord), data.segmentCapacityBytes)
+                || !IsRegionValid(header->edgeOffset, header->edgeCapacity, sizeof(DotnetAnalysis::RetentionProfilerEdgeRecord), data.segmentCapacityBytes)
+                || !IsRegionValid(header->rootOffset, header->rootCapacity, sizeof(DotnetAnalysis::RetentionProfilerRootRecord), data.segmentCapacityBytes)
+                || !IsRegionValid(header->functionOffset, header->functionCapacity, sizeof(DotnetAnalysis::RetentionProfilerFunctionEvidenceRecord), data.segmentCapacityBytes)
+                || !IsRegionValid(header->typeOffset, header->typeCapacity, sizeof(DotnetAnalysis::RetentionProfilerTypeEvidenceRecord), data.segmentCapacityBytes))
+            {
+                CloseResources(profiler);
+                return E_INVALIDARG;
+            }
         }
         return profiler->profilerInfo->SetEventMask(COR_PRF_MONITOR_GC);
     }
@@ -932,11 +1208,13 @@ namespace
             return E_POINTER;
         }
         *result = nullptr;
-        auto* profiler = new (std::nothrow) RawRetentionProfiler{ GetProfilerVtable(), 1, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, false };
+        auto* profiler = new (std::nothrow) RawRetentionProfiler{};
         if (profiler == nullptr)
         {
             return E_OUTOFMEMORY;
         }
+        profiler->vtable = GetProfilerVtable();
+        profiler->referenceCount = 1;
         ++s_activeProfilerObjects;
         const HRESULT queryResult = QueryInterface(profiler, riid, result);
         Release(profiler);

@@ -10,6 +10,7 @@ for (var index = 0; index < initialObjectCount; index++)
 }
 
 TestState.Graph = new RetainedGraph(allocations, new byte[4096]);
+TestState.ConstructedGenerics = new ConstructedGenericRoots();
 var executionWorkload = ReadExecutionWorkloadEnabled() ? ExecutionSamplingWorkload.Start() : null;
 try
 {
@@ -96,7 +97,28 @@ sealed class RetainedGraph
     public byte[] Payload { get; }
 }
 
+/// <summary>
+/// 同时保留具有不同 CLR 类型实参的同一泛型类型定义，供 Profiler 集成测试验证构造泛型身份。
+/// </summary>
+sealed class ConstructedGenericRoots
+{
+    /// <summary>
+    /// 保留 <see cref="List{String}"/> 的实例，使其构造类型出现在实时托管堆中。
+    /// </summary>
+    public List<string> Strings { get; } = [new string('s', 8)];
+
+    /// <summary>
+    /// 保留 <see cref="List{Object}"/> 的实例，使其与字符串实参构造类型可被区分。
+    /// </summary>
+    public List<object> Objects { get; } = [new object()];
+}
+
 static class TestState
 {
     public static RetainedGraph? Graph;
+
+    /// <summary>
+    /// 在目标进程生命周期内固定持有构造泛型测试对象。
+    /// </summary>
+    public static ConstructedGenericRoots? ConstructedGenerics;
 }

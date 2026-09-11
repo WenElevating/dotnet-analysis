@@ -160,17 +160,47 @@ internal sealed class MemorySnapshotStore
     /// <param name="allocationProfile">本次捕获封存的分配区间概要。</param>
     /// <param name="cancellationToken">取消当前验证或提升操作的令牌。</param>
     /// <returns>包含保留格式和最终路径的已持久化快照。</returns>
+    /// <exception cref="DiagnosticsException">容量、格式校验或原子提升失败时引发。</exception>
     public async Task<StoredSnapshot> PromoteRetentionAsync(
         MemorySnapshot snapshot,
         string temporaryPath,
         AllocationProfile allocationProfile,
         CancellationToken cancellationToken)
     {
+        using var captureReservation = await _retentionStorageGuard
+            .ReserveCaptureAsync(cancellationToken)
+            .ConfigureAwait(false);
+        return await PromoteRetentionAsync(
+            snapshot,
+            temporaryPath,
+            allocationProfile,
+            captureReservation,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 在调用方已持有完整捕获生命周期租约时复核实际占用并提升专用保留快照，避免重复获取目录锁。
+    /// </summary>
+    /// <param name="snapshot">已成功采集但尚待分析的快照元数据。</param>
+    /// <param name="temporaryPath">包含完整标记与校验和的临时保留快照路径。</param>
+    /// <param name="allocationProfile">本次捕获封存的分配区间概要。</param>
+    /// <param name="captureReservation">从 attach 前一直持有到发布或失败证据归档完成的容量租约。</param>
+    /// <param name="cancellationToken">取消当前容量复核、验证或提升操作的令牌。</param>
+    /// <returns>包含保留格式和最终路径的已持久化快照。</returns>
+    /// <exception cref="DiagnosticsException">容量、格式校验或原子提升失败时引发。</exception>
+    internal async Task<StoredSnapshot> PromoteRetentionAsync(
+        MemorySnapshot snapshot,
+        string temporaryPath,
+        AllocationProfile allocationProfile,
+        IRetentionSnapshotCaptureReservation captureReservation,
+        CancellationToken cancellationToken)
+    {
         ArgumentNullException.ThrowIfNull(snapshot);
         ArgumentException.ThrowIfNullOrWhiteSpace(temporaryPath);
         ArgumentNullException.ThrowIfNull(allocationProfile);
-        using var promotionReservation = await _retentionStorageGuard.ReservePromotionAsync(temporaryPath, cancellationToken).ConfigureAwait(false);
-        await RetentionHeapSnapshot.ReadIndexAsync(temporaryPath, cancellationToken).ConfigureAwait(false);
+        ArgumentNullException.ThrowIfNull(captureReservation);
+        await captureReservation.EnsureCanStoreAsync(temporaryPath, cancellationToken).ConfigureAwait(false);
+        await RetentionHeapSnapshot.ValidateAsync(temporaryPath, cancellationToken).ConfigureAwait(false);
         return await PromoteCoreAsync(
             snapshot,
             temporaryPath,
@@ -194,6 +224,8 @@ internal sealed class MemorySnapshotStore
         ArgumentNullException.ThrowIfNull(allocationProfile);
         cancellationToken.ThrowIfCancellationRequested();
         var snapshotId = snapshot.Id;
+        var finalSnapshotCreated = false;
+        var finalManifestCreated = false;
         try
         {
             if (!File.Exists(temporaryPath))
@@ -216,24 +248,21 @@ internal sealed class MemorySnapshotStore
             var integrity = await SnapshotIntegrity.CreateAsync(temporaryPath, cancellationToken).ConfigureAwait(false);
             await WriteManifestAsync(temporaryManifestPath, stored, integrity, cancellationToken).ConfigureAwait(false);
             File.Move(temporaryPath, finalDumpPath, false);
-            try
-            {
-                File.Move(temporaryManifestPath, finalManifestPath, false);
-            }
-            catch
-            {
-                TryDelete(finalDumpPath);
-                throw;
-            }
+            finalSnapshotCreated = true;
+            File.Move(temporaryManifestPath, finalManifestPath, false);
+            finalManifestCreated = true;
             _catalog.Register(snapshotId, finalDumpPath);
             return stored;
         }
         catch (Exception exception)
         {
             await DeleteTemporaryAsync(temporaryPath).ConfigureAwait(false);
-            TryDelete(GetFinalSnapshotPath(snapshotId, snapshotFormat));
-            TryDelete(_layout.GetFinalManifestPath(snapshotId));
             TryDelete(_layout.GetTemporaryManifestPath(snapshotId));
+            if (finalSnapshotCreated && !finalManifestCreated)
+            {
+                TryDelete(GetFinalSnapshotPath(snapshotId, snapshotFormat));
+            }
+
             if (exception is DiagnosticsException diagnosticsException)
             {
                 throw diagnosticsException;

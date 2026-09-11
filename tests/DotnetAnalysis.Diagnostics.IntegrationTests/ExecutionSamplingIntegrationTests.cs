@@ -57,20 +57,16 @@ public sealed class ExecutionSamplingIntegrationTests
             .ToArray();
         var firstQueryObservation = ObserveQueryCompletion(queryTasks[0]);
         var secondQueryObservation = ObserveQueryCompletion(queryTasks[1]);
-        var firstCancellationScheduledAt = Stopwatch.GetTimestamp();
         firstCancelledQuery.CancelAfter(QueryCancellationDelayMilliseconds);
-        var secondCancellationScheduledAt = Stopwatch.GetTimestamp();
         secondCancelledQuery.CancelAfter(QueryCancellationDelayMilliseconds);
 
-        await AssertCancelledOrCompletedBeforeDeadlineAsync(
+        await AssertCancelledOrCompletedAsync(
             firstQueryObservation,
             firstCancelledQuery,
-            firstCancellationScheduledAt,
             cancellationToken);
-        await AssertCancelledOrCompletedBeforeDeadlineAsync(
+        await AssertCancelledOrCompletedAsync(
             secondQueryObservation,
             secondCancelledQuery,
-            secondCancellationScheduledAt,
             cancellationToken);
         var successfulProfiles = await Task.WhenAll(queryTasks[2..]);
 
@@ -329,45 +325,42 @@ public sealed class ExecutionSamplingIntegrationTests
         Assert.AreEqual(DiagnosticsErrorCode.ExecutionProfileRangeUnavailable, exception.ErrorCode);
     }
 
-    private static Task<ObservedExecutionQuery> ObserveQueryCompletion(Task<ExecutionProfile> queryTask) =>
+    private static Task<Task<ExecutionProfile>> ObserveQueryCompletion(Task<ExecutionProfile> queryTask) =>
         queryTask.ContinueWith(
-            static completedQuery => new ObservedExecutionQuery(completedQuery, Stopwatch.GetTimestamp()),
+            static completedQuery => completedQuery,
             CancellationToken.None,
             TaskContinuationOptions.ExecuteSynchronously,
             TaskScheduler.Default);
 
-    private static async Task AssertCancelledOrCompletedBeforeDeadlineAsync(
-        Task<ObservedExecutionQuery> observationTask,
+    /// <summary>
+    /// 验证查询要么先完成，要么明确由调用方令牌取消；不将线程池计时器的调度延迟当成诊断查询的取消语义。
+    /// </summary>
+    /// <param name="observationTask">记录查询任务完成时刻的观察任务。</param>
+    /// <param name="queryCancellation">控制当前查询的调用方取消源。</param>
+    /// <param name="testCancellation">集成测试外层取消令牌。</param>
+    /// <returns>表示断言完成的任务。</returns>
+    private static async Task AssertCancelledOrCompletedAsync(
+        Task<Task<ExecutionProfile>> observationTask,
         CancellationTokenSource queryCancellation,
-        long cancellationScheduledAt,
         CancellationToken testCancellation)
     {
-        var observation = await observationTask;
-        var completionDelay = Stopwatch.GetElapsedTime(
-            cancellationScheduledAt,
-            observation.CompletedAtTimestamp);
-        if (observation.QueryTask.IsCompletedSuccessfully)
+        var queryTask = await observationTask;
+        if (queryTask.IsCompletedSuccessfully)
         {
-            Assert.IsTrue(
-                completionDelay <= TimeSpan.FromMilliseconds(QueryCancellationDelayMilliseconds),
-                $"A cancellable execution query completed successfully after its {QueryCancellationDelayMilliseconds} ms deadline.");
-            AssertProfileCountsAreConsistent(observation.QueryTask.Result);
+            AssertProfileCountsAreConsistent(queryTask.Result);
             return;
         }
 
         try
         {
-            await observation.QueryTask;
+            await queryTask;
             Assert.Fail("The observed execution query did not produce a result or cancellation.");
         }
         catch (OperationCanceledException) when (!testCancellation.IsCancellationRequested)
         {
             Assert.IsTrue(
                 queryCancellation.IsCancellationRequested,
-                "The execution query cancellation must originate from its scheduled query token.");
-            Assert.IsTrue(
-                completionDelay >= TimeSpan.FromMilliseconds(QueryCancellationDelayMilliseconds),
-                "Only an execution query that remained active until its cancellation deadline may report cancellation.");
+                "The execution query cancellation must originate from its caller query token.");
         }
     }
 
@@ -447,10 +440,6 @@ public sealed class ExecutionSamplingIntegrationTests
             }
         }
     }
-
-    private sealed record ObservedExecutionQuery(
-        Task<ExecutionProfile> QueryTask,
-        long CompletedAtTimestamp);
 
     private sealed class AttachedExecutionTarget : IAsyncDisposable
     {

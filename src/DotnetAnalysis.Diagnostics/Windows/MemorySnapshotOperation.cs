@@ -182,6 +182,35 @@ public sealed class MemorySnapshotOperation
     }
 
     /// <summary>
+    /// 按保留大小降序读取当前快照的支配树对象分页。
+    /// </summary>
+    /// <param name="offset">相对于排序结果的零基偏移量。</param>
+    /// <param name="pageSize">每页对象数，范围为 1 至 1000。</param>
+    /// <param name="cancellationToken">取消当前等待或分页投影操作的令牌。</param>
+    /// <returns>支配树对象分页结果。</returns>
+    public Task<MemoryDominatorPage> GetDominatorPageAsync(
+        int offset,
+        int pageSize,
+        CancellationToken cancellationToken)
+    {
+        return _analysisService.GetDominatorPageAsync(Snapshot, offset, pageSize, cancellationToken);
+    }
+
+    /// <summary>
+    /// 以当前快照为基线，按类型身份比较候选快照的对象数和浅表大小增长。
+    /// </summary>
+    /// <param name="candidateSnapshot">作为比较目标的快照。</param>
+    /// <param name="cancellationToken">取消当前等待或读取操作的令牌。</param>
+    /// <returns>按浅表大小增长排序的比较结果。</returns>
+    public Task<MemorySnapshotComparison> CompareSnapshotsAsync(
+        MemorySnapshot candidateSnapshot,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(candidateSnapshot);
+        return _analysisService.CompareSnapshotsAsync(Snapshot, candidateSnapshot, cancellationToken);
+    }
+
+    /// <summary>
     /// 执行一次分析并统一处理成功、取消和失败状态。
     /// </summary>
     private async Task<MemorySnapshotAnalysis> AnalyzeCoreAsync(

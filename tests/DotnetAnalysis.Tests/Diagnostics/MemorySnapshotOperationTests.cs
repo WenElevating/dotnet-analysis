@@ -55,6 +55,21 @@ public sealed class MemorySnapshotOperationTests
         Assert.AreEqual(operation.Snapshot, analysis.Snapshot);
     }
 
+    /// <summary>
+    /// 操作状态切换只能替换快照状态，不得丢失大快照的分页访问契约。
+    /// </summary>
+    [TestMethod]
+    public async Task AnalyzeAsync_PreservesPagedObjectAccessMode()
+    {
+        var operation = CreateOperation(
+            Snapshot(MemorySnapshotState.Analyzing),
+            new ControlledSnapshotAnalysisService { ObjectAccessMode = MemorySnapshotObjectAccessMode.Paged });
+
+        var analysis = await operation.AnalyzeAsync(CancellationToken.None);
+
+        Assert.AreEqual(MemorySnapshotObjectAccessMode.Paged, analysis.ObjectAccessMode);
+    }
+
     [TestMethod]
     public async Task AnalyzeAsync_WhenUnexpectedExceptionOccurs_LogsSnapshotStageAndWrapsStableErrorCode()
     {
@@ -139,6 +154,47 @@ public sealed class MemorySnapshotOperationTests
         Assert.AreEqual(1, analysisService.GetObjectsPageCalls);
     }
 
+    /// <summary>
+    /// 支配树分页必须经由应用层分析契约读取，操作对象不得接触 Diagnostics 内部索引。
+    /// </summary>
+    [TestMethod]
+    public async Task GetDominatorPageAsync_ReadsRequestedPageThroughAnalysisService()
+    {
+        var type = new TypeIdentity("Sample.Type", "Sample");
+        var expected = new MemoryDominatorPage(
+            [new MemoryDominatorInfo(new MemoryObjectInfo(42, type, 64), 128, null, null)],
+            1,
+            0,
+            10);
+        var analysisService = new ControlledSnapshotAnalysisService { DominatorPage = expected };
+        var operation = CreateOperation(Snapshot(MemorySnapshotState.Ready), analysisService);
+
+        var page = await operation.GetDominatorPageAsync(0, 10, CancellationToken.None);
+
+        Assert.AreEqual(expected, page);
+        Assert.AreEqual(1, analysisService.GetDominatorPageCalls);
+    }
+
+    /// <summary>
+    /// 快照对比以当前操作快照为基准并转发候选快照，不涉及对象地址匹配。
+    /// </summary>
+    [TestMethod]
+    public async Task CompareSnapshotsAsync_ForwardsCurrentSnapshotAndCandidateThroughAnalysisService()
+    {
+        var baseline = Snapshot(MemorySnapshotState.Ready);
+        var candidate = Snapshot(MemorySnapshotState.Ready);
+        var expected = new MemorySnapshotComparison(baseline.Id, candidate.Id, []);
+        var analysisService = new ControlledSnapshotAnalysisService { Comparison = expected };
+        var operation = CreateOperation(baseline, analysisService);
+
+        var comparison = await operation.CompareSnapshotsAsync(candidate, CancellationToken.None);
+
+        Assert.AreEqual(expected, comparison);
+        Assert.AreEqual(1, analysisService.CompareSnapshotsCalls);
+        Assert.AreEqual(baseline.Id, analysisService.LastBaselineSnapshotId);
+        Assert.AreEqual(candidate.Id, analysisService.LastCandidateSnapshotId);
+    }
+
     [TestMethod]
     public async Task AnalyzeAsync_PublishesSnapshotLifecycleEvents()
     {
@@ -214,6 +270,14 @@ public sealed class MemorySnapshotOperationTests
 
         public int GetRetentionPathsCalls { get; private set; }
 
+        public int GetDominatorPageCalls { get; private set; }
+
+        public int CompareSnapshotsCalls { get; private set; }
+
+        public MemorySnapshotId? LastBaselineSnapshotId { get; private set; }
+
+        public MemorySnapshotId? LastCandidateSnapshotId { get; private set; }
+
         public IReadOnlyList<MemoryObjectInfo> Objects { get; init; } = [];
 
         public MemoryReferencePath? ReferencePath { get; init; }
@@ -221,6 +285,12 @@ public sealed class MemorySnapshotOperationTests
         public MemoryObjectPage ObjectPage { get; init; } = new([], 0, 0, 1);
 
         public MemoryRetentionPathResult? RetentionPaths { get; init; }
+
+        public MemoryDominatorPage DominatorPage { get; init; } = new([], 0, 0, 1);
+
+        public MemorySnapshotComparison Comparison { get; init; } = new(default, default, []);
+
+        public MemorySnapshotObjectAccessMode ObjectAccessMode { get; init; } = MemorySnapshotObjectAccessMode.Full;
 
         public Task<MemorySnapshotAnalysis> AnalyzeAsync(MemorySnapshot snapshot, CancellationToken cancellationToken)
         {
@@ -248,7 +318,8 @@ public sealed class MemorySnapshotOperationTests
             var analysis = new MemorySnapshotAnalysis(
                 readySnapshot,
                 Array.Empty<MemoryTypeSummary>(),
-                AllocationProfile.NotAvailable(snapshot.RequestedAtUtc, snapshot.CapturedAtUtc ?? snapshot.RequestedAtUtc));
+                AllocationProfile.NotAvailable(snapshot.RequestedAtUtc, snapshot.CapturedAtUtc ?? snapshot.RequestedAtUtc),
+                ObjectAccessMode);
             return Task.FromResult(analysis);
         }
 
@@ -293,6 +364,29 @@ public sealed class MemorySnapshotOperationTests
             cancellationToken.ThrowIfCancellationRequested();
             GetObjectsPageCalls++;
             return Task.FromResult(ObjectPage);
+        }
+
+        public Task<MemoryDominatorPage> GetDominatorPageAsync(
+            MemorySnapshot snapshot,
+            int offset,
+            int pageSize,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            GetDominatorPageCalls++;
+            return Task.FromResult(DominatorPage);
+        }
+
+        public Task<MemorySnapshotComparison> CompareSnapshotsAsync(
+            MemorySnapshot baselineSnapshot,
+            MemorySnapshot candidateSnapshot,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            CompareSnapshotsCalls++;
+            LastBaselineSnapshotId = baselineSnapshot.Id;
+            LastCandidateSnapshotId = candidateSnapshot.Id;
+            return Task.FromResult(Comparison);
         }
     }
 

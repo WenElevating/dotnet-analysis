@@ -28,6 +28,48 @@ public sealed class RetentionHeapSnapshotReader : IIndexedMemorySnapshotReader
         (await RetentionHeapSnapshot.ReadIndexAsync(filePath, cancellationToken).ConfigureAwait(false)).GetReferencePath(objectAddress);
 
     /// <inheritdoc />
-    Task<SnapshotIndex> IIndexedMemorySnapshotReader.ReadIndexAsync(string filePath) =>
-        RetentionHeapSnapshot.ReadIndexAsync(filePath, CancellationToken.None);
+    Task<HeapIndexHandle> IIndexedMemorySnapshotReader.BuildIndexAsync(
+        MemorySnapshotId snapshotId,
+        string filePath,
+        HeapIndexRouter router,
+        CancellationToken cancellationToken) =>
+        BuildIndexCoreAsync(snapshotId, filePath, router, cancellationToken);
+
+    /// <summary>
+    /// 通过保留快照解析器建立索引句柄；大图的直接流式工件构建在此内部边界实现。
+    /// </summary>
+    private static async Task<HeapIndexHandle> BuildIndexCoreAsync(
+        MemorySnapshotId snapshotId,
+        string filePath,
+        HeapIndexRouter router,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(router);
+        var existing = await router
+            .TryOpenExistingMappedAsync(snapshotId, cancellationToken)
+            .ConfigureAwait(false);
+        if (existing is not null)
+        {
+            return existing;
+        }
+
+        var counts = await RetentionHeapSnapshot.ReadCountsAsync(filePath, cancellationToken).ConfigureAwait(false);
+        if (router.ShouldUseMapped(counts.ObjectCount, counts.EdgeCount))
+        {
+            return await router.BuildMappedAsync(
+                snapshotId,
+                (directory, token) => HeapIndexArtifactStore.PublishAsync(
+                    directory,
+                    (temporaryDirectory, writeToken) => RetentionHeapSnapshot.WriteMappedArtifactsAsync(temporaryDirectory, filePath, writeToken),
+                    HeapArtifactStorageGuard.EstimateIndexBuildPeakBytes(
+                        counts.ObjectCount,
+                        counts.EdgeCount,
+                        new FileInfo(filePath).Length),
+                    token),
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        var index = await RetentionHeapSnapshot.ReadIndexAsync(filePath, cancellationToken).ConfigureAwait(false);
+        return await router.RouteAsync(snapshotId, index, cancellationToken).ConfigureAwait(false);
+    }
 }

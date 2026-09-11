@@ -73,4 +73,38 @@ public interface IMemorySnapshotAnalysisService
         ulong objectAddress,
         int maxPathCount,
         CancellationToken cancellationToken) => throw new NotSupportedException("当前快照分析服务不支持保留路径查询。");
+
+    /// <summary>
+    /// 按保留大小降序读取快照的支配树对象分页；首次调用可等待后台派生分析。
+    /// </summary>
+    /// <param name="snapshot">待查询的快照。</param>
+    /// <param name="offset">相对于排序结果的零基偏移量。</param>
+    /// <param name="pageSize">每页对象数，范围为 1 至 1000。</param>
+    /// <param name="cancellationToken">取消当前等待或分页投影操作的令牌。</param>
+    /// <returns>支配树对象分页结果。</returns>
+    /// <exception cref="ArgumentOutOfRangeException">偏移量或页大小无效时引发。</exception>
+    /// <exception cref="DiagnosticsException">派生分析无法构建或读取时引发。</exception>
+    Task<MemoryDominatorPage> GetDominatorPageAsync(
+        MemorySnapshot snapshot,
+        int offset,
+        int pageSize,
+        CancellationToken cancellationToken) => Task.FromException<MemoryDominatorPage>(
+            new DiagnosticsException(
+                DiagnosticsErrorCode.DerivedAnalysisUnavailable,
+                "当前快照分析服务不支持支配树查询。"));
+
+    /// <summary>
+    /// 按类型身份比较两个快照的对象数量和浅表大小，不按对象地址匹配，也不累加 retained size。
+    /// </summary>
+    /// <param name="baselineSnapshot">作为比较基线的快照。</param>
+    /// <param name="candidateSnapshot">作为比较目标的快照。</param>
+    /// <param name="cancellationToken">取消当前等待或读取操作的令牌。</param>
+    /// <returns>按浅表大小增长降序排列的类型增长结果。</returns>
+    Task<MemorySnapshotComparison> CompareSnapshotsAsync(
+        MemorySnapshot baselineSnapshot,
+        MemorySnapshot candidateSnapshot,
+        CancellationToken cancellationToken) => Task.FromException<MemorySnapshotComparison>(
+            new DiagnosticsException(
+                DiagnosticsErrorCode.SnapshotQueryLimitReached,
+                "当前快照分析服务不支持快照对比。"));
 }

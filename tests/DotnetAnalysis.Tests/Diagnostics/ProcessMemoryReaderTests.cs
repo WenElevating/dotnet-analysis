@@ -5,6 +5,7 @@ using DotnetAnalysis.Diagnostics.Windows;
 namespace DotnetAnalysis.Tests.Diagnostics;
 
 [TestClass]
+[DoNotParallelize]
 public sealed class ProcessMemoryReaderTests
 {
     [TestMethod]

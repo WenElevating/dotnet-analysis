@@ -10,6 +10,7 @@ internal sealed class SnapshotIndexBuilder
     private readonly List<SnapshotIndex.ObjectRow> _objects = [];
     private readonly Dictionary<ulong, IReadOnlyList<ulong>> _edges = [];
     private readonly List<ulong> _roots = [];
+    private readonly List<SnapshotIndex.RetentionRootRow> _retentionRoots = [];
 
     /// <summary>
     /// 添加一个值类型对象行。
@@ -42,7 +43,21 @@ internal sealed class SnapshotIndexBuilder
     }
 
     /// <summary>
+    /// 添加带 CLR 标志或函数证据的 GC Root；弱根由最终索引统一排除出保留分析。
+    /// </summary>
+    /// <param name="address">根直接指向的对象地址。</param>
+    /// <param name="root">不得伪造的根类别、标志和可选函数证据。</param>
+    public void AddRoot(ulong address, MemoryRetentionRoot root)
+    {
+        ArgumentNullException.ThrowIfNull(root);
+        if (address != 0)
+        {
+            _retentionRoots.Add(new SnapshotIndex.RetentionRootRow(address, root));
+        }
+    }
+
+    /// <summary>
     /// 冻结当前输入为常驻紧凑索引。
     /// </summary>
-    public SnapshotIndex Build() => new(_objects, _edges, _roots);
+    public SnapshotIndex Build() => new(_objects, _edges, _roots, retentionRoots: _retentionRoots);
 }

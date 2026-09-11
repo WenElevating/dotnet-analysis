@@ -47,4 +47,17 @@ public sealed class MemorySnapshotObjectPagingTests
         _ = Assert.ThrowsExactly<ArgumentOutOfRangeException>(
             () => new MemoryObjectPage([], 0, 0, 1001));
     }
+
+    /// <summary>
+    /// 类型增长比较仅聚合对象数和浅表大小，不能混入会重叠的 retained size。
+    /// </summary>
+    [TestMethod]
+    public void TypeGrowth_ReportsSignedObjectAndShallowSizeDeltas()
+    {
+        var type = new TypeIdentity("Sample.Type", "Sample");
+        var growth = new MemoryTypeGrowth(type, baselineObjectCount: 2, candidateObjectCount: 5, baselineShallowSizeBytes: 32, candidateShallowSizeBytes: 80);
+
+        Assert.AreEqual(3L, growth.ObjectCountGrowth);
+        Assert.AreEqual(48L, growth.ShallowSizeGrowthBytes);
+    }
 }

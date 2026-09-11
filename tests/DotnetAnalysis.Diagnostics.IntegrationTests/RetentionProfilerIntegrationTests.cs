@@ -59,6 +59,43 @@ public sealed class RetentionProfilerIntegrationTests
     }
 
     /// <summary>
+    /// CLR 为同一泛型定义返回不同类型实参 ClassID 时，原生证据必须保留完整构造类型身份。
+    /// </summary>
+    [TestMethod]
+    [TestCategory("WindowsDiagnosticsIntegration")]
+    public async Task AttachAsync_WhenConstructedGenericArgumentsDiffer_ReturnsDistinctCompleteTypeNames()
+    {
+        var artifacts = ProfilerNativeArtifactLocator.Resolve();
+        await using var target = await IntegrationTestHost.StartTargetAsync("net10.0", initialObjectCount: 1_000);
+        using var capture = new RetentionProfilerCaptureSession();
+
+        var result = await ProfilerControllerClient.AttachAsync(
+            target.ProcessId,
+            TimeSpan.FromSeconds(15),
+            artifacts.ControllerPath,
+            artifacts.ProfilerPath,
+            capture.CreateAttachData(),
+            CancellationToken.None);
+
+        Assert.IsGreaterThanOrEqualTo(0, result, $"AttachProfiler failed with HRESULT 0x{result:x8}.");
+        var raw = await capture.WaitForCompletionAsync(CancellationToken.None);
+        var typeNames = raw.Types
+            .Select(type => type.TypeName)
+            .Where(static name => name is not null)
+            .ToHashSet(StringComparer.Ordinal);
+
+        var observedTypeNames = string.Join(Environment.NewLine, typeNames.Order(StringComparer.Ordinal));
+        Assert.Contains(
+            "System.Collections.Generic.List`1<System.String>",
+            typeNames,
+            $"Observed CLR type evidence:{Environment.NewLine}{observedTypeNames}");
+        Assert.Contains(
+            "System.Collections.Generic.List`1<System.Object>",
+            typeNames,
+            $"Observed CLR type evidence:{Environment.NewLine}{observedTypeNames}");
+    }
+
+    /// <summary>
     /// CLR 标记为栈根时，Profiler 必须返回经 Metadata 验证的实际持有函数，而非由诊断层拼接的名称。
     /// </summary>
     [TestMethod]

@@ -90,4 +90,12 @@ public sealed class SnapshotStorageLayout
     /// </summary>
     public string GetFinalManifestPath(MemorySnapshotId snapshotId) =>
         Path.Combine(GetSnapshotDirectory(snapshotId), "snapshot.json");
+
+    /// <summary>
+    /// 获取指定快照基础堆索引的不可变工件目录；目录仅在完整验证后才会被原子发布。
+    /// </summary>
+    /// <param name="snapshotId">快照稳定标识。</param>
+    /// <returns>当前版本堆索引工件根目录。</returns>
+    public string GetHeapIndexDirectory(MemorySnapshotId snapshotId) =>
+        Path.Combine(GetSnapshotDirectory(snapshotId), ".heapidx");
 }

@@ -50,6 +50,22 @@ public enum DiagnosticsErrorCode
     /// </summary>
     SnapshotTooLargeForFullEnumeration,
     /// <summary>
+    /// 构建基础堆索引失败，原始快照仍会被保留。
+    /// </summary>
+    SnapshotIndexBuildFailed,
+    /// <summary>
+    /// 查询超过当前快照索引的资源或访问上限。
+    /// </summary>
+    SnapshotQueryLimitReached,
+    /// <summary>
+    /// 支配树等派生分析无法构建或读取；基础索引查询仍可使用。
+    /// </summary>
+    DerivedAnalysisUnavailable,
+    /// <summary>
+    /// CLR Profiler 的保留捕获环形缓冲区耗尽，快照未被伪造为成功。
+    /// </summary>
+    ProfilerCaptureBufferExhausted,
+    /// <summary>
     /// 目标运行时或当前会话不支持执行采样。
     /// </summary>
     ExecutionProfilingUnavailable,

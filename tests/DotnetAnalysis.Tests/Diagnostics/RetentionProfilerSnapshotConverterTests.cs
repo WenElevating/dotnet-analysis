@@ -58,6 +58,42 @@ public sealed class RetentionProfilerSnapshotConverterTests
     }
 
     /// <summary>
+    /// 原生协议给出的完整构造泛型名称必须按 ClassID 投影为两个不同的类型身份。
+    /// </summary>
+    [TestMethod]
+    public void Convert_WhenConstructedGenericEvidenceDiffers_PreservesDistinctTypeIdentities()
+    {
+        var raw = new RetentionProfilerRawCapture(
+            [
+                Object((nuint)0x1000, (nuint)0x10),
+                Object((nuint)0x2000, (nuint)0x20)
+            ],
+            [],
+            [],
+            [],
+            [
+                new RetentionProfilerRawType(
+                    (nuint)0x10,
+                    "System.Collections.Generic.List`1<System.String>",
+                    "System.Private.CoreLib"),
+                new RetentionProfilerRawType(
+                    (nuint)0x20,
+                    "System.Collections.Generic.List`1<System.Object>",
+                    "System.Private.CoreLib")
+            ]);
+
+        var data = RetentionProfilerSnapshotConverter.Convert(raw);
+
+        CollectionAssert.AreEquivalent(
+            new[]
+            {
+                new TypeIdentity("System.Collections.Generic.List`1<System.String>", "System.Private.CoreLib"),
+                new TypeIdentity("System.Collections.Generic.List`1<System.Object>", "System.Private.CoreLib")
+            },
+            data.Types.ToArray());
+    }
+
+    /// <summary>
     /// 未知 CLR 根类别和无效函数证据索引必须保留为未知根且不产生函数名。
     /// </summary>
     [TestMethod]
