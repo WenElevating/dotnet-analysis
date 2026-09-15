@@ -40,6 +40,7 @@ public sealed class ExecutionSamplingPerformanceTests
     private const int BenchmarkRandomSeed = 0x51A7;
     private const int StressRandomSeed = 0x57E55;
     private const long MaximumPrivateMemoryIncreaseBytes = 128L * 1024 * 1024;
+    private const long MaximumQueryPrivateMemoryIncreaseBytes = 32L * 1024 * 1024;
     private const long MaximumStorageBytes = 128L * 1024 * 1024;
     private const long MaximumQueryAllocationBytes = 64L * 1024 * 1024;
     // 全栈调用树采样的运行时 provider 开销记在目标进程中；保留一个明确的
@@ -822,7 +823,9 @@ public sealed class ExecutionSamplingPerformanceTests
         var queryPrivateMemory = measuredQueries
             .Select(static query => query.PrivateMemoryAfterBytes)
             .ToArray();
-        var queryPrivateMemoryLeak = HasMonotonicLeak(queryPrivateMemory);
+        var queryPrivateMemoryIncrease = Math.Max(
+            0,
+            queryPrivateMemory.Max() - queryPrivateMemory[0]);
         var concurrencyPassed = ConcurrentBatchesPassed(evidence.ConcurrentQueries);
         var snapshotsPassed = evidence.Snapshots.Count == SnapshotSequenceCount
             && evidence.Snapshots.All(ExecutionSamplingThresholds.IsUsableSnapshot);
@@ -841,8 +844,8 @@ public sealed class ExecutionSamplingPerformanceTests
             "<=", queryP95Milliseconds, MaximumQueryP95Milliseconds, "milliseconds");
         AddThreshold(evidence, "fullRangeQueryAllocation", maximumQueryAllocation <= MaximumQueryAllocationBytes,
             "<=", maximumQueryAllocation, MaximumQueryAllocationBytes, "bytes");
-        AddThreshold(evidence, "queryPrivateMemoryNotMonotonic", !queryPrivateMemoryLeak,
-            "==", queryPrivateMemoryLeak ? 1 : 0, 0, "boolean");
+        AddThreshold(evidence, "queryPrivateMemoryPeakIncrease", queryPrivateMemoryIncrease <= MaximumQueryPrivateMemoryIncreaseBytes,
+            "<=", queryPrivateMemoryIncrease, MaximumQueryPrivateMemoryIncreaseBytes, "bytes");
         AddThreshold(evidence, "lostEventCount", allLostEventsZero,
             "==", evidence.LostEventCounts.DefaultIfEmpty(-1).Max(), 0, "events");
         AddThreshold(evidence, "profileCountsConsistent", allCountsConsistent,

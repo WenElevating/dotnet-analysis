@@ -11,7 +11,7 @@
   <Target Name="BuildRetentionProfiler"
           BeforeTargets="Build"
           Condition="'$(OS)' == 'Windows_NT' and '$(DesignTimeBuild)' != 'true'">
-    <Exec Command="cmake -S &quot;$(RetentionProfilerSourceDirectory)&quot; -B &quot;$(RetentionProfilerBuildDirectory)&quot; -G &quot;Visual Studio 17 2022&quot; -A x64" />
+    <Exec Command="cmake -S &quot;$(RetentionProfilerSourceDirectory)&quot; -B &quot;$(RetentionProfilerBuildDirectory)&quot; -G &quot;Visual Studio 17 2022&quot; -A x64 -DBUILD_TESTING=OFF" />
     <Exec Command="cmake --build &quot;$(RetentionProfilerBuildDirectory)&quot; --config &quot;$(Configuration)&quot;" />
     <ItemGroup>
       <RetentionProfilerNativeArtifact Include="$(RetentionProfilerBuildDirectory)\$(Configuration)\DotnetAnalysis.RetentionProfiler.dll" />

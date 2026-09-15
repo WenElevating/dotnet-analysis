@@ -9,3 +9,4 @@ TestResults/
 *.nettrace
 *.dmp
 native/out/
+artifacts/
