@@ -56,6 +56,24 @@ public sealed class SnapshotAnalysisTests
     }
 
     [TestMethod]
+    public async Task DisposeAsync_WaitsForSharedAnalysisBeforeCompleting()
+    {
+        var service = new FakeService { Analysis = CreateAnalysis(1) };
+        service.PendingAnalysis = new TaskCompletionSource<MemorySnapshotAnalysis>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var analysis = new SnapshotAnalysis(Snapshot(), service);
+
+        _ = analysis.AnalyzeAsync(CancellationToken.None);
+        var disposeTask = analysis.DisposeAsync().AsTask();
+
+        await Task.Delay(50);
+        Assert.IsFalse(disposeTask.IsCompleted);
+
+        service.PendingAnalysis.SetResult(service.Analysis);
+        await disposeTask;
+        await Assert.ThrowsAsync<ObjectDisposedException>(async () => await analysis.AnalyzeAsync(CancellationToken.None));
+    }
+
+    [TestMethod]
     public async Task CompareWith_ReturnsIndependentComparisonAndPropagatesFailure()
     {
         var service = new FakeService { Comparison = new MemorySnapshotComparison(Snapshot().Id, Snapshot().Id, []) };

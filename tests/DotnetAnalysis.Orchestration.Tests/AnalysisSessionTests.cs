@@ -57,6 +57,22 @@ public sealed class AnalysisSessionTests
         CollectionAssert.DoesNotContain(fakeSession.CaptureModes, MemorySnapshotCaptureMode.Standard);
     }
 
+    /// <summary>验证并发释放共享同一个收尾任务且只停止底层会话一次。</summary>
+    [TestMethod]
+    public async Task ConcurrentDisposeAsync_StopsUnderlyingSessionOnce()
+    {
+        var target = CreateTargetContext(retentionAvailable: true);
+        var fakeSession = new FakeDiagnosticsSession(target.Target);
+        var diagnostics = new FakeProcessDiagnostics(fakeSession);
+        var session = await AnalysisSession.AttachAsync(diagnostics, target, CancellationToken.None);
+
+        var first = session.DisposeAsync().AsTask();
+        var second = session.DisposeAsync().AsTask();
+        await Task.WhenAll(first, second);
+
+        Assert.AreEqual(1, fakeSession.EndCallCount);
+    }
+
     /// <summary>验证时间线容量限制会保留缺失质量而不无限增长。</summary>
     [TestMethod]
     public void Timeline_IsBoundedAndPreservesMissingQuality()

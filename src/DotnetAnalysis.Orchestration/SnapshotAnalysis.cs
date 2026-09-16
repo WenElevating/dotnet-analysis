@@ -11,6 +11,7 @@ public sealed class SnapshotAnalysis : ISnapshotAnalysis
     private readonly IMemorySnapshotAnalysisService _analysisService;
     private readonly object _gate = new();
     private Task<MemorySnapshotAnalysis>? _analysisTask;
+    private Task? _disposeTask;
     private bool _disposed;
 
     /// <summary>创建单快照分析句柄。</summary>
@@ -51,20 +52,30 @@ public sealed class SnapshotAnalysis : ISnapshotAnalysis
     public Task<MemoryObjectPage> GetObjectsPageAsync(TypeIdentity type, int offset, int pageSize, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(type);
+        cancellationToken.ThrowIfCancellationRequested();
         return _analysisService.GetObjectsPageAsync(Snapshot, type, offset, pageSize, cancellationToken);
     }
 
     /// <inheritdoc />
-    public Task<MemoryReferencePath?> GetReferencePathAsync(ulong objectAddress, CancellationToken cancellationToken) =>
-        _analysisService.GetReferencePathAsync(Snapshot, objectAddress, cancellationToken);
+    public Task<MemoryReferencePath?> GetReferencePathAsync(ulong objectAddress, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return _analysisService.GetReferencePathAsync(Snapshot, objectAddress, cancellationToken);
+    }
 
     /// <inheritdoc />
-    public Task<MemoryRetentionPathResult?> GetRetentionPathsAsync(ulong objectAddress, int maxPathCount, CancellationToken cancellationToken) =>
-        _analysisService.GetRetentionPathsAsync(Snapshot, objectAddress, maxPathCount, cancellationToken);
+    public Task<MemoryRetentionPathResult?> GetRetentionPathsAsync(ulong objectAddress, int maxPathCount, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return _analysisService.GetRetentionPathsAsync(Snapshot, objectAddress, maxPathCount, cancellationToken);
+    }
 
     /// <inheritdoc />
-    public Task<MemoryDominatorPage> GetDominatorPageAsync(int offset, int pageSize, CancellationToken cancellationToken) =>
-        _analysisService.GetDominatorPageAsync(Snapshot, offset, pageSize, cancellationToken);
+    public Task<MemoryDominatorPage> GetDominatorPageAsync(int offset, int pageSize, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return _analysisService.GetDominatorPageAsync(Snapshot, offset, pageSize, cancellationToken);
+    }
 
     /// <inheritdoc />
     public SnapshotComparison CompareWith(ISnapshotAnalysis candidate)
@@ -85,11 +96,23 @@ public sealed class SnapshotAnalysis : ISnapshotAnalysis
     {
         lock (_gate)
         {
-            _disposed = true;
-            _analysisTask = null;
-        }
+            if (_disposeTask is not null)
+            {
+                return new ValueTask(_disposeTask);
+            }
 
-        return ValueTask.CompletedTask;
+            _disposed = true;
+            _disposeTask = DisposeCoreAsync(_analysisTask);
+            return new ValueTask(_disposeTask);
+        }
+    }
+
+    private static async Task DisposeCoreAsync(Task<MemorySnapshotAnalysis>? analysisTask)
+    {
+        if (analysisTask is not null)
+        {
+            await analysisTask.ConfigureAwait(false);
+        }
     }
 
     private Task<MemorySnapshotAnalysis> GetOrCreateAnalysisTask()

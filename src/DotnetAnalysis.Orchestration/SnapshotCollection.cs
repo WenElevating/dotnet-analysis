@@ -45,6 +45,11 @@ public sealed class SnapshotCollection : ISnapshotCollection
         ArgumentNullException.ThrowIfNull(capture);
         ObjectDisposedException.ThrowIf(_disposed, this);
         var snapshot = await capture(cancellationToken).ConfigureAwait(false);
+        if (snapshot.State is MemorySnapshotState.Analyzing)
+        {
+            var analysis = await _analysisService.AnalyzeAsync(snapshot, cancellationToken).ConfigureAwait(false);
+            snapshot = analysis.Snapshot;
+        }
         return AddSnapshot(snapshot);
     }
 

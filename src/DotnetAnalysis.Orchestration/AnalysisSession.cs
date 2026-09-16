@@ -19,6 +19,7 @@ public sealed class AnalysisSession : IAnalysisSession
     private readonly MemoryTimeline _timeline;
     private Task? _samplingTask;
     private Task? _stopTask;
+    private Task? _disposeTask;
     private DiagnosticFailure? _failure;
     private bool _disposed;
 
@@ -49,11 +50,11 @@ public sealed class AnalysisSession : IAnalysisSession
     {
         ArgumentNullException.ThrowIfNull(diagnostics);
         ArgumentNullException.ThrowIfNull(target);
-        var lifetimeCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var lifetimeCancellation = new CancellationTokenSource();
         try
         {
             var diagnosticsSession = await diagnostics
-                .AttachAsync(target.Target, lifetimeCancellation.Token)
+                .AttachAsync(target.Target, cancellationToken)
                 .ConfigureAwait(false);
             var session = new AnalysisSession(
                 target,
@@ -175,13 +176,22 @@ public sealed class AnalysisSession : IAnalysisSession
     }
 
     /// <inheritdoc />
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
         lock (_gate)
         {
-            if (_disposed) return;
-        }
+            if (_disposeTask is not null)
+            {
+                return new ValueTask(_disposeTask);
+            }
 
+            _disposeTask = DisposeCoreAsync();
+            return new ValueTask(_disposeTask);
+        }
+    }
+
+    private async Task DisposeCoreAsync()
+    {
         try
         {
             await StopAsync(CancellationToken.None).ConfigureAwait(false);
