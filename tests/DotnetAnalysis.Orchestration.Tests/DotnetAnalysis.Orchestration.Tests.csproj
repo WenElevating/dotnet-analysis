@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\DotnetAnalysis.Core\DotnetAnalysis.Core.csproj" />
+    <ProjectReference Include="..\..\src\DotnetAnalysis.Application\DotnetAnalysis.Application.csproj" />
+    <ProjectReference Include="..\..\src\DotnetAnalysis.Orchestration\DotnetAnalysis.Orchestration.csproj" />
+    <PackageReference Include="MSTest" Version="4.0.2" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <MSTestEnableParallelization>false</MSTestEnableParallelization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Using Include="Microsoft.VisualStudio.TestTools.UnitTesting" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\DotnetAnalysis.Tests\Architecture\OrchestrationBoundaryTests.cs" Link="Architecture\OrchestrationBoundaryTests.cs" />
+  </ItemGroup>
+
+</Project>

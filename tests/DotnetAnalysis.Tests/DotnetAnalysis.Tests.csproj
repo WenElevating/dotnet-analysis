@@ -47,6 +47,7 @@
     <ProjectReference
       Include="..\..\src\DotnetAnalysis.Desktop\DotnetAnalysis.Desktop.csproj"
       Condition="'$(CoreDiagnosticsOnly)' != 'true' and '$(ApplicationOnly)' != 'true' and '$(Task2Only)' != 'true'" />
+    <ProjectReference Include="..\..\src\DotnetAnalysis.Orchestration\DotnetAnalysis.Orchestration.csproj" />
   </ItemGroup>
 
 </Project>
