@@ -126,20 +126,69 @@ public sealed class RuntimeCapabilitiesResolver
     {
         ArgumentNullException.ThrowIfNull(process);
         cancellationToken.ThrowIfCancellationRequested();
-        if (!_inspector.IsWindows
-            || !_inspector.Is64BitOperatingSystem
-            || !_architectureInspector.IsAmd64(process)
-            || !_inspector.IsCoreClr(process))
+        var capabilities = Probe(process, cancellationToken);
+        if (!IsSupported(capabilities))
         {
             throw new DiagnosticsException(DiagnosticsErrorCode.RuntimeNotSupported, "The target runtime is not supported.");
         }
 
-        var major = _inspector.GetRuntimeMajorVersion(process);
-        if (major is < 8 or > 10)
-        {
-            throw new DiagnosticsException(DiagnosticsErrorCode.RuntimeNotSupported, "The target runtime version is not supported.");
-        }
-
         return Task.CompletedTask;
     }
+
+    /// <summary>
+    /// 读取目标进程的无副作用运行时和基础诊断能力证据。
+    /// </summary>
+    /// <param name="process">需要探测的目标进程。</param>
+    /// <param name="cancellationToken">取消本次探测的令牌。</param>
+    /// <returns>按能力分别记录的稳定探测结果。</returns>
+    public Task<TargetProcessCapabilities> ProbeAsync(
+        TargetProcess process,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(process);
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(Probe(process, cancellationToken));
+    }
+
+    private TargetProcessCapabilities Probe(
+        TargetProcess process,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var is64BitTarget = _architectureInspector.IsAmd64(process);
+        var isCoreClr = _inspector.IsCoreClr(process);
+        var runtimeMajorVersion = isCoreClr ? _inspector.GetRuntimeMajorVersion(process) : 0;
+        var supported = _inspector.IsWindows
+            && _inspector.Is64BitOperatingSystem
+            && is64BitTarget
+            && isCoreClr
+            && runtimeMajorVersion is >= 8 and <= 10;
+        DiagnosticsErrorCode? errorCode = supported ? null : DiagnosticsErrorCode.RuntimeNotSupported;
+        var reason = supported ? null : "目标不是受支持的 Windows x64 .NET 8/9/10 CoreCLR 进程。";
+        var retentionErrorCode = supported ? DiagnosticsErrorCode.ProfilerAttachUnavailable : errorCode;
+        var retentionReason = supported
+            ? "当前探测只验证运行时环境，未执行有副作用的 Profiler 附着验证。"
+            : reason;
+
+        return new TargetProcessCapabilities(
+            process,
+            _inspector.IsWindows,
+            _inspector.Is64BitOperatingSystem,
+            is64BitTarget,
+            isCoreClr,
+            runtimeMajorVersion,
+            supported,
+            errorCode,
+            reason,
+            false,
+            retentionErrorCode,
+            retentionReason,
+            supported,
+            errorCode,
+            reason,
+            DateTimeOffset.UtcNow);
+    }
+
+    private static bool IsSupported(TargetProcessCapabilities capabilities) =>
+        capabilities.StandardSnapshotAvailable;
 }

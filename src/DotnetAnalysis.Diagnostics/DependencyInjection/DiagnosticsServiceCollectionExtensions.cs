@@ -23,6 +23,7 @@ public static class DiagnosticsServiceCollectionExtensions
         services.AddSingleton<ProcessEnumerator>();
         services.AddSingleton<ProcessIdentityValidator>();
         services.AddSingleton<RuntimeCapabilitiesResolver>();
+        services.AddSingleton<ITargetProcessLauncher, WindowsTargetProcessLauncher>();
         services.AddSingleton<IProcessMemoryReader, ProcessMemoryReader>();
         services.AddSingleton<ImportedSnapshotCatalog>();
         services.TryAddSingleton<SnapshotStorageLayout>(_ =>

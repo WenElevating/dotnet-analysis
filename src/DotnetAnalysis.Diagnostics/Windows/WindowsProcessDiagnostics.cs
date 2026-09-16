@@ -131,6 +131,18 @@ public sealed class WindowsProcessDiagnostics : IProcessDiagnostics
         return AttachCoreAsync(process, cancellationToken);
     }
 
+    /// <inheritdoc />
+    public async Task<TargetProcessCapabilities> ProbeCapabilitiesAsync(
+        TargetProcess process,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(process);
+        await _identityValidator.ValidateAsync(process, cancellationToken).ConfigureAwait(false);
+        var capabilities = await _capabilitiesResolver.ProbeAsync(process, cancellationToken).ConfigureAwait(false);
+        await _identityValidator.ValidateAsync(process, cancellationToken).ConfigureAwait(false);
+        return capabilities;
+    }
+
     /// <summary>
     /// 完成身份与能力验证后创建采样和捕获会话。
     /// </summary>
