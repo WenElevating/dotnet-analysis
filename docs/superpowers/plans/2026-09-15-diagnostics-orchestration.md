@@ -304,19 +304,19 @@ git commit -m "feat: add owned orchestration analysis sessions"
 - Consumes: `IMemorySnapshotAnalysisService`, `MemorySnapshot`, `MemoryObjectPage`, `MemoryReferencePath`, `MemoryRetentionPathResult`, `MemorySnapshotComparison`。
 - Produces: 多快照集合、当前/基线/候选选择、单快照分析接口和独立比较结果。
 
-- [ ] **Step 1: 写快照单元测试**
+- [x] **Step 1: 写快照单元测试**
 
 覆盖三次快照顺序、导入不修改源文件、当前快照切换、基线/候选选择、100,000 对象分页门禁、基础/派生分析隔离、查询取消和关闭。
 
-- [ ] **Step 2: 实现快照集合所有权**
+- [x] **Step 2: 实现快照集合所有权**
 
 快照只有在 Diagnostics 确认正式文件持久化后进入集合；捕获取消或失败不加入成功集合；集合关闭时释放分析句柄但不删除正式快照。
 
-- [ ] **Step 3: 实现单快照分析转发**
+- [x] **Step 3: 实现单快照分析转发**
 
 类型、对象分页、引用路径、Retention 路径、GC Root、支配树和比较分别传播质量与错误码；基础查询不能因派生失败而失效。
 
-- [ ] **Step 4: 运行测试**
+- [x] **Step 4: 运行测试**
 
 ```powershell
 dotnet test .\tests\DotnetAnalysis.Orchestration.Tests\DotnetAnalysis.Orchestration.Tests.csproj --configuration Debug --filter "FullyQualifiedName~Snapshot"
@@ -324,7 +324,7 @@ dotnet test .\tests\DotnetAnalysis.Orchestration.Tests\DotnetAnalysis.Orchestrat
 
 Expected: 多快照、分页、质量和派生隔离测试全部通过。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add src/DotnetAnalysis.Orchestration tests/DotnetAnalysis.Orchestration.Tests
