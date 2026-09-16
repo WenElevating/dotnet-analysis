@@ -1,6 +1,14 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
+using DotnetAnalysis.Application.Contracts.Diagnostics;
+using DotnetAnalysis.Application.Events;
+using DotnetAnalysis.Diagnostics.DependencyInjection;
+using DotnetAnalysis.Diagnostics.Windows;
+using DotnetAnalysis.Orchestration;
+using DotnetAnalysis.Orchestration.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace DotnetAnalysis.Diagnostics.IntegrationTests;
 
@@ -24,6 +32,22 @@ public sealed class IntegrationTestHost : IAsyncDisposable
     }
 
     public int ProcessId => _process.Id;
+
+    /// <summary>
+    /// 终止指定的受控目标进程；目标已经退出时视为清理完成。
+    /// </summary>
+    /// <param name="processId">需要终止的目标进程标识。</param>
+    internal static async Task TerminateTargetAsync(int processId)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            await TerminateProcessAsync(process).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is ArgumentException or InvalidOperationException)
+        {
+        }
+    }
 
     /// <summary>
     /// 向受控目标发送一条命令，并异步读取其对应的单行响应。
@@ -309,4 +333,149 @@ public sealed class IntegrationTestHost : IAsyncDisposable
 
     private static string GetTargetProjectDirectory() =>
         Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "DotnetAnalysis.Diagnostics.TestTarget"));
+}
+
+/// <summary>
+/// 为编排层真实集成测试创建隔离的 Diagnostics、Orchestration 和快照存储上下文。
+/// </summary>
+internal sealed class OrchestratedIntegrationFixture : IAsyncDisposable
+{
+    private readonly ServiceProvider _provider;
+    private readonly string _snapshotRoot;
+    private readonly object _disposeGate = new();
+    private Task? _disposeTask;
+
+    private OrchestratedIntegrationFixture(
+        ServiceProvider provider,
+        IDiagnosticsApplication application,
+        SnapshotStorageLayout snapshotLayout,
+        string snapshotRoot)
+    {
+        _provider = provider;
+        Application = application;
+        SnapshotLayout = snapshotLayout;
+        _snapshotRoot = snapshotRoot;
+    }
+
+    /// <summary>
+    /// 当前测试上下文中的真实编排应用入口。
+    /// </summary>
+    public IDiagnosticsApplication Application { get; }
+
+    /// <summary>
+    /// 当前测试专用的快照存储布局。
+    /// </summary>
+    public SnapshotStorageLayout SnapshotLayout { get; }
+
+    /// <summary>
+    /// 当前测试上下文使用的快照根目录，用于在释放完成后验证临时资源已删除。
+    /// </summary>
+    internal string SnapshotRoot => _snapshotRoot;
+
+    /// <summary>
+    /// 创建使用真实 Diagnostics 和 Orchestration 注册的隔离测试上下文。
+    /// </summary>
+    /// <returns>可异步释放的编排测试 Fixture。</returns>
+    public static OrchestratedIntegrationFixture Create()
+    {
+        var snapshotRoot = Path.Combine(
+            Path.GetTempPath(),
+            "DotnetAnalysis.Diagnostics.OrchestrationIntegrationTests",
+            Guid.NewGuid().ToString("N"));
+        var snapshotLayout = new SnapshotStorageLayout(snapshotRoot);
+        var services = new ServiceCollection();
+        services.AddSingleton<IEventBus>(_ => new InProcessEventBus(NullLogger<InProcessEventBus>.Instance));
+        services.AddSingleton(snapshotLayout);
+        services.AddWindowsProcessDiagnostics();
+        services.AddOrchestration();
+        var provider = services.BuildServiceProvider(validateScopes: true);
+
+        return new OrchestratedIntegrationFixture(
+            provider,
+            provider.GetRequiredService<IDiagnosticsApplication>(),
+            snapshotLayout,
+            snapshotRoot);
+    }
+
+    /// <summary>
+    /// 关闭应用上下文、释放真实服务并删除本次测试产生的快照目录。
+    /// </summary>
+    public async ValueTask DisposeAsync()
+    {
+        Task disposeTask;
+        lock (_disposeGate)
+        {
+            _disposeTask ??= DisposeCoreAsync();
+            disposeTask = _disposeTask;
+        }
+
+        await disposeTask.ConfigureAwait(false);
+    }
+
+    private async Task DisposeCoreAsync()
+    {
+        List<Exception>? cleanupExceptions = null;
+        try
+        {
+            await Application.CloseAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (DiagnosticsException exception) when (exception.ErrorCode is DiagnosticsErrorCode.TargetExited or DiagnosticsErrorCode.CaptureFailed)
+        {
+        }
+        catch (Exception exception)
+        {
+            cleanupExceptions ??= new List<Exception>();
+            cleanupExceptions.Add(exception);
+        }
+
+        try
+        {
+            await _provider.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            cleanupExceptions ??= new List<Exception>();
+            cleanupExceptions.Add(exception);
+        }
+
+        try
+        {
+            await DeleteSnapshotRootAsync(_snapshotRoot).ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            cleanupExceptions ??= new List<Exception>();
+            cleanupExceptions.Add(exception);
+        }
+
+        if (cleanupExceptions is not null)
+        {
+            throw new AggregateException("编排集成 Fixture 资源清理失败。", cleanupExceptions);
+        }
+    }
+
+    private static async Task DeleteSnapshotRootAsync(string snapshotRoot)
+    {
+        for (var attempt = 0; attempt < 5; attempt++)
+        {
+            try
+            {
+                if (Directory.Exists(snapshotRoot))
+                {
+                    Directory.Delete(snapshotRoot, recursive: true);
+                }
+
+                return;
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                if (attempt == 4)
+                {
+                    throw;
+                }
+
+                await Task.Delay(TimeSpan.FromMilliseconds(100)).ConfigureAwait(false);
+            }
+        }
+    }
 }

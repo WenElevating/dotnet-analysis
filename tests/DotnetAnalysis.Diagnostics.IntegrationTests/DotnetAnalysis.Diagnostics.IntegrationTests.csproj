@@ -4,6 +4,7 @@
     <ProjectReference Include="..\..\src\DotnetAnalysis.Core\DotnetAnalysis.Core.csproj" />
     <ProjectReference Include="..\..\src\DotnetAnalysis.Application\DotnetAnalysis.Application.csproj" />
     <ProjectReference Include="..\..\src\DotnetAnalysis.Diagnostics\DotnetAnalysis.Diagnostics.csproj" />
+    <ProjectReference Include="..\..\src\DotnetAnalysis.Orchestration\DotnetAnalysis.Orchestration.csproj" />
     <ProjectReference Include="..\DotnetAnalysis.Diagnostics.TestTarget\DotnetAnalysis.Diagnostics.TestTarget.csproj" ReferenceOutputAssembly="false" />
     <PackageReference Include="MSTest" Version="4.0.2" />
   </ItemGroup>
