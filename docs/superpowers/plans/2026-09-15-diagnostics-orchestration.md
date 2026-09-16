@@ -92,15 +92,15 @@
 - Consumes: existing `DotnetAnalysis.Core` and `DotnetAnalysis.Application` projects.
 - Produces: buildable Orchestration project and isolated MSTest project; no implementation behavior yet.
 
-- [ ] **Step 1: 写项目边界测试**
+- [x] **Step 1: 写项目边界测试**
 
 在 `tests/DotnetAnalysis.Tests/Architecture/OrchestrationBoundaryTests.cs` 增加测试，断言 Orchestration 程序集不存在 WPF/Diagnostics 程序集引用，并且其公共契约不泄漏宿主或基础设施类型。
 
-- [ ] **Step 2: 创建两个项目并加入 solution**
+- [x] **Step 2: 创建两个项目并加入 solution**
 
 使用 SDK-style 项目，源项目目标 `net10.0`，测试项目目标 `net10.0-windows`，启用 `Nullable`、`ImplicitUsings`、`LangVersion=latest`，测试项目引用 MSTest 4 和 Core/Application/Orchestration。
 
-- [ ] **Step 3: 运行骨架验证**
+- [x] **Step 3: 运行骨架验证**
 
 Run:
 
@@ -111,7 +111,7 @@ dotnet build .\DotnetAnalysis.sln --configuration Debug
 
 Expected: 编译成功；新测试项目可发现且当前无测试失败。
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```powershell
 git add DotnetAnalysis.sln src/DotnetAnalysis.Orchestration tests/DotnetAnalysis.Orchestration.Tests
@@ -137,15 +137,15 @@ git commit -m "feat: add diagnostics orchestration project boundaries"
 - Consumes: `TargetProcess`, `ProcessDiagnosticsSessionState`, `MemorySnapshot`, `MemorySnapshotCaptureMode`, `DiagnosticsErrorCode`.
 - Produces: immutable models containing target identity, capabilities, quality, operation state and application state; no WPF or Diagnostics concrete types.
 
-- [ ] **Step 1: Write failing model/contract tests**
+- [x] **Step 1: Write failing model/contract tests**
 
 测试至少断言：目标身份必须包含 PID 和启动时间；`ProcessFilter` 不包含 UI 类型；能力可以独立为可用/不可用；错误结果保留错误码、阶段和可重试标记；状态快照包含 generation、session、snapshot 和 operation identities。
 
-- [ ] **Step 2: 实现不可变模型和中文 XML 文档**
+- [x] **Step 2: 实现不可变模型和中文 XML 文档**
 
 所有公开模型使用 `record`/只读属性；构造函数验证非空身份、正数 PID、合法页大小和时间范围。质量模型至少区分 Complete、Partial、Unavailable、Failed。
 
-- [ ] **Step 3: 运行独立单元测试**
+- [x] **Step 3: 运行独立单元测试**
 
 ```powershell
 dotnet test .\tests\DotnetAnalysis.Orchestration.Tests\DotnetAnalysis.Orchestration.Tests.csproj --configuration Debug --filter "FullyQualifiedName~ApplicationContractTests"
@@ -153,7 +153,7 @@ dotnet test .\tests\DotnetAnalysis.Orchestration.Tests\DotnetAnalysis.Orchestrat
 
 Expected: 所有接口/模型契约测试通过。
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```powershell
 git add src/DotnetAnalysis.Orchestration/Models tests/DotnetAnalysis.Orchestration.Tests/ApplicationContractTests.cs src/DotnetAnalysis.Application/Contracts/Diagnostics/DiagnosticsErrorCode.cs
@@ -175,15 +175,15 @@ git commit -m "feat: add orchestration state and quality contracts"
 - Consumes: `CancellationToken`, `TimeProvider`, existing `IEventBus`, operation options.
 - Produces: operation identity, linked cancellation, deadline state, stage/progress and `AcceptsResult(generation, sessionId, operationId)` guard.
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 覆盖：创建唯一 operation ID；取消只结束当前操作；截止时间触发超时；generation/session 不匹配拒绝写入；重复完成和释放幂等；旧操作事件被宿主可识别地丢弃。
 
-- [ ] **Step 2: 实现最小作用域**
+- [x] **Step 2: 实现最小作用域**
 
 `OperationScope` 必须拥有链接取消源和截止时间；释放时取消并等待注册清理；`DiagnosticOperation` 只暴露不可变状态和稳定结果，不暴露底层 `CancellationTokenSource`。
 
-- [ ] **Step 3: 验证并发边界**
+- [x] **Step 3: 验证并发边界**
 
 ```powershell
 dotnet test .\tests\DotnetAnalysis.Orchestration.Tests\DotnetAnalysis.Orchestration.Tests.csproj --configuration Debug --filter "FullyQualifiedName~OperationScopeTests"
@@ -191,7 +191,7 @@ dotnet test .\tests\DotnetAnalysis.Orchestration.Tests\DotnetAnalysis.Orchestrat
 
 Expected: 并发完成、取消、超时和旧代次结果测试全部通过。
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```powershell
 git add src/DotnetAnalysis.Orchestration/Operations src/DotnetAnalysis.Application/Events tests/DotnetAnalysis.Orchestration.Tests/OperationScopeTests.cs
@@ -217,19 +217,19 @@ git commit -m "feat: isolate orchestration operations by generation"
 - Consumes: existing `IProcessDiagnostics.GetProcessesAsync`, target identity and capability evidence; launch adapter for EXE start.
 - Produces: filtered unique candidates, `TargetContext`, capability summary, launch result and stable failure stages.
 
-- [ ] **Step 1: 写独立接口测试**
+- [x] **Step 1: 写独立接口测试**
 
 覆盖进程去重、筛选、排序、退出候选、权限字段为空、PID 复用、运行时不支持、Profiler 能力不可用、启动参数校验和启动等待超时。
 
-- [ ] **Step 2: 实现查找和探测**
+- [x] **Step 2: 实现查找和探测**
 
 查找阶段只执行快速候选读取；能力探测对选中目标执行深度校验；附着前必须再次校验 PID 与启动时间。任何探测结果只能作为提示，不能替代附着时验证。
 
-- [ ] **Step 3: 实现启动契约适配**
+- [x] **Step 3: 实现启动契约适配**
 
 支持 EXE 路径、参数、工作目录和显式目标处理策略；默认不终止启动失败的目标进程。启动结果必须包含 PID、启动时间和身份验证状态。
 
-- [ ] **Step 4: 运行测试**
+- [x] **Step 4: 运行测试**
 
 ```powershell
 dotnet test .\tests\DotnetAnalysis.Orchestration.Tests\DotnetAnalysis.Orchestration.Tests.csproj --configuration Debug --filter "FullyQualifiedName~TargetProcess"
@@ -237,7 +237,7 @@ dotnet test .\tests\DotnetAnalysis.Orchestration.Tests\DotnetAnalysis.Orchestrat
 
 Expected: 查找、能力和启动边界独立测试通过；不存在对 WPF 或 Diagnostics 内部类型的引用。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add src/DotnetAnalysis.Orchestration src/DotnetAnalysis.Application/Contracts/Diagnostics src/DotnetAnalysis.Diagnostics tests/DotnetAnalysis.Orchestration.Tests
