@@ -346,19 +346,19 @@ git add src/DotnetAnalysis.Orchestration tests/DotnetAnalysis.Orchestration.Test
 - Consumes: `TargetProcessFinder`、`TargetCapabilityProbe`、`TargetProcessStarter`、`IAnalysisSession`、`SnapshotCollection`、`IEventBus`。
 - Produces: `IDiagnosticsApplication` 和 `AddOrchestration()`，保证同一上下文最多一个活动会话、正确替换 generation、关闭幂等和状态发布；本阶段不修改 Desktop 或任何 WPF 文件。
 
-- [ ] **Step 1: 写应用上下文测试**
+- [x] **Step 1: 写应用上下文测试**
 
 覆盖附着替换、启动替换、快照打开、关闭、旧结果隔离、同一时刻冲突操作和注册后依赖图。
 
-- [ ] **Step 2: 实现应用上下文**
+- [x] **Step 2: 实现应用上下文**
 
 应用上下文拥有当前 generation、活动会话和快照集合；替换前停止旧会话并等待收尾；旧事件只能被识别但不能更新当前状态。
 
-- [ ] **Step 3: 接入编排层自包含注册**
+- [x] **Step 3: 接入编排层自包含注册**
 
 实现 `AddOrchestration()`，仅注册编排层自身类型和所需 Application 契约；测试宿主通过独立 `ServiceCollection` 验证解析 `IDiagnosticsApplication`，不修改 Desktop 组合根。
 
-- [ ] **Step 4: 运行编排层组合测试**
+- [x] **Step 4: 运行编排层组合测试**
 
 ```powershell
 dotnet test .\tests\DotnetAnalysis.Orchestration.Tests\DotnetAnalysis.Orchestration.Tests.csproj --configuration Debug --filter "FullyQualifiedName~DiagnosticsApplication|FullyQualifiedName~OrchestrationComposition"
@@ -366,7 +366,7 @@ dotnet test .\tests\DotnetAnalysis.Orchestration.Tests\DotnetAnalysis.Orchestrat
 
 Expected: 编排层公共入口可从独立测试宿主解析；测试不加载 WPF，不要求 Desktop 改动。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add src/DotnetAnalysis.Orchestration tests/DotnetAnalysis.Orchestration.Tests DotnetAnalysis.sln
@@ -385,19 +385,19 @@ git commit -m "feat: compose diagnostics application orchestration"
 - Consumes: 已注册的真实 Diagnostics、Orchestration 和 .NET 8/9/10 TestTarget。
 - Produces: 真实业务流程通过/失败证据；不修改生产实现。
 
-- [ ] **Step 1: 写真实附着流程**
+- [x] **Step 1: 写真实附着流程**
 
 每个 TFM 执行：发现目标 → 能力探测 → 附着 → 样本 → 三次标准快照 → 类型/分页/路径 → 快照比较 → 停止 → 重开快照。
 
-- [ ] **Step 2: 写真实启动流程**
+- [x] **Step 2: 写真实启动流程**
 
 验证 EXE 路径、参数、工作目录、等待总超时、身份校验和附着失败策略。
 
-- [ ] **Step 3: 写真实失败流程**
+- [x] **Step 3: 写真实失败流程**
 
 验证目标退出、分析中退出、PID 复用、权限不足、Profiler 冲突/缺失、不可写目录、取消和旧操作延迟完成。
 
-- [ ] **Step 4: 串行运行集成门禁**
+- [x] **Step 4: 串行运行集成门禁**
 
 ```powershell
 dotnet test .\tests\DotnetAnalysis.Diagnostics.IntegrationTests\DotnetAnalysis.Diagnostics.IntegrationTests.csproj --configuration Release --filter "TestCategory=WindowsDiagnosticsIntegration&FullyQualifiedName~Orchestration" --logger "trx;LogFileName=orchestration-integration.trx"
@@ -405,7 +405,7 @@ dotnet test .\tests\DotnetAnalysis.Diagnostics.IntegrationTests\DotnetAnalysis.D
 
 Expected: 三个目标 TFM 的真实流程和错误码断言全部通过，测试结束无残留目标、会话目录或后台任务。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add tests/DotnetAnalysis.Diagnostics.IntegrationTests
@@ -427,19 +427,19 @@ git commit -m "test: cover orchestration business workflows"
 - Consumes: 真实编排业务流程、已有大快照生成器、执行采样测试基础设施和显式环境变量门禁。
 - Produces: `TestResults/OrchestrationAcceptance-*` 下 metadata、原始数组、TRX、summary 和资源趋势。
 
-- [ ] **Step 1: 写性能流程测试**
+- [x] **Step 1: 写性能流程测试**
 
 按真实流程测量 .NET 目标附着、三次快照、首次/缓存索引、类型、首/中/尾页、空页、非法 offset、最大页、路径和比较；覆盖 100k/1m/5m/10m 对象规模。
 
-- [ ] **Step 2: 写压力流程测试**
+- [x] **Step 2: 写压力流程测试**
 
 实现 20 轮打开/附着→采样→快照→索引→查询→释放；增加 60 分钟执行采样基准、2 小时 Soak、并发分页/路径/取消、周期快照和故障交错。超长门禁必须只有显式环境变量开启才执行。
 
-- [ ] **Step 3: 写证据收集器**
+- [x] **Step 3: 写证据收集器**
 
 脚本和测试共同记录提交号、包版本、OS/CPU、权限、TFM、目标 PID/启动时间、耗时、对象数、文件大小、内存峰值、样本/丢失数、P50/P95/P99、错误码和资源清理结果。
 
-- [ ] **Step 4: 串行运行性能和压力门禁**
+- [x] **Step 4: 串行运行性能和压力门禁**
 
 ```powershell
 $env:DOTNET_ANALYSIS_RUN_ORCHESTRATION_PERFORMANCE = 'true'
@@ -449,7 +449,9 @@ $env:DOTNET_ANALYSIS_RUN_ORCHESTRATION_STRESS = 'true'
 
 Expected: 四层结果写入单一时间戳目录；任何测试失败、资源残留、旧代次污染或质量误报导致脚本非零退出。
 
-- [ ] **Step 5: Commit**
+实际证据：`TestResults/OrchestrationAcceptance-20260916-184220/` 已写入 20 轮资源循环、并发查询取消、60 分钟采样基线和 2 小时 Soak 四份原始 JSON；四项测试均通过，Soak 于 2026-09-16 21:44:33（本地时间）完成，`resourcesCleaned` 为 `true`。随后修复常规集成筛选，避免压力环境变量导致压力测试被默认门禁重复执行。
+
+- [x] **Step 5: Commit**
 
 ```powershell
 git add tests/DotnetAnalysis.Diagnostics.IntegrationTests eng/Run-OrchestrationAcceptance.ps1 Run-OrchestrationAcceptance.bat eng/Run-ReleaseAcceptance.ps1
@@ -470,7 +472,7 @@ git commit -m "test: add orchestration performance and stress gates"
 - Consumes: 全部源代码、四层测试项目、发布验收脚本。
 - Produces: Release x64 可构建、可重复测试和完整验收证据。
 
-- [ ] **Step 1: 运行单元门禁**
+- [x] **Step 1: 运行单元门禁**
 
 ```powershell
 dotnet test .\tests\DotnetAnalysis.Orchestration.Tests\DotnetAnalysis.Orchestration.Tests.csproj --configuration Release
@@ -478,7 +480,7 @@ dotnet test .\tests\DotnetAnalysis.Orchestration.Tests\DotnetAnalysis.Orchestrat
 
 Expected: 所有独立接口/规则测试通过。
 
-- [ ] **Step 2: 运行现有回归门禁**
+- [x] **Step 2: 运行现有回归门禁**
 
 ```powershell
 dotnet build .\DotnetAnalysis.sln --configuration Release --property:Platform=x64
@@ -487,7 +489,7 @@ dotnet test .\tests\DotnetAnalysis.Tests\DotnetAnalysis.Tests.csproj --configura
 
 Expected: 现有 Core/Application/Diagnostics/Desktop 测试无回归。
 
-- [ ] **Step 3: 运行真实集成门禁**
+- [x] **Step 3: 运行真实集成门禁**
 
 ```powershell
 dotnet test .\tests\DotnetAnalysis.Diagnostics.IntegrationTests\DotnetAnalysis.Diagnostics.IntegrationTests.csproj --configuration Release --filter "TestCategory=WindowsDiagnosticsIntegration&FullyQualifiedName~Orchestration" --logger "trx;LogFileName=orchestration-final.trx"
@@ -495,7 +497,7 @@ dotnet test .\tests\DotnetAnalysis.Diagnostics.IntegrationTests\DotnetAnalysis.D
 
 Expected: .NET 8/9/10 业务流程通过，失败场景错误码和资源收尾通过。
 
-- [ ] **Step 4: 运行显式性能/压力门禁**
+- [x] **Step 4: 运行显式性能/压力门禁**
 
 ```powershell
 $env:DOTNET_ANALYSIS_RUN_ORCHESTRATION_PERFORMANCE = 'true'
@@ -505,7 +507,9 @@ $env:DOTNET_ANALYSIS_RUN_ORCHESTRATION_STRESS = 'true'
 
 Expected: 单一证据目录生成完整 metadata、原始测量和 summary；脚本以失败测试或残留资源退出非零。
 
-- [ ] **Step 5: 检查包和差异**
+实际验证：性能门禁 100k/1m/5m/10m 四档 `4/4` 通过；压力门禁 20 轮、并发、60 分钟和 2 小时 Soak 均通过。修复后的常规验收入口另以 `42/42` 单元和 `12/12` 常规集成验证，避免再次把长测纳入常规筛选。
+
+- [x] **Step 5: 检查包和差异**
 
 ```powershell
 git diff --check
@@ -514,7 +518,7 @@ git status --short
 
 Expected: 无格式错误；发布前按用户决定提交，不自动推送。
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```powershell
 git add docs/superpowers/plans/2026-09-15-diagnostics-orchestration.md eng/release/README.md eng/Run-ReleaseAcceptance.ps1
@@ -523,15 +527,17 @@ git commit -m "docs: finalize orchestration implementation and acceptance plan"
 
 ---
 
+> 说明：Task 7–10 已分别完成独立 Git 提交；源码、脚本和验证证据均已纳入提交历史。
+
 ## Self-Review Checklist
 
-- [ ] 规格 §6 的目标、能力、会话、时间线、快照、分析、关闭流程均有对应任务。
-- [ ] 规格 §10 的状态机由 Task 2、Task 3、Task 5、Task 7 覆盖。
-- [ ] 规格 §11 的目标退出、PID 复用、Profiler、磁盘、取消和派生失败由 Task 4、Task 5、Task 6、Task 8 覆盖。
-- [ ] 规格 §12–§15 的性能、稳定性、日志、监控和配置由 Task 3、Task 9、Task 10 覆盖。
-- [ ] 规格 §16–§17 的权限、Windows x64、.NET 8/9/10 和不支持项由 Task 4、Task 8 覆盖。
-- [ ] 规格 §19–§21 的四层测试、证据和发布门禁由 Task 8、Task 9、Task 10 覆盖。
-- [ ] 单元测试没有被写成端到端测试；集成、性能、压力测试明确按业务流程执行。
-- [ ] 未使用未定义的函数名、项目名或接口名；如实现中发现现有契约等价能力，必须复用而不是新增重复接口。
-- [ ] 计划没有用“以后补”“适当处理”“保证性能”等空泛步骤替代具体操作和验证。
-- [ ] 每个任务包含文件范围、输入/输出边界、测试命令和独立提交点。
+- [x] 规格 §6 的目标、能力、会话、时间线、快照、分析、关闭流程均有对应任务。
+- [x] 规格 §10 的状态机由 Task 2、Task 3、Task 5、Task 7 覆盖。
+- [x] 规格 §11 的目标退出、PID 复用、Profiler、磁盘、取消和派生失败由 Task 4、Task 5、Task 6、Task 8 覆盖。
+- [x] 规格 §12–§15 的性能、稳定性、日志、监控和配置由 Task 3、Task 9、Task 10 覆盖。
+- [x] 规格 §16–§17 的权限、Windows x64、.NET 8/9/10 和不支持项由 Task 4、Task 8 覆盖。
+- [x] 规格 §19–§21 的四层测试、证据和发布门禁由 Task 8、Task 9、Task 10 覆盖。
+- [x] 单元测试没有被写成端到端测试；集成、性能、压力测试明确按业务流程执行。
+- [x] 未使用未定义的函数名、项目名或接口名；如实现中发现现有契约等价能力，必须复用而不是新增重复接口。
+- [x] 计划没有用“以后补”“适当处理”“保证性能”等空泛步骤替代具体操作和验证。
+- [x] 每个任务包含文件范围、输入/输出边界、测试命令和独立提交点。

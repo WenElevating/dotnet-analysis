@@ -28,6 +28,17 @@
 .\eng\Run-ReleaseAcceptance.ps1 -Version 1.0.0 -RunLargeSnapshotBenchmark
 ```
 
+`Run-ReleaseAcceptance.ps1` 默认包含编排单元测试和常规编排集成测试。性能和压力测试不属于默认发布门禁，只有显式设置对应环境变量并传入 `-EnableLongRunning` 才执行：
+
+```powershell
+.\eng\Run-OrchestrationAcceptance.ps1 -Configuration Release
+$env:DOTNET_ANALYSIS_RUN_ORCHESTRATION_PERFORMANCE = 'true'
+$env:DOTNET_ANALYSIS_RUN_ORCHESTRATION_STRESS = 'true'
+.\eng\Run-OrchestrationAcceptance.ps1 -Configuration Release -EnableLongRunning
+```
+
+编排证据写入 `TestResults\OrchestrationAcceptance-*`，包含 `metadata.json`、测试 TRX、原始测量 JSON 和 `summary.json`；发布验收入口会默认生成这份常规编排证据，并在调用常规门禁时屏蔽长测环境变量。长测请单独运行上面的编排验收命令。
+
 该入口按顺序执行单元测试、Windows 诊断集成测试、可选大快照基准，最后生成并校验自包含发布包。不要用 Solution 级 `dotnet test` 作为唯一发布门禁。
 
 ## 夜间极限验收

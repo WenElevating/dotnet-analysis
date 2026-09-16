@@ -30,6 +30,32 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Large snapshot benchmark failed.' }
     }
 
+    $orchestrationGateVariables = @(
+        'DOTNET_ANALYSIS_RUN_ORCHESTRATION_PERFORMANCE',
+        'DOTNET_ANALYSIS_RUN_ORCHESTRATION_STRESS'
+    )
+    $previousOrchestrationGateValues = @{}
+    foreach ($variableName in $orchestrationGateVariables) {
+        $previousOrchestrationGateValues[$variableName] = [Environment]::GetEnvironmentVariable($variableName, 'Process')
+        Remove-Item "Env:$variableName" -ErrorAction SilentlyContinue
+    }
+
+    try {
+        & (Join-Path $PSScriptRoot 'Run-OrchestrationAcceptance.ps1') -Configuration $Configuration -SkipBuild
+        if ($LASTEXITCODE -ne 0) { throw 'Orchestration acceptance failed.' }
+    }
+    finally {
+        foreach ($variableName in $orchestrationGateVariables) {
+            $previousValue = $previousOrchestrationGateValues[$variableName]
+            if ($null -eq $previousValue) {
+                Remove-Item "Env:$variableName" -ErrorAction SilentlyContinue
+            }
+            else {
+                Set-Item "Env:$variableName" $previousValue
+            }
+        }
+    }
+
     & (Join-Path $PSScriptRoot 'Publish-Release.ps1') -Version $Version -SkipBuild
     if ($LASTEXITCODE -ne 0) { throw 'Release package verification failed.' }
     Write-Output 'Release acceptance passed using sequential test project execution.'
