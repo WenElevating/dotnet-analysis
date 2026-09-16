@@ -94,11 +94,47 @@ public sealed class ApplicationContractTests
         var sessionId = ProcessDiagnosticsSessionId.New();
         var snapshot = new MemorySnapshot(MemorySnapshotId.New(), MemorySnapshotOrigin.Imported, DateTimeOffset.UtcNow, null, DateTimeOffset.UtcNow, MemorySnapshotState.Ready);
         var operation = new DiagnosticOperationState(Guid.NewGuid(), Guid.NewGuid(), DiagnosticOperationStage.FindingTarget, DiagnosticOperationStatus.Running);
+        var operationWithSession = new DiagnosticOperationState(Guid.NewGuid(), operation.Generation, DiagnosticOperationStage.Querying, DiagnosticOperationStatus.Running, sessionId: sessionId);
+        var operationWithSnapshot = new DiagnosticOperationState(Guid.NewGuid(), operation.Generation, DiagnosticOperationStage.Querying, DiagnosticOperationStatus.Running, snapshotId: snapshot.Id);
 
         var state = new DiagnosticsApplicationState(operation.Generation, DiagnosticsApplicationPhase.TargetSelection, ProcessDiagnosticsSessionState.Monitoring, sessionId: sessionId, snapshot: snapshot, operation: operation);
+        var operationOnlySessionState = new DiagnosticsApplicationState(operation.Generation, DiagnosticsApplicationPhase.TargetSelection, operation: operationWithSession);
+        var operationOnlySnapshotState = new DiagnosticsApplicationState(operation.Generation, DiagnosticsApplicationPhase.SnapshotSelection, snapshot: null, operation: operationWithSnapshot);
 
         Assert.AreEqual(sessionId, state.SessionId);
         Assert.AreEqual(snapshot.Id, state.Snapshot!.Id);
+        Assert.AreEqual(sessionId, operationOnlySessionState.Operation!.SessionId);
+        Assert.AreEqual(snapshot.Id, operationOnlySnapshotState.Operation!.SnapshotId);
+    }
+
+    /// <summary>验证双方身份一致、冲突以及任一侧为空时的校验规则。</summary>
+    [TestMethod]
+    public void ApplicationState_ValidatesOnlyTwoPresentResourceIdentities()
+    {
+        var generation = Guid.NewGuid();
+        var sessionId = ProcessDiagnosticsSessionId.New();
+        var otherSessionId = ProcessDiagnosticsSessionId.New();
+        var snapshotId = MemorySnapshotId.New();
+        var otherSnapshotId = MemorySnapshotId.New();
+        var snapshot = new MemorySnapshot(snapshotId, MemorySnapshotOrigin.Imported, DateTimeOffset.UtcNow, null, DateTimeOffset.UtcNow, MemorySnapshotState.Ready);
+
+        var matchingOperation = new DiagnosticOperationState(Guid.NewGuid(), generation, DiagnosticOperationStage.Querying, DiagnosticOperationStatus.Running, sessionId, snapshotId);
+        _ = new DiagnosticsApplicationState(generation, DiagnosticsApplicationPhase.SnapshotSelection, sessionId: sessionId, snapshot: snapshot, operation: matchingOperation);
+
+        var sessionMismatch = new DiagnosticOperationState(Guid.NewGuid(), generation, DiagnosticOperationStage.Querying, DiagnosticOperationStatus.Running, otherSessionId, snapshotId);
+        Assert.ThrowsExactly<ArgumentException>(() => new DiagnosticsApplicationState(generation, DiagnosticsApplicationPhase.SnapshotSelection, sessionId: sessionId, snapshot: snapshot, operation: sessionMismatch));
+
+        var snapshotMismatch = new DiagnosticOperationState(Guid.NewGuid(), generation, DiagnosticOperationStage.Querying, DiagnosticOperationStatus.Running, sessionId, otherSnapshotId);
+        Assert.ThrowsExactly<ArgumentException>(() => new DiagnosticsApplicationState(generation, DiagnosticsApplicationPhase.SnapshotSelection, sessionId: sessionId, snapshot: snapshot, operation: snapshotMismatch));
+
+        var applicationOnly = new DiagnosticOperationState(Guid.NewGuid(), generation, DiagnosticOperationStage.FindingTarget, DiagnosticOperationStatus.Running);
+        _ = new DiagnosticsApplicationState(generation, DiagnosticsApplicationPhase.TargetSelection, sessionId: sessionId, snapshot: snapshot, operation: applicationOnly);
+
+        var operationOnly = new DiagnosticOperationState(Guid.NewGuid(), generation, DiagnosticOperationStage.Querying, DiagnosticOperationStatus.Running, sessionId, snapshotId);
+        _ = new DiagnosticsApplicationState(generation, DiagnosticsApplicationPhase.SnapshotSelection, operation: operationOnly);
+
+        var neitherSide = new DiagnosticOperationState(Guid.NewGuid(), generation, DiagnosticOperationStage.FindingTarget, DiagnosticOperationStatus.Running);
+        _ = new DiagnosticsApplicationState(generation, DiagnosticsApplicationPhase.TargetSelection, operation: neitherSide);
     }
 
     /// <summary>验证追加捕获模式不会改变原有位置参数构造调用的含义。</summary>
