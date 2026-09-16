@@ -7,7 +7,7 @@ namespace DotnetAnalysis.Application.Events;
 /// <summary>
 /// 表示快照分析失败，并携带可供上层处理的稳定错误码。
 /// </summary>
-public sealed record MemorySnapshotAnalysisFailed : IApplicationEvent
+public sealed record MemorySnapshotAnalysisFailed : IApplicationEvent, IOperationEvent
 {
     /// <summary>
     /// 创建分析失败事件。
@@ -68,4 +68,14 @@ public sealed record MemorySnapshotAnalysisFailed : IApplicationEvent
     /// 显式映射到通用事件会话属性。
     /// </summary>
     ProcessDiagnosticsSessionId? IApplicationEvent.SessionId => SessionId;
+
+    /// <inheritdoc />
+    public Guid Generation { get; init; }
+
+    /// <inheritdoc />
+    public Guid? OperationId { get; init; }
+
+    /// <inheritdoc />
+    public bool Matches(Guid generation, ProcessDiagnosticsSessionId? sessionId, Guid operationId) =>
+        Generation == generation && SessionId == sessionId && OperationId == operationId;
 }

@@ -11,4 +11,15 @@ public sealed record ModuleFaulted(
     string Module,
     string Message,
     DateTimeOffset OccurredAt,
-    string Source) : IApplicationEvent;
+    string Source) : IApplicationEvent, IOperationEvent
+{
+    /// <inheritdoc />
+    public Guid Generation { get; init; }
+
+    /// <inheritdoc />
+    public Guid? OperationId { get; init; }
+
+    /// <inheritdoc />
+    public bool Matches(Guid generation, ProcessDiagnosticsSessionId? sessionId, Guid operationId) =>
+        Generation == generation && SessionId == sessionId && OperationId == operationId;
+}

@@ -10,7 +10,7 @@ public sealed record ProcessMemoryUsageUpdated(
     ProcessDiagnosticsSessionId SessionId,
     MemoryUsageSample Sample,
     DateTimeOffset OccurredAt,
-    string Source) : IApplicationEvent, IApplicationEventDeliveryPolicy
+    string Source) : IApplicationEvent, IApplicationEventDeliveryPolicy, IOperationEvent
 {
     /// <summary>
     /// 此事件关联的会话。
@@ -26,4 +26,14 @@ public sealed record ProcessMemoryUsageUpdated(
     /// 按会话区分进程内存样本流的投递键。
     /// </summary>
     public string DeliveryKey => $"{SessionId.Value:N}:process-memory";
+
+    /// <inheritdoc />
+    public Guid Generation { get; init; }
+
+    /// <inheritdoc />
+    public Guid? OperationId { get; init; }
+
+    /// <inheritdoc />
+    public bool Matches(Guid generation, ProcessDiagnosticsSessionId? sessionId, Guid operationId) =>
+        Generation == generation && SessionId == sessionId && OperationId == operationId;
 }
