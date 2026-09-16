@@ -12,6 +12,7 @@ namespace DotnetAnalysis.Orchestration.Tests;
     Justification = "Test names describe the required contract behavior.")]
 public sealed class ApplicationContractTests
 {
+    /// <summary>验证目标上下文保留 PID 和启动时间。</summary>
     [TestMethod]
     public void TargetContext_PreservesProcessIdAndStartTime()
     {
@@ -26,6 +27,7 @@ public sealed class ApplicationContractTests
         Assert.AreSame(target, context.Target);
     }
 
+    /// <summary>验证筛选模型不依赖 UI 且校验页大小。</summary>
     [TestMethod]
     public void ProcessFilter_HasNoUiDependencyAndValidatesPageSize()
     {
@@ -37,6 +39,7 @@ public sealed class ApplicationContractTests
         Assert.IsFalse(typeof(ProcessFilter).Assembly.GetReferencedAssemblies().Any(static name => name.Name == "PresentationFramework"));
     }
 
+    /// <summary>验证每项诊断能力可以独立报告可用性。</summary>
     [TestMethod]
     public void Capabilities_AreIndependentlyAvailable()
     {
@@ -52,33 +55,39 @@ public sealed class ApplicationContractTests
         Assert.IsTrue(capabilities.ExecutionSampling.IsAvailable);
     }
 
+    /// <summary>验证操作失败保留错误码、阶段和重试标记。</summary>
     [TestMethod]
     public void OperationState_PreservesFailureCodeStageAndRetryability()
     {
-        var failure = new DiagnosticFailure(DiagnosticsErrorCode.TargetChanged, DiagnosticOperationStage.Attaching, false, "目标身份已变化");
-        var operation = new DiagnosticOperationState(Guid.NewGuid(), Guid.NewGuid(), DiagnosticOperationStage.Attaching, DiagnosticOperationStatus.Failed, failure: failure);
+        var failure = new DiagnosticFailure(DiagnosticsErrorCode.TargetChanged, DiagnosticOperationStage.Querying, false, "目标身份已变化");
+        var operation = new DiagnosticOperationState(Guid.NewGuid(), Guid.NewGuid(), DiagnosticOperationStage.Querying, DiagnosticOperationStatus.Failed, failure: failure);
 
         Assert.AreEqual(DiagnosticsErrorCode.TargetChanged, operation.Failure!.ErrorCode);
-        Assert.AreEqual(DiagnosticOperationStage.Attaching, operation.Failure.Stage);
+        Assert.AreEqual(DiagnosticOperationStage.Querying, operation.Failure.Stage);
         Assert.IsFalse(operation.Failure.Retryable);
     }
 
+    /// <summary>验证状态快照保留并校验 generation、session、snapshot 和 operation 身份。</summary>
     [TestMethod]
     public void ApplicationState_ContainsGenerationSessionSnapshotAndOperationIdentities()
     {
         var sessionId = ProcessDiagnosticsSessionId.New();
         var snapshotId = MemorySnapshotId.New();
         var snapshot = new MemorySnapshot(snapshotId, MemorySnapshotOrigin.Imported, DateTimeOffset.UtcNow, null, DateTimeOffset.UtcNow, MemorySnapshotState.Ready);
-        var operation = new DiagnosticOperationState(Guid.NewGuid(), Guid.NewGuid(), DiagnosticOperationStage.Querying, DiagnosticOperationStatus.Running, sessionId, snapshotId);
+        var operation = new DiagnosticOperationState(Guid.NewGuid(), Guid.NewGuid(), DiagnosticOperationStage.Querying, DiagnosticOperationStatus.Running, sessionId, snapshotId, MemorySnapshotCaptureMode.Standard);
 
-        var state = new DiagnosticsApplicationState(operation.Generation, DiagnosticsApplicationLifecycle.SnapshotAnalysis, sessionId: sessionId, snapshot: snapshot, operation: operation);
+        var state = new DiagnosticsApplicationState(operation.Generation, DiagnosticsApplicationPhase.SnapshotSelection, ProcessDiagnosticsSessionState.Monitoring, sessionId: sessionId, snapshot: snapshot, operation: operation);
 
         Assert.AreEqual(operation.Generation, state.Generation);
         Assert.AreEqual(sessionId, state.SessionId);
         Assert.AreEqual(snapshotId, state.Snapshot!.Id);
         Assert.AreEqual(operation.OperationId, state.Operation!.OperationId);
+        Assert.AreEqual(MemorySnapshotCaptureMode.Standard, state.Operation.CaptureMode);
+        Assert.ThrowsExactly<ArgumentException>(() => new DiagnosticsApplicationState(Guid.NewGuid(), DiagnosticsApplicationPhase.SnapshotSelection, operation: operation));
+        Assert.ThrowsExactly<ArgumentException>(() => new DiagnosticsApplicationState(operation.Generation, DiagnosticsApplicationPhase.SnapshotSelection, sessionId: ProcessDiagnosticsSessionId.New(), operation: operation));
     }
 
+    /// <summary>验证质量摘要区分完整、部分、不可用和失败。</summary>
     [TestMethod]
     public void QualitySummary_DistinguishesRequiredQualityLevels()
     {
@@ -89,6 +98,7 @@ public sealed class ApplicationContractTests
             qualities);
     }
 
+    /// <summary>验证启动目标校验可执行文件路径和超时。</summary>
     [TestMethod]
     public void LaunchTarget_ValidatesExecutableAndTimeout()
     {

@@ -2,31 +2,19 @@ using DotnetAnalysis.Core.Diagnostics;
 
 namespace DotnetAnalysis.Orchestration.Models;
 
-/// <summary>诊断应用上下文的稳定生命周期状态。</summary>
-public enum DiagnosticsApplicationLifecycle
+/// <summary>诊断应用上下文独有的宿主协调阶段。</summary>
+public enum DiagnosticsApplicationPhase
 {
-    /// <summary>尚未进入目标或快照分析。</summary>
+    /// <summary>尚未建立应用上下文。</summary>
     Start,
-    /// <summary>正在查找目标。</summary>
-    FindingTarget,
-    /// <summary>正在附着目标。</summary>
-    Attaching,
-    /// <summary>活动会话正在分析。</summary>
-    LiveAnalysis,
-    /// <summary>正在捕获快照。</summary>
-    CapturingSnapshot,
-    /// <summary>正在分析快照。</summary>
-    AnalyzingSnapshot,
-    /// <summary>当前快照可查询。</summary>
-    SnapshotAnalysis,
-    /// <summary>正在停止或替换上下文。</summary>
-    Stopping,
-    /// <summary>已正常结束。</summary>
-    Ended,
-    /// <summary>发生稳定失败。</summary>
-    Failed,
+    /// <summary>正在协调目标选择。</summary>
+    TargetSelection,
+    /// <summary>正在协调快照选择。</summary>
+    SnapshotSelection,
     /// <summary>应用上下文已关闭。</summary>
-    Closed
+    Closed,
+    /// <summary>应用上下文发生失败并等待清理。</summary>
+    Failed
 }
 
 /// <summary>
@@ -36,7 +24,8 @@ public sealed record DiagnosticsApplicationState
 {
     /// <summary>创建应用状态快照。</summary>
     /// <param name="generation">非空应用上下文代次。</param>
-    /// <param name="lifecycle">应用生命周期状态。</param>
+    /// <param name="phase">应用独有协调阶段。</param>
+    /// <param name="sessionState">复用 Core 的诊断会话状态。</param>
     /// <param name="target">当前目标上下文。</param>
     /// <param name="sessionId">当前会话身份。</param>
     /// <param name="snapshot">当前快照。</param>
@@ -45,7 +34,8 @@ public sealed record DiagnosticsApplicationState
     /// <param name="failure">当前稳定失败结果。</param>
     public DiagnosticsApplicationState(
         Guid generation,
-        DiagnosticsApplicationLifecycle lifecycle,
+        DiagnosticsApplicationPhase phase,
+        ProcessDiagnosticsSessionState? sessionState = null,
         TargetContext? target = null,
         ProcessDiagnosticsSessionId? sessionId = null,
         MemorySnapshot? snapshot = null,
@@ -54,13 +44,24 @@ public sealed record DiagnosticsApplicationState
         DiagnosticFailure? failure = null)
     {
         if (generation == Guid.Empty) throw new ArgumentException("Generation cannot be empty.", nameof(generation));
-        if (snapshot is not null && operation?.SnapshotId is not null && operation.SnapshotId != snapshot.Id)
+        if (operation is not null && operation.Generation != generation)
+        {
+            throw new ArgumentException("Operation generation must match application generation.", nameof(operation));
+        }
+
+        if (operation is not null && operation.SessionId != sessionId)
+        {
+            throw new ArgumentException("Session identity must match the operation session identity.", nameof(sessionId));
+        }
+
+        if (operation is not null && operation.SnapshotId != snapshot?.Id)
         {
             throw new ArgumentException("Snapshot identity must match the operation snapshot identity.", nameof(snapshot));
         }
 
         Generation = generation;
-        Lifecycle = lifecycle;
+        Phase = phase;
+        SessionState = sessionState;
         Target = target;
         SessionId = sessionId;
         Snapshot = snapshot;
@@ -72,8 +73,11 @@ public sealed record DiagnosticsApplicationState
     /// <summary>应用上下文代次。</summary>
     public Guid Generation { get; }
 
-    /// <summary>应用生命周期状态。</summary>
-    public DiagnosticsApplicationLifecycle Lifecycle { get; }
+    /// <summary>应用独有协调阶段。</summary>
+    public DiagnosticsApplicationPhase Phase { get; }
+
+    /// <summary>复用 Core 的诊断会话状态。</summary>
+    public ProcessDiagnosticsSessionState? SessionState { get; }
 
     /// <summary>当前目标上下文。</summary>
     public TargetContext? Target { get; }

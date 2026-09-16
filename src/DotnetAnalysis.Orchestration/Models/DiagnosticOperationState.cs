@@ -10,18 +10,8 @@ public enum DiagnosticOperationStage
     None,
     /// <summary>正在查找目标。</summary>
     FindingTarget,
-    /// <summary>正在附着目标。</summary>
-    Attaching,
-    /// <summary>正在采样。</summary>
-    Sampling,
-    /// <summary>正在捕获快照。</summary>
-    CapturingSnapshot,
-    /// <summary>正在分析快照。</summary>
-    AnalyzingSnapshot,
     /// <summary>正在查询结果。</summary>
     Querying,
-    /// <summary>正在停止会话。</summary>
-    Stopping,
     /// <summary>正在关闭应用上下文。</summary>
     Closing
 }
@@ -89,6 +79,7 @@ public sealed record DiagnosticOperationState
     /// <param name="status">当前处理状态。</param>
     /// <param name="sessionId">关联会话身份。</param>
     /// <param name="snapshotId">关联快照身份。</param>
+    /// <param name="captureMode">快照捕获模式；非捕获操作时为空。</param>
     /// <param name="deadlineUtc">操作总截止时间。</param>
     /// <param name="isCancellable">当前操作是否可取消。</param>
     /// <param name="failure">稳定失败结果。</param>
@@ -99,6 +90,7 @@ public sealed record DiagnosticOperationState
         DiagnosticOperationStatus status,
         ProcessDiagnosticsSessionId? sessionId = null,
         MemorySnapshotId? snapshotId = null,
+        MemorySnapshotCaptureMode? captureMode = null,
         DateTimeOffset? deadlineUtc = null,
         bool isCancellable = false,
         DiagnosticFailure? failure = null)
@@ -116,6 +108,7 @@ public sealed record DiagnosticOperationState
         Status = status;
         SessionId = sessionId;
         SnapshotId = snapshotId;
+        CaptureMode = captureMode;
         DeadlineUtc = deadlineUtc;
         IsCancellable = isCancellable;
         Failure = failure;
@@ -138,6 +131,9 @@ public sealed record DiagnosticOperationState
 
     /// <summary>关联快照身份。</summary>
     public MemorySnapshotId? SnapshotId { get; }
+
+    /// <summary>请求的快照捕获模式；非捕获操作时为空。</summary>
+    public MemorySnapshotCaptureMode? CaptureMode { get; }
 
     /// <summary>操作总截止时间。</summary>
     public DateTimeOffset? DeadlineUtc { get; }
