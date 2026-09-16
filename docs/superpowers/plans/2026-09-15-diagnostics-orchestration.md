@@ -260,19 +260,19 @@ git commit -m "feat: orchestrate target discovery capability and launch"
 - Consumes: `IProcessDiagnostics.AttachAsync`, `IProcessDiagnosticsSession`, `OperationScope`, `TargetContext`, `IEventBus`.
 - Produces: `IAnalysisSession` with `ReadMemoryTimelineAsync`, standard/Retention `CaptureAsync`, execution profile query, `StopAsync`, `DisposeAsync` and capability/quality state.
 
-- [ ] **Step 1: 写会话失败测试**
+- [x] **Step 1: 写会话失败测试**
 
 覆盖附着成功状态序列、样本质量、捕获模式转发、Retention 禁止降级、目标退出、PID 变化、取消、停止、重复释放和后台任务收尾。
 
-- [ ] **Step 2: 实现会话所有权**
+- [x] **Step 2: 实现会话所有权**
 
 会话独占底层诊断会话和会话级取消源；宿主只能获得 `IAnalysisSession`；停止时等待采样、捕获和查询相关后台工作进入终态。
 
-- [ ] **Step 3: 实现时间线和执行采样入口**
+- [x] **Step 3: 实现时间线和执行采样入口**
 
 时间线有界并保留缺失/中断质量；执行采样查询验证时间区间属于当前会话可查询范围；查询取消只影响当前调用。
 
-- [ ] **Step 4: 运行测试**
+- [x] **Step 4: 运行测试**
 
 ```powershell
 dotnet test .\tests\DotnetAnalysis.Orchestration.Tests\DotnetAnalysis.Orchestration.Tests.csproj --configuration Debug --filter "FullyQualifiedName~AnalysisSessionTests"
@@ -280,7 +280,7 @@ dotnet test .\tests\DotnetAnalysis.Orchestration.Tests\DotnetAnalysis.Orchestrat
 
 Expected: 所有会话单元测试通过，且无未观察后台任务。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add src/DotnetAnalysis.Orchestration tests/DotnetAnalysis.Orchestration.Tests
