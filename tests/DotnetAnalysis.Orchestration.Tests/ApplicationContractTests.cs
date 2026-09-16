@@ -74,7 +74,7 @@ public sealed class ApplicationContractTests
         var sessionId = ProcessDiagnosticsSessionId.New();
         var snapshotId = MemorySnapshotId.New();
         var snapshot = new MemorySnapshot(snapshotId, MemorySnapshotOrigin.Imported, DateTimeOffset.UtcNow, null, DateTimeOffset.UtcNow, MemorySnapshotState.Ready);
-        var operation = new DiagnosticOperationState(Guid.NewGuid(), Guid.NewGuid(), DiagnosticOperationStage.Querying, DiagnosticOperationStatus.Running, sessionId, snapshotId, MemorySnapshotCaptureMode.Standard);
+        var operation = new DiagnosticOperationState(Guid.NewGuid(), Guid.NewGuid(), DiagnosticOperationStage.Querying, DiagnosticOperationStatus.Running, sessionId, snapshotId, captureMode: MemorySnapshotCaptureMode.Standard);
 
         var state = new DiagnosticsApplicationState(operation.Generation, DiagnosticsApplicationPhase.SnapshotSelection, ProcessDiagnosticsSessionState.Monitoring, sessionId: sessionId, snapshot: snapshot, operation: operation);
 
@@ -85,6 +85,43 @@ public sealed class ApplicationContractTests
         Assert.AreEqual(MemorySnapshotCaptureMode.Standard, state.Operation.CaptureMode);
         Assert.ThrowsExactly<ArgumentException>(() => new DiagnosticsApplicationState(Guid.NewGuid(), DiagnosticsApplicationPhase.SnapshotSelection, operation: operation));
         Assert.ThrowsExactly<ArgumentException>(() => new DiagnosticsApplicationState(operation.Generation, DiagnosticsApplicationPhase.SnapshotSelection, sessionId: ProcessDiagnosticsSessionId.New(), operation: operation));
+    }
+
+    /// <summary>验证非会话和非快照操作允许状态快照保留当前上下文身份。</summary>
+    [TestMethod]
+    public void ApplicationState_AllowsOptionalOperationIdentities()
+    {
+        var sessionId = ProcessDiagnosticsSessionId.New();
+        var snapshot = new MemorySnapshot(MemorySnapshotId.New(), MemorySnapshotOrigin.Imported, DateTimeOffset.UtcNow, null, DateTimeOffset.UtcNow, MemorySnapshotState.Ready);
+        var operation = new DiagnosticOperationState(Guid.NewGuid(), Guid.NewGuid(), DiagnosticOperationStage.FindingTarget, DiagnosticOperationStatus.Running);
+
+        var state = new DiagnosticsApplicationState(operation.Generation, DiagnosticsApplicationPhase.TargetSelection, ProcessDiagnosticsSessionState.Monitoring, sessionId: sessionId, snapshot: snapshot, operation: operation);
+
+        Assert.AreEqual(sessionId, state.SessionId);
+        Assert.AreEqual(snapshot.Id, state.Snapshot!.Id);
+    }
+
+    /// <summary>验证追加捕获模式不会改变原有位置参数构造调用的含义。</summary>
+    [TestMethod]
+    public void OperationState_PreservesExistingPositionalConstructorOrder()
+    {
+        var deadline = DateTimeOffset.UtcNow.AddMinutes(1);
+        var failure = new DiagnosticFailure(DiagnosticsErrorCode.CaptureFailed, DiagnosticOperationStage.Querying, true, "可重试失败");
+        var operation = new DiagnosticOperationState(
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            DiagnosticOperationStage.Querying,
+            DiagnosticOperationStatus.Failed,
+            null,
+            null,
+            deadline,
+            true,
+            failure);
+
+        Assert.AreEqual(deadline, operation.DeadlineUtc);
+        Assert.IsTrue(operation.IsCancellable);
+        Assert.AreSame(failure, operation.Failure);
+        Assert.IsNull(operation.CaptureMode);
     }
 
     /// <summary>验证质量摘要区分完整、部分、不可用和失败。</summary>

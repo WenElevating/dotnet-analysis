@@ -49,12 +49,12 @@ public sealed record DiagnosticsApplicationState
             throw new ArgumentException("Operation generation must match application generation.", nameof(operation));
         }
 
-        if (operation is not null && operation.SessionId != sessionId)
+        if (operation?.SessionId is not null && operation.SessionId != sessionId)
         {
             throw new ArgumentException("Session identity must match the operation session identity.", nameof(sessionId));
         }
 
-        if (operation is not null && operation.SnapshotId != snapshot?.Id)
+        if (operation?.SnapshotId is not null && operation.SnapshotId != snapshot?.Id)
         {
             throw new ArgumentException("Snapshot identity must match the operation snapshot identity.", nameof(snapshot));
         }

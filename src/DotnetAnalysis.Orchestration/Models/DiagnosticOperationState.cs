@@ -79,10 +79,10 @@ public sealed record DiagnosticOperationState
     /// <param name="status">当前处理状态。</param>
     /// <param name="sessionId">关联会话身份。</param>
     /// <param name="snapshotId">关联快照身份。</param>
-    /// <param name="captureMode">快照捕获模式；非捕获操作时为空。</param>
     /// <param name="deadlineUtc">操作总截止时间。</param>
     /// <param name="isCancellable">当前操作是否可取消。</param>
     /// <param name="failure">稳定失败结果。</param>
+    /// <param name="captureMode">快照捕获模式；非捕获操作时为空。</param>
     public DiagnosticOperationState(
         Guid operationId,
         Guid generation,
@@ -90,10 +90,10 @@ public sealed record DiagnosticOperationState
         DiagnosticOperationStatus status,
         ProcessDiagnosticsSessionId? sessionId = null,
         MemorySnapshotId? snapshotId = null,
-        MemorySnapshotCaptureMode? captureMode = null,
         DateTimeOffset? deadlineUtc = null,
         bool isCancellable = false,
-        DiagnosticFailure? failure = null)
+        DiagnosticFailure? failure = null,
+        MemorySnapshotCaptureMode? captureMode = null)
     {
         if (operationId == Guid.Empty) throw new ArgumentException("Operation ID cannot be empty.", nameof(operationId));
         if (generation == Guid.Empty) throw new ArgumentException("Generation cannot be empty.", nameof(generation));
