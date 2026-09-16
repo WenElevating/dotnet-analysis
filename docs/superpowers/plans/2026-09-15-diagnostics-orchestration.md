@@ -4,7 +4,7 @@
 
 **Goal:** 在不泄漏 Diagnostics/WPF 实现细节的前提下，建立可被 WPF、CLI 或未来其他宿主复用的生产级诊断编排层，覆盖目标查找、能力探测、启动/附着、活动会话、多快照分析、取消/超时、错误恢复和四层业务验收。
 
-**Architecture:** `Core <- Application <- Orchestration <- Host`。`Orchestration` 只依赖 Core/Application；Diagnostics 通过 Application 契约提供真实能力；Desktop 仅在组合根注册并消费编排接口，不直接编排诊断流程。单元测试独立验证接口和规则；集成、性能、压力测试使用真实 Windows 业务流程。
+**Architecture:** `Core <- Application <- Orchestration <- Host`。`Orchestration` 只依赖 Core/Application；Diagnostics 通过 Application 契约提供真实能力；本阶段不接入任何具体宿主。单元测试独立验证接口和规则；集成、性能、压力测试使用真实 Windows 业务流程。
 
 **Tech stack:** C# latest、.NET 10、MSTest 4、Microsoft.Extensions.DependencyInjection、现有 `IEventBus`、Windows x64、现有 Diagnostics 集成测试基础设施。
 
@@ -75,9 +75,6 @@
 ### 现有文件修改
 
 - `DotnetAnalysis.sln`：加入 Orchestration 源项目和单元测试项目。
-- `src/DotnetAnalysis.Desktop/DotnetAnalysis.Desktop.csproj`：引用 Orchestration。
-- `src/DotnetAnalysis.Desktop/Composition/DesktopServiceCollectionExtensions.cs`：只注册编排层入口，不在 ViewModel 中直接调用 Diagnostics。
-- `src/DotnetAnalysis.Desktop/App.xaml.cs`：组合根注册顺序保持 Core/Application/Diagnostics/Orchestration/Desktop。
 - `src/DotnetAnalysis.Application/Contracts/Diagnostics/DiagnosticsErrorCode.cs`：仅在现有错误码不足时补充稳定编排阶段错误，并补中文 XML。
 - `eng/Run-ReleaseAcceptance.ps1`：把 Orchestration 四层门禁加入发布验收，但保持现有 Diagnostics 门禁独立可运行。
 
@@ -89,7 +86,6 @@
 - Create: `src/DotnetAnalysis.Orchestration/DotnetAnalysis.Orchestration.csproj`
 - Create: `tests/DotnetAnalysis.Orchestration.Tests/DotnetAnalysis.Orchestration.Tests.csproj`
 - Modify: `DotnetAnalysis.sln`
-- Modify: `src/DotnetAnalysis.Desktop/DotnetAnalysis.Desktop.csproj`
 - Modify: `tests/DotnetAnalysis.Tests/DotnetAnalysis.Tests.csproj` only if architecture tests need explicit project discovery
 
 **Interfaces:**
@@ -98,7 +94,7 @@
 
 - [ ] **Step 1: 写项目边界测试**
 
-在 `tests/DotnetAnalysis.Tests/Architecture/OrchestrationBoundaryTests.cs` 增加测试，断言 Orchestration 程序集不存在 WPF/Diagnostics 程序集引用，并且 Desktop 只通过组合根注册编排层。
+在 `tests/DotnetAnalysis.Tests/Architecture/OrchestrationBoundaryTests.cs` 增加测试，断言 Orchestration 程序集不存在 WPF/Diagnostics 程序集引用，并且其公共契约不泄漏宿主或基础设施类型。
 
 - [ ] **Step 2: 创建两个项目并加入 solution**
 
@@ -118,7 +114,7 @@ Expected: 编译成功；新测试项目可发现且当前无测试失败。
 - [ ] **Step 4: Commit**
 
 ```powershell
-git add DotnetAnalysis.sln src/DotnetAnalysis.Orchestration tests/DotnetAnalysis.Orchestration.Tests src/DotnetAnalysis.Desktop/DotnetAnalysis.Desktop.csproj
+git add DotnetAnalysis.sln src/DotnetAnalysis.Orchestration tests/DotnetAnalysis.Orchestration.Tests
 git commit -m "feat: add diagnostics orchestration project boundaries"
 ```
 
@@ -337,20 +333,18 @@ git add src/DotnetAnalysis.Orchestration tests/DotnetAnalysis.Orchestration.Test
 
 ---
 
-## Task 7: 实现 `DiagnosticsApplication`、注册和 Desktop 组合根接入
+## Task 7: 实现 `DiagnosticsApplication` 和编排层自包含注册
 
 **Files:**
 - Create: `src/DotnetAnalysis.Orchestration/IDiagnosticsApplication.cs`
 - Create: `src/DotnetAnalysis.Orchestration/DiagnosticsApplication.cs`
 - Create: `src/DotnetAnalysis.Orchestration/DependencyInjection/OrchestrationServiceCollectionExtensions.cs`
-- Modify: `src/DotnetAnalysis.Desktop/Composition/DesktopServiceCollectionExtensions.cs`
-- Modify: `src/DotnetAnalysis.Desktop/App.xaml.cs`
 - Test: `tests/DotnetAnalysis.Orchestration.Tests/DiagnosticsApplicationTests.cs`
-- Modify: `tests/DotnetAnalysis.Tests/Desktop/CompositionTests.cs`
+- Test: `tests/DotnetAnalysis.Orchestration.Tests/OrchestrationCompositionTests.cs`
 
 **Interfaces:**
 - Consumes: `TargetProcessFinder`、`TargetCapabilityProbe`、`TargetProcessStarter`、`IAnalysisSession`、`SnapshotCollection`、`IEventBus`。
-- Produces: `IDiagnosticsApplication`，保证同一上下文最多一个活动会话、正确替换 generation、关闭幂等和状态发布。
+- Produces: `IDiagnosticsApplication` 和 `AddOrchestration()`，保证同一上下文最多一个活动会话、正确替换 generation、关闭幂等和状态发布；本阶段不修改 Desktop 或任何 WPF 文件。
 
 - [ ] **Step 1: 写应用上下文测试**
 
@@ -360,28 +354,26 @@ git add src/DotnetAnalysis.Orchestration tests/DotnetAnalysis.Orchestration.Test
 
 应用上下文拥有当前 generation、活动会话和快照集合；替换前停止旧会话并等待收尾；旧事件只能被识别但不能更新当前状态。
 
-- [ ] **Step 3: 接入组合根**
+- [ ] **Step 3: 接入编排层自包含注册**
 
-Desktop 只调用 `AddOrchestration()`；ViewModel 不新增 Diagnostics 直接依赖；现有 `IEventBus` 保持单例并由编排层复用。
+实现 `AddOrchestration()`，仅注册编排层自身类型和所需 Application 契约；测试宿主通过独立 `ServiceCollection` 验证解析 `IDiagnosticsApplication`，不修改 Desktop 组合根。
 
-- [ ] **Step 4: 运行组合和架构测试**
+- [ ] **Step 4: 运行编排层组合测试**
 
 ```powershell
-dotnet test .\tests\DotnetAnalysis.Orchestration.Tests\DotnetAnalysis.Orchestration.Tests.csproj --configuration Debug
-dotnet test .\tests\DotnetAnalysis.Tests\DotnetAnalysis.Tests.csproj --configuration Debug --no-build --filter "FullyQualifiedName~Composition|FullyQualifiedName~Architecture"
+dotnet test .\tests\DotnetAnalysis.Orchestration.Tests\DotnetAnalysis.Orchestration.Tests.csproj --configuration Debug --filter "FullyQualifiedName~DiagnosticsApplication|FullyQualifiedName~OrchestrationComposition"
 ```
 
-Expected: 编排测试和依赖边界测试通过；Desktop 可构建。
+Expected: 编排层公共入口可从独立测试宿主解析；测试不加载 WPF，不要求 Desktop 改动。
 
 - [ ] **Step 5: Commit**
 
 ```powershell
-git add src/DotnetAnalysis.Orchestration src/DotnetAnalysis.Desktop tests/DotnetAnalysis.Tests DotnetAnalysis.sln
+git add src/DotnetAnalysis.Orchestration tests/DotnetAnalysis.Orchestration.Tests DotnetAnalysis.sln
 git commit -m "feat: compose diagnostics application orchestration"
 ```
 
 ---
-
 ## Task 8: 编写真实业务流程集成测试
 
 **Files:**
