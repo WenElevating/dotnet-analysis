@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dotnet Analysis | Memory Diagnostics</title>
+  <style>
+    :root{--bg:#1e1e1e;--chrome:#181818;--surface:#252526;--surface2:#2d2d30;--line:#3d3d42;--line2:#52525a;--text:#e8e8e8;--muted:#a3a3a3;--faint:#73737a;--blue:#4cc2ff;--blue2:#89d7ff;--purple:#b98be0;--green:#89d185;--amber:#e2b76d;--red:#f48771;--mono:"Cascadia Code",Consolas,monospace}
+    [data-theme="light"]{--bg:#f5f5f5;--chrome:#e9e9e9;--surface:#fff;--surface2:#f1f1f1;--line:#d6d6d6;--line2:#bcbcbc;--text:#242424;--muted:#5d5d5d;--faint:#858585;--blue:#0f6cbd;--blue2:#075a9e;--purple:#7555a3;--green:#107c10;--amber:#986000;--red:#ba2d22}
+    *{box-sizing:border-box}body{margin:0;min-width:1120px;height:100vh;overflow:hidden;background:var(--bg);color:var(--text);font:12px/1.4 "Segoe UI","Microsoft YaHei UI",sans-serif}button,input,select{font:inherit;color:inherit}button{cursor:pointer}button:focus-visible,input:focus-visible,select:focus-visible{outline:1px solid var(--blue);outline-offset:-1px}.icon{width:14px;height:14px;stroke-width:1.7}.app{display:grid;grid-template-rows:31px 41px minmax(0,1fr) 23px;height:100vh}.titlebar{background:var(--chrome);border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 10px;gap:8px;user-select:none}.mark{width:16px;height:16px;border:1px solid var(--blue);display:grid;place-items:center;color:var(--blue);font:bold 10px var(--mono)}.titlebar strong{font-weight:600}.titlebar span{color:var(--muted)}.window{margin-left:auto;display:flex;height:100%}.window span{width:42px;display:grid;place-items:center;color:var(--muted)}.window span:last-child:hover{background:#c42b1c;color:#fff}
+    .commandbar{display:flex;align-items:center;background:var(--surface);border-bottom:1px solid var(--line);padding:0 10px;gap:5px}.command{min-height:27px;display:inline-flex;align-items:center;gap:6px;padding:4px 9px;border:1px solid transparent;background:transparent;color:var(--text)}.command:hover{background:var(--surface2);border-color:var(--line2)}.command.primary{background:var(--blue);color:#111;border-color:var(--blue)}[data-theme="light"] .command.primary{color:#fff}.command.primary:hover{background:var(--blue2)}.cmd-divider{height:20px;border-left:1px solid var(--line);margin:0 4px}.cmd-spacer{margin-left:auto;color:var(--muted);font-size:10px}
+    .body{display:grid;grid-template-columns:252px minmax(0,1fr);min-height:0}.path{background:var(--chrome);border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0}.path-head{height:43px;padding:0 11px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line)}.path-head strong{font-size:11px}.path-head button{border:0;background:transparent;color:var(--muted);font-size:16px}.path-list{padding:9px 7px;overflow:auto}.path-section{padding:8px 8px 5px;color:var(--faint);font-size:10px;text-transform:uppercase;letter-spacing:.06em}.path-item{display:flex;align-items:center;gap:8px;min-height:31px;padding:5px 8px;border:1px solid transparent;background:transparent;color:var(--muted);text-align:left;width:100%}.path-item:hover{background:var(--surface2);color:var(--text)}.path-item.active{background:var(--surface2);color:var(--blue);border-color:var(--line2)}.path-item .indent{margin-left:16px}.path-item .time{margin-left:auto;color:var(--faint);font:10px var(--mono)}.path-footer{margin-top:auto;border-top:1px solid var(--line);padding:9px 11px;color:var(--muted);font-size:10px;display:flex;align-items:center;gap:7px}.dot{width:7px;height:7px;border-radius:50%;background:var(--green);display:inline-block;flex:none}
+    .main{display:flex;flex-direction:column;min-width:0;min-height:0}.context{min-height:48px;background:var(--surface);border-bottom:1px solid var(--line);padding:0 15px;display:flex;align-items:center;gap:11px}.context h1{font-size:15px;font-weight:600;margin:0}.context .meta{color:var(--muted)}.context .right{margin-left:auto;display:flex;align-items:center;gap:6px}.small{height:27px;border:1px solid var(--line2);background:var(--surface);padding:3px 9px;display:inline-flex;align-items:center;gap:6px;color:var(--text)}.small:hover{background:var(--surface2)}.small.primary{background:var(--blue);color:#111;border-color:var(--blue)}[data-theme="light"] .small.primary{color:#fff}.state{display:inline-flex;align-items:center;gap:6px;color:var(--green);font-size:11px;margin-right:4px}.tabs{height:36px;display:flex;align-items:end;gap:1px;background:var(--surface);border-bottom:1px solid var(--line);padding:0 9px}.tab{height:35px;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--muted);padding:0 12px}.tab:hover{background:var(--surface2);color:var(--text)}.tab.active{border-bottom-color:var(--blue);color:var(--blue);font-weight:600}.tab .close{margin-left:8px;color:var(--faint)}.scroll{min-height:0;overflow:auto;padding:14px 15px 17px}.view{display:none}.view.active{display:block}.title-row{display:flex;align-items:baseline;gap:11px;margin-bottom:12px}.title-row h2{margin:0;font-size:18px;font-weight:600}.title-row p{margin:0;color:var(--muted)}.sample{margin-left:auto;color:var(--faint);font-size:10px}
+    .surface{background:var(--surface);border:1px solid var(--line);min-width:0}.surface-head{height:39px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:9px;padding:0 11px}.surface-head strong{font-weight:600}.surface-head .sub{color:var(--muted);font-size:10px}.surface-head .tools{display:flex;gap:5px;align-items:center;margin-left:auto}.surface-body{padding:11px}.grid{display:grid;grid-template-columns:minmax(0,1fr) 305px;gap:11px}.metric-line{display:grid;grid-template-columns:repeat(4,1fr);background:var(--surface);border:1px solid var(--line);margin-bottom:11px}.metric{padding:10px 12px;border-right:1px solid var(--line)}.metric:last-child{border:0}.metric label{display:block;color:var(--muted);font-size:10px}.metric strong{display:block;font-size:18px;font-weight:600;margin-top:2px}.metric small{display:block;color:var(--faint);font-size:10px;margin-top:2px}.chart{padding:8px 10px 10px}.legend{display:flex;gap:16px;margin:1px 0 4px 33px;color:var(--muted);font-size:10px}.legend span{display:inline-flex;align-items:center;gap:5px}.legend i{width:8px;height:8px;display:inline-block}.chart svg{width:100%;height:207px}.axis{display:flex;justify-content:space-between;padding-left:33px;color:var(--faint);font-size:10px}.chart-note{padding:7px 0 0 33px;color:var(--amber);font-size:10px}.capability{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 0;border-bottom:1px solid var(--line)}.capability:last-child{border:0}.capability strong{font-weight:600}.capability small{display:block;color:var(--muted);margin-top:2px}.status{font-size:10px;padding:2px 6px;border:1px solid var(--line2);white-space:nowrap}.status.good{color:var(--green);border-color:var(--green)}.status.warn{color:var(--amber);border-color:var(--amber)}.status.off{color:var(--muted)}.notice{margin-top:10px;border-left:2px solid var(--amber);padding:7px 9px;background:color-mix(in srgb,var(--amber) 10%,var(--surface));color:var(--amber);font-size:10px}.snapline{display:grid;grid-template-columns:repeat(3,1fr);border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:var(--surface);margin-top:11px}.snap{padding:10px 12px;border-right:1px solid var(--line);cursor:pointer}.snap:last-child{border:0}.snap:hover,.snap.current{background:var(--surface2);box-shadow:inset 0 -2px var(--blue)}.snap strong{font-size:11px}.snap .value{font:600 15px var(--mono);margin-top:5px}.snap small{color:var(--muted);font-size:10px}.table{width:100%;border-collapse:collapse}.table th,.table td{padding:7px 10px;border-bottom:1px solid var(--line);text-align:left}.table th{background:var(--surface2);color:var(--muted);font-size:10px;font-weight:600}.table tbody tr{cursor:pointer}.table tbody tr:hover,.table tbody tr.selected{background:var(--surface2)}.table .num{text-align:right;font-variant-numeric:tabular-nums}.type{font-weight:600}.meta{display:block;color:var(--faint);font-size:10px;margin-top:1px}.mono{font:11px var(--mono)}.table-foot{display:flex;justify-content:space-between;padding:8px 10px;color:var(--muted);font-size:10px}.filter{height:27px;width:185px;border:1px solid var(--line2);background:var(--surface);padding:4px 7px;color:var(--text)}
+    .summary-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}.summary-grid div{border:1px solid var(--line);padding:9px;background:var(--surface2)}.summary-grid strong{display:block;font:600 16px var(--mono)}.summary-grid span{display:block;color:var(--muted);font-size:10px;margin-top:3px}.subtabs{display:flex;align-items:end;gap:1px;background:var(--surface);border:1px solid var(--line);border-bottom:0;margin-top:11px;padding:0 8px}.subtabs button{height:34px;border:0;border-bottom:2px solid transparent;background:transparent;color:var(--muted);padding:0 10px}.subtabs button.active{border-bottom-color:var(--blue);color:var(--blue);font-weight:600}.subview{display:none}.subview.active{display:block}.placeholder{padding:26px 12px;color:var(--muted)}.placeholder strong{display:block;color:var(--text);font-size:13px;margin-bottom:4px}.compare-head{display:grid;grid-template-columns:1fr 1fr auto;gap:9px;margin-bottom:11px}.compare-box{background:var(--surface);border:1px solid var(--line);padding:9px 11px}.compare-box label{display:block;color:var(--muted);font-size:10px;margin-bottom:4px}.compare-box select{width:100%;height:28px;background:var(--surface);border:1px solid var(--line2);padding:3px 6px}.up{color:var(--red);font-weight:600}.down{color:var(--green);font-weight:600}
+    .targets{display:grid;grid-template-columns:1fr 310px;gap:11px}.entry-list{display:grid;grid-template-columns:1fr 1fr;gap:8px}.entry{padding:15px;border:1px solid var(--line2);background:var(--surface);text-align:left;min-height:126px}.entry:hover{background:var(--surface2);border-color:var(--blue)}.entry .icon{color:var(--blue);width:21px;height:21px;margin-bottom:12px}.entry strong{display:block;font-size:13px}.entry p{color:var(--muted);margin:5px 0 12px}.entry a{color:var(--blue);font-weight:600}.property{display:grid;grid-template-columns:1fr auto;border-bottom:1px solid var(--line);padding:8px 0}.property:last-child{border:0}.property span{color:var(--muted)}.property strong{text-align:right}.process-filter{display:flex;gap:5px;align-items:center;margin-left:auto}.process-filter input{height:27px;width:180px;background:var(--surface);border:1px solid var(--line2);padding:4px 7px}
+    .drawer-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.3);display:none}.drawer{position:fixed;right:0;top:0;bottom:0;width:380px;background:var(--surface);border-left:1px solid var(--line);box-shadow:-4px 0 16px rgba(0,0,0,.22);display:none}.drawer-open .drawer-backdrop,.drawer-open .drawer{display:block}.drawer header{height:52px;border-bottom:1px solid var(--line);padding:0 14px;display:flex;align-items:center;justify-content:space-between}.drawer h3{font-size:14px;margin:0}.drawer header small{display:block;color:var(--muted);font-size:10px;margin-top:2px}.drawer header button{border:0;background:transparent;font-size:18px;color:var(--muted)}.drawer-content{padding:13px 14px}.detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px}.detail-grid div{background:var(--surface2);border:1px solid var(--line);padding:8px}.detail-grid small{display:block;color:var(--muted)}.detail-grid strong{display:block;margin-top:3px}.drawer h4{font-size:12px;margin:17px 0 9px}.path-step{border-left:2px solid var(--blue);padding:0 0 12px 10px;margin-left:4px}.path-step small{display:block;color:var(--muted);margin-top:2px}.picker-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:center;justify-content:center}.picker-open .picker-backdrop{display:flex}.picker{width:580px;background:var(--surface);border:1px solid var(--line2);box-shadow:0 15px 45px rgba(0,0,0,.3)}.picker header{padding:14px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}.picker h3{margin:0;font-size:15px}.picker header button{border:0;background:transparent;color:var(--muted);font-size:18px}.picker-tools{padding:11px 14px;border-bottom:1px solid var(--line)}.picker-tools input{width:100%;height:29px;background:var(--surface);border:1px solid var(--line2);padding:4px 8px}.picker-body{min-height:208px}.picker-footer{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-top:1px solid var(--line);color:var(--muted);font-size:10px}.toast{position:fixed;bottom:34px;left:50%;transform:translate(-50%,10px);opacity:0;background:var(--text);color:var(--surface);padding:8px 12px;pointer-events:none;transition:.15s}.toast.show{opacity:1;transform:translate(-50%,0)}.statusbar{display:flex;align-items:center;gap:17px;background:var(--chrome);border-top:1px solid var(--line);color:var(--muted);font-size:10px;padding:0 10px}.statusbar .last{margin-left:auto}@media(max-width:1180px){body{min-width:980px}.body{grid-template-columns:215px minmax(0,1fr)}.grid{grid-template-columns:minmax(0,1fr) 270px}.targets{grid-template-columns:1fr 270px}}
+  </style>
+</head>
+<body>
+  <div class="app" id="app">
+    <div class="titlebar"><div class="mark">D</div><strong>Dotnet Analysis</strong><span>Memory Diagnostics</span><div class="window"><span>−</span><span>□</span><span>×</span></div></div>
+    <div class="commandbar"><button class="command primary" id="attach"><i data-lucide="plug-zap" class="icon"></i>附着进程</button><button class="command" id="open"><i data-lucide="folder-open" class="icon"></i>打开快照</button><span class="cmd-divider"></span><button class="command" id="capture"><i data-lucide="camera" class="icon"></i><span>捕获快照</span></button><button class="command" id="stop"><i data-lucide="square" class="icon"></i>结束会话</button><span class="cmd-divider"></span><button class="command" id="theme"><i data-lucide="sun-moon" class="icon"></i>主题</button><span class="cmd-spacer">模拟数据 · Windows x64</span></div>
+    <div class="body"><aside class="path"><div class="path-head"><strong>分析路径</strong><button id="new-context" title="新建上下文">＋</button></div><div class="path-list"><div class="path-section">当前会话</div><button class="path-item active" data-view="live"><i data-lucide="activity" class="icon"></i><span>OrderService.exe</span><span class="time">14:26</span></button><button class="path-item indent" data-view="live"><i data-lucide="chart-line" class="icon"></i><span>实时内存</span></button><button class="path-item indent" data-view="live"><i data-lucide="flame" class="icon"></i><span>分配热点</span></button><div class="path-section">快照</div><button class="path-item" data-view="snapshots"><i data-lucide="file-box" class="icon"></i><span>#1 启动后基线</span><span class="time">96.2M</span></button><button class="path-item" data-view="snapshots"><i data-lucide="file-box" class="icon"></i><span>#2 订单洪峰</span><span class="time">117.8M</span></button><button class="path-item active" data-view="snapshots"><i data-lucide="file-box" class="icon"></i><span>#3 当前快照</span><span class="time">128.4M</span></button><div class="path-section">结果视图</div><button class="path-item" data-view="snapshots"><i data-lucide="table-2" class="icon"></i><span>类型</span></button><button class="path-item" data-view="snapshots"><i data-lucide="route" class="icon"></i><span>引用路径</span></button><button class="path-item" data-view="compare"><i data-lucide="columns-2" class="icon"></i><span>快照对比</span></button></div><div class="path-footer"><span class="dot"></span>诊断服务就绪</div></aside>
+      <main class="main"><div class="context"><h1 id="context-title">OrderService.exe</h1><span class="meta" id="context-meta">PID 8420 · .NET 10.0 · x64</span><div class="right"><span class="state" id="state"><span class="dot"></span>Monitoring</span><button class="small" id="refresh"><i data-lucide="refresh-cw" class="icon"></i>刷新</button></div></div><div class="tabs"><button class="tab active" data-view="live">实时会话 <span class="close">×</span></button><button class="tab" data-view="snapshots">快照 #3 <span class="close">×</span></button><button class="tab" data-view="compare">对比 <span class="close">×</span></button></div><div class="scroll">
+        <section class="view active" id="view-live"><div class="title-row"><h2>实时会话</h2><span class="status good">监控中</span><p>附着目标持续提供时间线与采样结果</p><span class="sample">示例数据</span></div><div class="metric-line"><div class="metric"><label>托管堆</label><strong>128.4 MB</strong><small>过去 5 分钟 +8.2 MB</small></div><div class="metric"><label>进程内存</label><strong>364.7 MB</strong><small>私有工作集</small></div><div class="metric"><label>分配采样</label><strong>18,426</strong><small>连续 · 采样结果</small></div><div class="metric"><label>已保存快照</label><strong>3</strong><small>最近 #3 · 14:24</small></div></div><div class="grid"><section class="surface"><div class="surface-head"><strong>内存时间线</strong><span class="sub">最近 15 分钟 · 每 10 秒采样</span><div class="tools"><button class="small" id="range">15 分钟 ▾</button></div></div><div class="chart"><div class="legend"><span><i style="background:var(--blue)"></i>托管堆</span><span><i style="background:var(--purple)"></i>进程内存</span></div><svg viewBox="0 0 760 205" preserveAspectRatio="none" aria-label="内存时间线"><g stroke="var(--line)" stroke-width="1"><path d="M36 12H752M36 60H752M36 108H752M36 156H752M36 202H752"/></g><g fill="var(--faint)" font-size="10" text-anchor="end"><text x="30" y="16">400</text><text x="30" y="64">300</text><text x="30" y="112">200</text><text x="30" y="160">100</text><text x="30" y="204">0</text></g><path d="M36 174L80 173L118 165L158 168L200 153L244 158L287 140L327 143L370 129L411 122L455 109L499 100L542 94L580 85L622 76L663 71L705 59L752 48" fill="none" stroke="var(--blue)" stroke-width="2.5"/><path d="M36 145L80 144L118 138L158 140L200 128L244 131L287 121L327 124L370 109L411 112L455 96L499 101L542 88L580 82L622 73L663 77L705 61L752 55" fill="none" stroke="var(--purple)" stroke-width="2" stroke-dasharray="4 3"/><path d="M580 12V202" stroke="var(--amber)" stroke-dasharray="3 3"/></svg><div class="axis"><span>14:12</span><span>14:15</span><span>14:18</span><span>14:21</span><span>14:27</span></div><div class="chart-note">14:23 有 18 秒采样缺口，该区间证据为“部分”。</div></div></section><section class="surface"><div class="surface-head"><strong>诊断能力</strong><span class="sub">探测于 14:26</span></div><div class="surface-body"><div class="capability"><div><strong>标准快照</strong><small>GCDump 捕获</small></div><span class="status good">可用</span></div><div class="capability"><div><strong>Retention 快照</strong><small>Native profiler</small></div><span class="status good">可用</span></div><div class="capability"><div><strong>执行采样</strong><small>采样窗口存在缺口</small></div><span class="status warn">部分</span></div><div class="capability"><div><strong>对象分页</strong><small>大快照按页读取</small></div><span class="status good">可用</span></div><div class="notice">缺失采样不会绘制为零。</div></div></section></div><div class="snapline"><div class="snap"><strong>#1 启动后基线</strong><div class="value">96.2 MB</div><small>标准 · 14:16</small></div><div class="snap"><strong>#2 订单洪峰</strong><div class="value">117.8 MB</div><small>Retention · 14:21</small></div><div class="snap current"><strong>#3 当前快照</strong><div class="value">128.4 MB</div><small>标准 · 14:24</small></div></div><div class="grid" style="margin-top:11px"><section class="surface"><div class="surface-head"><strong>分配热点</strong><span class="sub">#3 之前的采样区间</span><div class="tools"><button class="small" id="calltree">调用树 →</button></div></div><table class="table"><thead><tr><th>类型</th><th class="num">观测分配</th><th class="num">样本数</th><th>调用栈</th></tr></thead><tbody><tr><td class="type">System.String</td><td class="num">42.8 MB</td><td class="num">8,412</td><td>OrderParser.Parse</td></tr><tr><td class="type">OrderLine[]</td><td class="num">18.6 MB</td><td class="num">3,204</td><td>OrderMapper.Map</td></tr><tr><td class="type">Dictionary&lt;String, Object&gt;</td><td class="num">11.2 MB</td><td class="num">1,890</td><td>CacheStore.Get</td></tr></tbody></table><div class="table-foot"><span>采样结果，不代表每一次分配</span><span>1-3 / 18</span></div></section><section class="surface"><div class="surface-head"><strong>时间线事件</strong><span class="sub">按顺序记录</span></div><table class="table"><tbody><tr><td class="mono">14:24:36</td><td>快照 #3 已保存</td><td><span class="status good">完成</span></td></tr><tr><td class="mono">14:23:11</td><td>采样窗口缺口</td><td><span class="status warn">部分</span></td></tr><tr><td class="mono">14:21:08</td><td>Retention #2 已保存</td><td><span class="status good">完成</span></td></tr></tbody></table></section></div></section>
+        <section class="view" id="view-snapshots"><div class="title-row"><h2>快照 #3</h2><span class="status good">分析就绪</span><p>标准捕获 · 14:24:36 · 128.4 MB</p><span class="sample">示例数据</span></div><div class="grid"><section class="surface"><div class="surface-head"><strong>快照摘要</strong><span class="sub">对象与类型索引</span></div><div class="surface-body"><div class="summary-grid"><div><strong>128.4 MB</strong><span>托管堆使用</span></div><div><strong>84,216</strong><span>对象总数</span></div><div><strong>1,482</strong><span>类型数量</span></div></div></div></section><section class="surface"><div class="surface-head"><strong>证据状态</strong></div><div class="surface-body"><div class="property"><span>来源</span><strong>实时会话</strong></div><div class="property"><span>分配区间</span><strong>连续</strong></div><div class="property"><span>存储</span><strong>已验证</strong></div></div></section></div><div class="subtabs"><button class="active" data-sub="types">类型</button><button data-sub="objects">对象</button><button data-sub="retention">Retention 路径</button><button data-sub="dominators">支配树</button></div><div class="surface" style="border-top:0"><div class="subview active" id="sub-types"><div class="surface-head"><strong>类型统计</strong><span class="sub">点击行查看对象</span><div class="tools"><input class="filter" id="type-filter" placeholder="筛选类型" aria-label="筛选类型"></div></div><table class="table"><thead><tr><th>类型</th><th class="num">对象数</th><th class="num">浅表大小</th><th class="num">保留大小</th><th>证据</th></tr></thead><tbody id="types"><tr data-type="System.String"><td><span class="type">System.String</span><span class="meta">System.Private.CoreLib</span></td><td class="num">18,420</td><td class="num">42.8 MB</td><td class="num">46.1 MB</td><td><span class="status good">完整</span></td></tr><tr data-type="OrderLine[]"><td><span class="type">OrderLine[]</span><span class="meta">OrderService.Domain</span></td><td class="num">3,204</td><td class="num">23.5 MB</td><td class="num">31.8 MB</td><td><span class="status good">完整</span></td></tr><tr data-type="Dictionary<String, Object>"><td><span class="type">Dictionary&lt;String, Object&gt;</span><span class="meta">System.Private.CoreLib</span></td><td class="num">1,890</td><td class="num">11.2 MB</td><td class="num">28.4 MB</td><td><span class="status warn">部分</span></td></tr><tr data-type="OrderCache"><td><span class="type">OrderCache</span><span class="meta">OrderService.Infrastructure</span></td><td class="num">1</td><td class="num">96 KB</td><td class="num">19.7 MB</td><td><span class="status good">完整</span></td></tr></tbody></table><div class="table-foot"><span>显示 4 / 1,482 个类型</span><span>第 1 页 · 2 · 3</span></div></div><div class="subview" id="sub-objects"><div class="surface-head"><strong id="object-title">System.String 对象</strong><span class="sub">分页读取</span></div><table class="table"><thead><tr><th>地址</th><th>值预览</th><th class="num">大小</th><th>操作</th></tr></thead><tbody><tr data-object="1"><td class="mono">0x000001B6A21F44C0</td><td>"order-2026-09-30-1842"</td><td class="num">54 B</td><td>引用路径 →</td></tr><tr data-object="1"><td class="mono">0x000001B6A21F4518</td><td>"payment.completed"</td><td class="num">42 B</td><td>引用路径 →</td></tr><tr data-object="1"><td class="mono">0x000001B6A21F4570</td><td>"eu-west-1"</td><td class="num">32 B</td><td>引用路径 →</td></tr></tbody></table></div><div class="subview" id="sub-retention"><div class="placeholder"><strong>选择对象查看 Retention 路径</strong>根证据和普通引用链分别呈现。</div></div><div class="subview" id="sub-dominators"><div class="placeholder"><strong>支配树查询</strong>按保留大小排序，首次查询等待派生分析。</div></div></div></section>
+        <section class="view" id="view-compare"><div class="title-row"><h2>快照对比</h2><p>按类型身份比较对象数和浅表大小。</p><span class="sample">示例数据</span></div><div class="compare-head"><div class="compare-box"><label>基线快照</label><select><option>#1 启动后基线 · 96.2 MB</option><option>#2 订单洪峰 · 117.8 MB</option></select></div><div class="compare-box"><label>候选快照</label><select><option>#3 当前快照 · 128.4 MB</option><option>#2 订单洪峰 · 117.8 MB</option></select></div><button class="small primary" id="compare">重新比较</button></div><section class="surface"><div class="surface-head"><strong>类型变化</strong><span class="sub">按浅表大小增长排序</span></div><table class="table"><thead><tr><th>类型</th><th class="num">基线对象</th><th class="num">候选对象</th><th class="num">数量变化</th><th class="num">浅表大小变化</th></tr></thead><tbody><tr><td class="type">System.String</td><td class="num">11,240</td><td class="num">18,420</td><td class="num up">+7,180</td><td class="num up">+18.4 MB</td></tr><tr><td class="type">OrderLine[]</td><td class="num">1,608</td><td class="num">3,204</td><td class="num up">+1,596</td><td class="num up">+11.9 MB</td></tr><tr><td class="type">Dictionary&lt;String, Object&gt;</td><td class="num">1,102</td><td class="num">1,890</td><td class="num up">+788</td><td class="num up">+6.8 MB</td></tr><tr><td class="type">Utf8JsonReader</td><td class="num">1,420</td><td class="num">1,126</td><td class="num down">-294</td><td class="num down">-1.4 MB</td></tr></tbody></table><div class="table-foot"><span>不按对象地址匹配，也不累加 retained size</span><span>比较质量：完整</span></div></section></section>
+      </div></main>
+    </div>
+    <footer class="statusbar"><span><span class="dot"></span>诊断服务就绪</span><span id="footer">OrderService.exe · Monitoring</span><span class="last">本地模拟原型</span></footer>
+  </div>
+  <div class="drawer-backdrop" id="drawer-backdrop"></div><aside class="drawer" id="drawer"><header><div><h3>对象详情</h3><small>System.String · 0x000001B6A21F44C0</small></div><button id="close-drawer">×</button></header><div class="drawer-content"><div class="detail-grid"><div><small>类型</small><strong>System.String</strong></div><div><small>大小</small><strong>54 B</strong></div><div><small>地址</small><strong class="mono">0x...44C0</strong></div><div><small>快照</small><strong>#3 当前</strong></div></div><h4>引用路径</h4><div class="path-step"><strong>OrderCache._entries</strong><small>OrderService.Infrastructure</small></div><div class="path-step"><strong>OrderController._cache</strong><small>OrderService.Api</small></div><div class="path-step"><strong>Root: Thread 1842</strong><small>已验证栈根</small></div><div class="notice">Retention 路径与普通引用链不是同一种证据。</div></div></aside><div class="picker-backdrop" id="picker-backdrop"><section class="picker" role="dialog" aria-modal="true" aria-labelledby="picker-title"><header><h3 id="picker-title">附着到进程</h3><button id="close-picker" title="关闭">×</button></header><div class="picker-tools"><input id="process-filter" placeholder="筛选进程名或 PID" aria-label="筛选进程"></div><div class="picker-body"><table class="table"><thead><tr><th>进程</th><th>运行时</th><th class="num">PID</th></tr></thead><tbody id="processes"><tr class="selected"><td class="type">OrderService.exe</td><td>.NET 10.0</td><td class="num">8420</td></tr><tr><td class="type">dotnet.exe</td><td>.NET 10.0</td><td class="num">11904</td></tr><tr><td class="type">DiagnosticsTarget.exe</td><td>.NET 8.0</td><td class="num">13780</td></tr><tr><td class="type">WpfSample.exe</td><td>.NET 9.0</td><td class="num">15564</td></tr></tbody></table></div><footer class="picker-footer"><span>模拟进程列表</span><button class="small primary" id="confirm-attach">附着所选进程</button></footer></section></div><div class="toast" id="toast"></div>
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <script>
+    (() => {
+      const $ = (selector, root = document) => root.querySelector(selector);
+      const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+      const on = (selector, event, handler, root = document) => {
+        const element = $(selector, root);
+        if (element) element.addEventListener(event, handler);
+        return element;
+      };
+
+      const toast = $('#toast');
+      let toastTimer;
+
+      function notify(message) {
+        if (!toast) return;
+        toast.textContent = message;
+        toast.classList.add('show');
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => toast.classList.remove('show'), 1800);
+      }
+
+      function view(name) {
+        $$('[data-view]').forEach((element) => {
+          element.classList.toggle('active', element.dataset.view === name);
+        });
+        $$('.view').forEach((element) => {
+          element.classList.toggle('active', element.id === `view-${name}`);
+        });
+
+        const titles = {
+          live: 'OrderService.exe',
+          snapshots: '快照 #3',
+          compare: '快照对比'
+        };
+        const metadata = {
+          live: 'PID 8420 · .NET 10.0 · x64',
+          snapshots: '#3 当前快照 · 标准捕获 · 14:24:36',
+          compare: '#1 基线 → #3 当前快照'
+        };
+        const contextTitle = $('#context-title');
+        const contextMeta = $('#context-meta');
+        if (contextTitle) contextTitle.textContent = titles[name] ?? name;
+        if (contextMeta) contextMeta.textContent = metadata[name] ?? '';
+        const scroll = $('.scroll');
+        if (scroll) scroll.scrollTop = 0;
+      }
+
+      $$('[data-view]').forEach((element) => {
+        element.addEventListener('click', () => view(element.dataset.view));
+      });
+
+      const picker = () => document.body.classList.add('picker-open');
+      const closePicker = () => document.body.classList.remove('picker-open');
+      on('#attach', 'click', picker);
+      on('#close-picker', 'click', closePicker);
+      on('#picker-backdrop', 'click', (event) => {
+        if (event.target.id === 'picker-backdrop') closePicker();
+      });
+      on('#confirm-attach', 'click', () => {
+        closePicker();
+        view('live');
+        notify('已附着 OrderService.exe，开始采样');
+      });
+
+      on('#process-filter', 'input', (event) => {
+        const query = event.target.value.toLowerCase();
+        $$('#processes tr').forEach((row) => {
+          row.hidden = !row.textContent.toLowerCase().includes(query);
+        });
+      });
+      $$('#processes tr').forEach((row) => {
+        row.addEventListener('click', () => {
+          $$('#processes tr').forEach((item) => item.classList.remove('selected'));
+          row.classList.add('selected');
+        });
+      });
+
+      on('#open', 'click', () => {
+        view('snapshots');
+        notify('已打开模拟快照');
+      });
+      on('#capture', 'click', () => {
+        view('live');
+        notify('快照已保存，正在建立索引');
+      });
+      on('#stop', 'click', () => {
+        const state = $('#state');
+        if (state) state.innerHTML = '<span class="dot"></span>Ended';
+        const footer = $('#footer');
+        if (footer) footer.textContent = '无活动目标';
+        notify('会话已结束，已保存快照保留');
+      });
+      on('#theme', 'click', () => {
+        const root = document.documentElement;
+        root.dataset.theme = root.dataset.theme === 'dark' ? 'light' : 'dark';
+      });
+      on('#refresh', 'click', () => notify('目标与能力已刷新'));
+      on('#calltree', 'click', () => notify('执行采样调用树待接入真实查询'));
+      on('#compare', 'click', () => notify('对比结果已刷新'));
+
+      $$('.snap').forEach((snapshot) => {
+        snapshot.addEventListener('click', () => {
+          $$('.snap').forEach((item) => item.classList.remove('current'));
+          snapshot.classList.add('current');
+          const label = $('strong', snapshot);
+          notify(`已选择 ${label ? label.textContent : '快照'}`);
+        });
+      });
+
+      $$('[data-sub]').forEach((tab) => {
+        tab.addEventListener('click', () => {
+          $$('[data-sub]').forEach((item) => item.classList.toggle('active', item === tab));
+          $$('.subview').forEach((panel) => {
+            panel.classList.toggle('active', panel.id === `sub-${tab.dataset.sub}`);
+          });
+        });
+      });
+
+      on('#type-filter', 'input', (event) => {
+        const query = event.target.value.toLowerCase();
+        $$('#types tr').forEach((row) => {
+          row.hidden = !(row.dataset.type ?? '').toLowerCase().includes(query);
+        });
+      });
+      $$('#types tr').forEach((row) => {
+        row.addEventListener('click', () => {
+          const objectTitle = $('#object-title');
+          if (objectTitle) objectTitle.textContent = `${row.dataset.type} 对象`;
+          const objectsTab = $('[data-sub="objects"]');
+          if (objectsTab) objectsTab.click();
+        });
+      });
+
+      const closeDrawer = () => document.body.classList.remove('drawer-open');
+      $$('[data-object]').forEach((row) => {
+        row.addEventListener('click', () => document.body.classList.add('drawer-open'));
+      });
+      on('#close-drawer', 'click', closeDrawer);
+      on('#drawer-backdrop', 'click', closeDrawer);
+
+      if (window.lucide) window.lucide.createIcons();
+    })();
+  </script>
+</body>
+</html>
