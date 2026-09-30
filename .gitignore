@@ -10,3 +10,4 @@ TestResults/
 *.dmp
 native/out/
 artifacts/
+.firecrawl/

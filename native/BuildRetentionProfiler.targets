@@ -5,17 +5,17 @@
   -->
   <PropertyGroup>
     <RetentionProfilerSourceDirectory>$([System.String]::Copy('$(MSBuildThisFileDirectory)').TrimEnd('\'))</RetentionProfilerSourceDirectory>
-    <RetentionProfilerBuildDirectory>$(BaseIntermediateOutputPath)retention-profiler</RetentionProfilerBuildDirectory>
+    <!-- NMake 是单配置生成器；按 Configuration 隔离缓存，避免 Debug/Release 并发改写同一个 CMakeCache。 -->
+    <RetentionProfilerBuildDirectory>$(BaseIntermediateOutputPath)retention-profiler\$(Configuration)</RetentionProfilerBuildDirectory>
   </PropertyGroup>
 
   <Target Name="BuildRetentionProfiler"
           BeforeTargets="Build"
           Condition="'$(OS)' == 'Windows_NT' and '$(DesignTimeBuild)' != 'true'">
-    <Exec Command="cmake -S &quot;$(RetentionProfilerSourceDirectory)&quot; -B &quot;$(RetentionProfilerBuildDirectory)&quot; -G &quot;Visual Studio 17 2022&quot; -A x64 -DBUILD_TESTING=OFF" />
-    <Exec Command="cmake --build &quot;$(RetentionProfilerBuildDirectory)&quot; --config &quot;$(Configuration)&quot;" />
+    <Exec Command="&quot;$(SystemRoot)\System32\WindowsPowerShell\v1.0\powershell.exe&quot; -NoLogo -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildThisFileDirectory)..\eng\Build-RetentionProfiler.ps1&quot; -SourceDirectory &quot;$(RetentionProfilerSourceDirectory)&quot; -BuildDirectory &quot;$(RetentionProfilerBuildDirectory)&quot; -Configuration &quot;$(Configuration)&quot; -Architecture x64" />
     <ItemGroup>
-      <RetentionProfilerNativeArtifact Include="$(RetentionProfilerBuildDirectory)\$(Configuration)\DotnetAnalysis.RetentionProfiler.dll" />
-      <RetentionProfilerNativeArtifact Include="$(RetentionProfilerBuildDirectory)\$(Configuration)\DotnetAnalysis.RetentionProfilerController.dll" />
+      <RetentionProfilerNativeArtifact Include="$(RetentionProfilerBuildDirectory)\DotnetAnalysis.RetentionProfiler.dll" />
+      <RetentionProfilerNativeArtifact Include="$(RetentionProfilerBuildDirectory)\DotnetAnalysis.RetentionProfilerController.dll" />
     </ItemGroup>
     <Copy SourceFiles="@(RetentionProfilerNativeArtifact)"
           DestinationFolder="$(OutDir)native\"
